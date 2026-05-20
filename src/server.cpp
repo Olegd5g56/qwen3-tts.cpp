@@ -331,6 +331,78 @@ static void print_usage(const char * program) {
     fprintf(stderr, "       --repetition-penalty <f>    repetition penalty default (default: 1.05)\n");
     fprintf(stderr, "       --seed <n>                  default sampling seed (default: -1 = random)\n");
     fprintf(stderr, "  -h,  --help                     show this help\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "environment variables (overridden by CLI flags):\n");
+    fprintf(stderr, "  TTS_MODEL, TTS_VOCODER\n");
+    fprintf(stderr, "  TTS_HF_REPO, TTS_HF_FILE, TTS_HF_REPO_V, TTS_HF_FILE_V\n");
+    fprintf(stderr, "  TTS_HOST, TTS_PORT, TTS_THREADS, TTS_VERBOSE\n");
+    fprintf(stderr, "  TTS_TEMPERATURE, TTS_TOP_K, TTS_REPETITION_PENALTY, TTS_SEED\n");
+}
+
+// parse a truthy/falsy env value: "1", "true", "yes", "on" (case-insensitive) => true
+static bool env_truthy(const char * v) {
+    if (!v || !*v) return false;
+    std::string s = v;
+    for (char & c : s) c = (char)std::tolower((unsigned char)c);
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+// fill server_params from TTS_* environment variables. called before parse_args
+// so CLI flags take precedence over env, which takes precedence over defaults.
+// invalid numeric values abort with a clear message rather than silently using
+// the default — env misconfig in a container should fail loudly.
+static bool load_env(server_params & sp) {
+    auto get_str = [](const char * name, std::string & dst) {
+        const char * v = std::getenv(name);
+        if (v && *v) dst = v;
+    };
+    auto get_int = [](const char * name, int & dst) -> bool {
+        const char * v = std::getenv(name);
+        if (!v || !*v) return true;
+        try { dst = std::stoi(v); } catch (...) {
+            fprintf(stderr, "error: %s must be an integer (got '%s')\n", name, v);
+            return false;
+        }
+        return true;
+    };
+    auto get_i64 = [](const char * name, int64_t & dst) -> bool {
+        const char * v = std::getenv(name);
+        if (!v || !*v) return true;
+        try { dst = std::stoll(v); } catch (...) {
+            fprintf(stderr, "error: %s must be an integer (got '%s')\n", name, v);
+            return false;
+        }
+        return true;
+    };
+    auto get_float = [](const char * name, float & dst) -> bool {
+        const char * v = std::getenv(name);
+        if (!v || !*v) return true;
+        try { dst = std::stof(v); } catch (...) {
+            fprintf(stderr, "error: %s must be a number (got '%s')\n", name, v);
+            return false;
+        }
+        return true;
+    };
+
+    get_str("TTS_MODEL",     sp.model);
+    get_str("TTS_VOCODER",   sp.vocoder);
+    get_str("TTS_HF_REPO",   sp.hf_repo);
+    get_str("TTS_HF_FILE",   sp.hf_file);
+    get_str("TTS_HF_REPO_V", sp.hf_repo_v);
+    get_str("TTS_HF_FILE_V", sp.hf_file_v);
+    get_str("TTS_HOST",      sp.host);
+
+    if (!get_int  ("TTS_PORT",               sp.port))               return false;
+    if (!get_int  ("TTS_THREADS",            sp.n_threads))          return false;
+    if (!get_float("TTS_TEMPERATURE",        sp.temperature))        return false;
+    if (!get_int  ("TTS_TOP_K",              sp.top_k))              return false;
+    if (!get_float("TTS_REPETITION_PENALTY", sp.repetition_penalty)) return false;
+    if (!get_i64  ("TTS_SEED",               sp.seed))               return false;
+
+    if (const char * v = std::getenv("TTS_VERBOSE")) {
+        if (*v) sp.verbose = env_truthy(v);
+    }
+    return true;
 }
 
 static bool parse_args(int argc, char ** argv, server_params & sp) {
@@ -394,6 +466,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
 
 int main(int argc, char ** argv) {
     server_params sp;
+    if (!load_env(sp)) {
+        return 1;
+    }
     if (!parse_args(argc, argv, sp)) {
         print_usage(argv[0]);
         return 1;
