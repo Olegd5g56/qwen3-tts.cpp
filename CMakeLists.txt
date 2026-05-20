@@ -40,6 +40,10 @@ if(QWEN3_TTS_SERVER)
         GIT_TAG        v3.11.3
     )
     FetchContent_MakeAvailable(httplib nlohmann_json)
+
+    # libopusenc — system dependency, Ogg/Opus encoding for the /v1/audio/speech endpoint
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OPUSENC REQUIRED IMPORTED_TARGET libopusenc)
 endif()
 
 # PIC is needed for the shared library — set globally so GGML libs get it too
@@ -241,6 +245,7 @@ if(QWEN3_TTS_SERVER)
         qwen3_tts
         httplib::httplib
         nlohmann_json::nlohmann_json
+        PkgConfig::OPUSENC
     )
 endif()
 

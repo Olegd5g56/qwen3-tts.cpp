@@ -13,10 +13,12 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <opusenc.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -91,6 +93,64 @@ static std::string encode_wav(const std::vector<float> & samples, int sample_rat
     }
 
     return buf;
+}
+
+// stateful Ogg/Opus encoder. write() consumes float PCM (mono); whenever
+// libopusenc finishes a page, on_page is invoked with the encoded bytes
+// (raw page data, ready to ship). finish() drains pending samples and
+// emits the final pages. Sample rate must be one of 8/12/16/24/48 kHz —
+// 24 kHz matches the vocoder output, so no resampling is needed.
+struct opus_streamer {
+    OggOpusEnc *      enc      = nullptr;
+    OggOpusComments * comments = nullptr;
+    std::function<bool(const char *, size_t)> on_page;
+    bool failed = false;
+
+    bool open(int sample_rate) {
+        comments = ope_comments_create();
+        OpusEncCallbacks cb;
+        cb.write = &opus_streamer::write_cb;
+        cb.close = &opus_streamer::close_cb;
+        int error = 0;
+        enc = ope_encoder_create_callbacks(&cb, this, comments, sample_rate, 1, 0, &error);
+        return enc != nullptr && error == OPE_OK;
+    }
+    bool write(const float * pcm, size_t n_samples) {
+        if (!enc || failed) return false;
+        return ope_encoder_write_float(enc, pcm, (int)n_samples) == OPE_OK && !failed;
+    }
+    void finish() {
+        if (enc) ope_encoder_drain(enc);
+    }
+    ~opus_streamer() {
+        if (enc) ope_encoder_destroy(enc);
+        if (comments) ope_comments_destroy(comments);
+    }
+
+    static int write_cb(void * user, const unsigned char * ptr, opus_int32 len) {
+        auto * s = static_cast<opus_streamer *>(user);
+        if (s->failed) return 1;
+        if (!s->on_page(reinterpret_cast<const char *>(ptr), (size_t)len)) {
+            s->failed = true;
+            return 1;
+        }
+        return 0;
+    }
+    static int close_cb(void *) { return 0; }
+};
+
+// encode float32 audio samples as a self-contained Ogg/Opus byte buffer
+static std::string encode_opus(const std::vector<float> & samples, int sample_rate) {
+    std::string out;
+    opus_streamer s;
+    s.on_page = [&out](const char * p, size_t n) {
+        out.append(p, n);
+        return true;
+    };
+    if (!s.open(sample_rate)) return {};
+    if (!samples.empty()) s.write(samples.data(), samples.size());
+    s.finish();
+    return out;
 }
 
 // encode float32 audio samples as raw PCM (int16, little-endian)
@@ -793,11 +853,11 @@ int main(int argc, char ** argv) {
         }
 
         // validate response format
-        if (response_format != "wav" && response_format != "pcm") {
+        if (response_format != "wav" && response_format != "pcm" && response_format != "opus") {
             res.status = 400;
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
-                            "', supported: wav, pcm"},
+                            "', supported: wav, pcm, opus"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
@@ -874,10 +934,12 @@ int main(int argc, char ** argv) {
         // that want a single delta event.
         const bool live_stream = !stream_format.empty() && stream_batch_size > 0;
         if (live_stream) {
-            const bool is_sse = (stream_format == "sse");
-            const bool is_wav = (response_format == "wav");
+            const bool is_sse  = (stream_format == "sse");
+            const bool is_wav  = (response_format == "wav");
+            const bool is_opus = (response_format == "opus");
             const char * ctype = is_sse ? "text/event-stream"
-                                        : (is_wav ? "audio/wav" : "audio/pcm");
+                                        : (is_wav  ? "audio/wav"
+                                        : (is_opus ? "audio/ogg" : "audio/pcm"));
 
             // capture synthesis inputs; move into provider lambda below.
             res.set_chunked_content_provider(ctype,
@@ -885,13 +947,15 @@ int main(int argc, char ** argv) {
                  voice_embedding = std::move(voice_embedding),
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
-                 stream_batch_size, is_sse, is_wav,
+                 stream_batch_size, is_sse, is_wav, is_opus,
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
 
                     // wav header up front (audio mode only). for SSE, the wav
                     // bytes per-delta are raw pcm — clients reconstruct wav.
+                    // opus emits its own ogg headers via libopusenc on first
+                    // write, so no manual header is needed.
                     bool header_written = false;
                     auto ensure_header = [&]() {
                         if (!header_written && !is_sse && is_wav) {
@@ -901,10 +965,36 @@ int main(int argc, char ** argv) {
                         header_written = true;
                     };
 
+                    // opus encoder is created lazily so we don't pay the cost
+                    // on a request that fails before producing any pcm.
+                    opus_streamer opus;
+                    bool opus_open = false;
+                    auto ensure_opus = [&]() -> bool {
+                        if (opus_open || !is_opus) return opus_open || !is_opus;
+                        opus.on_page = [&](const char * p, size_t n) -> bool {
+                            if (is_sse) {
+                                json delta = {
+                                    {"type", "speech.audio.delta"},
+                                    {"audio", base64_encode(p, n)},
+                                };
+                                std::string frame = "event: speech.audio.delta\ndata: "
+                                                  + delta.dump() + "\n\n";
+                                return sink.write(frame.data(), frame.size());
+                            }
+                            return sink.write(p, n);
+                        };
+                        opus_open = opus.open(sample_rate_fallback);
+                        return opus_open;
+                    };
+
                     streaming_opts sopts;
                     sopts.batch_size = stream_batch_size;
                     sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
                         ensure_header();
+                        if (is_opus) {
+                            if (!ensure_opus()) return false;
+                            return opus.write(pcm, n);
+                        }
                         std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
                         if (is_sse) {
                             json delta = {
@@ -933,6 +1023,8 @@ int main(int argc, char ** argv) {
 
                     // ensure a header went out even if no pcm was produced.
                     ensure_header();
+                    // flush any opus samples sitting in libopusenc's lookahead.
+                    if (opus_open) opus.finish();
 
                     if (is_sse) {
                         std::string done_frame = "event: speech.audio.done\ndata: "
@@ -986,6 +1078,8 @@ int main(int argc, char ** argv) {
         if (stream_format.empty()) {
             if (response_format == "pcm") {
                 res.set_content(encode_pcm(result.audio), "audio/pcm");
+            } else if (response_format == "opus") {
+                res.set_content(encode_opus(result.audio, result.sample_rate), "audio/ogg");
             } else {
                 res.set_content(encode_wav(result.audio, result.sample_rate), "audio/wav");
             }
@@ -994,12 +1088,21 @@ int main(int argc, char ** argv) {
 
         // stream_format=audio: raw chunked bytes in the chosen response_format.
         // wav uses a placeholder-size header so playback can start immediately.
+        // opus produces a self-contained Ogg stream (no separate header).
         if (stream_format == "audio") {
-            std::string header = (response_format == "wav")
-                ? wav_streaming_header(result.sample_rate)
-                : std::string();
-            std::string body_bytes = encode_pcm(result.audio);
-            const char * ctype = (response_format == "wav") ? "audio/wav" : "audio/pcm";
+            std::string header;
+            std::string body_bytes;
+            const char * ctype = "audio/pcm";
+            if (response_format == "wav") {
+                header     = wav_streaming_header(result.sample_rate);
+                body_bytes = encode_pcm(result.audio);
+                ctype      = "audio/wav";
+            } else if (response_format == "opus") {
+                body_bytes = encode_opus(result.audio, result.sample_rate);
+                ctype      = "audio/ogg";
+            } else {
+                body_bytes = encode_pcm(result.audio);
+            }
 
             res.set_chunked_content_provider(ctype,
                 [header = std::move(header), body_bytes = std::move(body_bytes)]
@@ -1015,13 +1118,18 @@ int main(int argc, char ** argv) {
         }
 
         // stream_format=sse: emit speech.audio.delta + speech.audio.done.
-        // response_format still selects the bytes carried inside delta (wav or
-        // pcm). usage/timings on the done event are shaped to be consumed by
-        // both openai clients and llama-swap's metrics_monitor.
+        // response_format still selects the bytes carried inside delta (wav,
+        // pcm, or opus). usage/timings on the done event are shaped to be
+        // consumed by both openai clients and llama-swap's metrics_monitor.
         {
-            std::string audio_bytes = (response_format == "wav")
-                ? encode_wav(result.audio, result.sample_rate)
-                : encode_pcm(result.audio);
+            std::string audio_bytes;
+            if (response_format == "wav") {
+                audio_bytes = encode_wav(result.audio, result.sample_rate);
+            } else if (response_format == "opus") {
+                audio_bytes = encode_opus(result.audio, result.sample_rate);
+            } else {
+                audio_bytes = encode_pcm(result.audio);
+            }
 
             json delta = {
                 {"type", "speech.audio.delta"},
