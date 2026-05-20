@@ -10,6 +10,7 @@
 //   POST /v1/audio/speech     - synthesize speech (supports voice cloning)
 
 #include "qwen3_tts.h"
+#include "voice_store.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -19,7 +20,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -281,16 +281,6 @@ static std::string build_done_event(const tts_result & result) {
     return ev.dump();
 }
 
-// in-memory custom voice store
-struct custom_voice {
-    std::string name;
-    std::vector<float> embedding; // 1024-dim speaker embedding
-    // ICL voice cloning data (optional)
-    std::string ref_text;
-    std::vector<int32_t> ref_codes;
-    int32_t n_ref_frames = 0;
-};
-
 struct server_params {
     std::string model;
     std::string vocoder;
@@ -298,6 +288,7 @@ struct server_params {
     std::string hf_file;     // override filename within --hf-repo
     std::string hf_repo_v;   // vocoder HF repo
     std::string hf_file_v;   // override filename within --hf-repo-v
+    std::string voices_dir = "./voices"; // persistent on-disk voice library
     std::string host      = "127.0.0.1";
     int         port      = 8080;
     int         n_threads = 4;
@@ -385,6 +376,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  -H,  --host <host>              listen host (default: 127.0.0.1)\n");
     fprintf(stderr, "  -p,  --port <port>              listen port (default: 8080)\n");
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
+    fprintf(stderr, "       --voices-dir <dir>          persistent voice library dir (default: ./voices)\n");
     fprintf(stderr, "  -V,  --verbose                  print per-stage progress and timing\n");
     fprintf(stderr, "       --temperature <f>           sampling temperature default (default: 0.9)\n");
     fprintf(stderr, "       --top-k <n>                 top-k sampling default (default: 50)\n");
@@ -396,6 +388,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  TTS_MODEL, TTS_VOCODER\n");
     fprintf(stderr, "  TTS_HF_REPO, TTS_HF_FILE, TTS_HF_REPO_V, TTS_HF_FILE_V\n");
     fprintf(stderr, "  TTS_HOST, TTS_PORT, TTS_THREADS, TTS_VERBOSE\n");
+    fprintf(stderr, "  TTS_VOICES_DIR\n");
     fprintf(stderr, "  TTS_TEMPERATURE, TTS_TOP_K, TTS_REPETITION_PENALTY, TTS_SEED\n");
 }
 
@@ -444,13 +437,14 @@ static bool load_env(server_params & sp) {
         return true;
     };
 
-    get_str("TTS_MODEL",     sp.model);
-    get_str("TTS_VOCODER",   sp.vocoder);
-    get_str("TTS_HF_REPO",   sp.hf_repo);
-    get_str("TTS_HF_FILE",   sp.hf_file);
-    get_str("TTS_HF_REPO_V", sp.hf_repo_v);
-    get_str("TTS_HF_FILE_V", sp.hf_file_v);
-    get_str("TTS_HOST",      sp.host);
+    get_str("TTS_MODEL",      sp.model);
+    get_str("TTS_VOCODER",    sp.vocoder);
+    get_str("TTS_HF_REPO",    sp.hf_repo);
+    get_str("TTS_HF_FILE",    sp.hf_file);
+    get_str("TTS_HF_REPO_V",  sp.hf_repo_v);
+    get_str("TTS_HF_FILE_V",  sp.hf_file_v);
+    get_str("TTS_VOICES_DIR", sp.voices_dir);
+    get_str("TTS_HOST",       sp.host);
 
     if (!get_int  ("TTS_PORT",               sp.port))               return false;
     if (!get_int  ("TTS_THREADS",            sp.n_threads))          return false;
@@ -486,6 +480,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) { fprintf(stderr, "error: missing threads\n"); return false; }
             sp.n_threads = std::stoi(argv[i]);
+        } else if (arg == "--voices-dir") {
+            if (++i >= argc) { fprintf(stderr, "error: missing voices-dir\n"); return false; }
+            sp.voices_dir = argv[i];
         } else if (arg == "-V" || arg == "--verbose") {
             sp.verbose = true;
         } else if (arg == "-hf" || arg == "--hf-repo") {
@@ -569,10 +566,14 @@ int main(int argc, char ** argv) {
     // synthesis is not thread-safe, serialize all requests
     std::mutex synth_mutex;
 
-    // custom voice store (voice_id -> voice data)
-    std::map<std::string, custom_voice> voices;
-    std::mutex voices_mutex;
-    int next_voice_id = 1;
+    // persistent on-disk voice library; manages embeddings and ICL caches.
+    VoiceStore voice_store(sp.voices_dir, &tts, &synth_mutex);
+    voice_store.refresh();
+    {
+        auto v = voice_store.list();
+        fprintf(stderr, "voice library: %s (%zu voice%s)\n",
+                sp.voices_dir.c_str(), v.size(), v.size() == 1 ? "" : "s");
+    }
 
     httplib::Server svr;
 
@@ -619,7 +620,7 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /v1/audio/voices ---
-    svr.Get("/v1/audio/voices", [&model_id, &tts, &voices, &voices_mutex](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/v1/audio/voices", [&model_id, &tts, &voice_store](const httplib::Request &, httplib::Response & res) {
         json voice_list = json::array({"default"});
 
         // add built-in speakers from model metadata (custom_voice models)
@@ -627,22 +628,18 @@ int main(int argc, char ** argv) {
             voice_list.push_back(name);
         }
 
-        // add user-created cloned voices
-        {
-            std::lock_guard<std::mutex> lock(voices_mutex);
-            for (auto & [id, v] : voices) {
-                voice_list.push_back(id);
-            }
+        // add on-disk cloned voices
+        for (auto & id : voice_store.list()) {
+            voice_list.push_back(id);
         }
         res.set_content(json({{model_id, voice_list}}).dump(), "application/json");
     });
 
-    // --- POST /v1/audio/voices --- create custom voice from reference audio
+    // --- POST /v1/audio/voices --- create or replace voice from reference audio
     svr.Post("/v1/audio/voices",
-        [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &voice_store](const httplib::Request & req, httplib::Response & res) {
 
-        // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
-        if (!tts.has_speaker_encoder()) {
+        if (!voice_store.can_encode_new()) {
             res.status = 400;
             json err = {{"error", {
                 {"message", "this model variant (" + tts.get_model_type() +
@@ -654,144 +651,68 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // expect multipart form: name (string) + audio_sample (file)
+        // expect multipart form: name (string) + audio_sample (file) [+ ref_text]
         if (!req.has_file("audio_sample")) {
             res.status = 400;
             res.set_content(R"({"error":{"message":"'audio_sample' file is required","type":"invalid_request_error"}})",
                             "application/json");
             return;
         }
-        std::string name = "custom";
+        std::string name;
         if (req.has_param("name")) name = req.get_param_value("name");
         if (req.has_file("name")) name = req.get_file_value("name").content;
-
-        auto audio_file = req.get_file_value("audio_sample");
-
-        // write to temp file for the encoder (expects a file path)
-        char tmppath[] = "/tmp/qwen3tts_voice_XXXXXX.wav";
-        int fd = mkstemps(tmppath, 4);
-        if (fd < 0) {
-            res.status = 500;
-            res.set_content(R"({"error":{"message":"failed to create temp file","type":"server_error"}})",
+        if (name.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"'name' is required","type":"invalid_request_error"}})",
                             "application/json");
             return;
         }
-        write(fd, audio_file.content.data(), audio_file.content.size());
-        close(fd);
-
-        // optional ref_text for ICL voice cloning
-        std::string ref_text;
-        if (req.has_param("ref_text")) ref_text = req.get_param_value("ref_text");
-        if (req.has_file("ref_text")) ref_text = req.get_file_value("ref_text").content;
-
-        // extract speaker embedding (optional when ref_text is provided for ICL mode)
-        std::vector<float> embedding;
-        bool ok;
-        {
-            std::lock_guard<std::mutex> lock(synth_mutex);
-            ok = tts.extract_speaker_embedding(tmppath, embedding);
-        }
-
-        if (!ok && ref_text.empty()) {
-            unlink(tmppath);
+        if (!VoiceStore::valid_id(name)) {
             res.status = 400;
-            json err = {{"error", {
-                {"message", "failed to extract speaker embedding: " + tts.get_error()},
-                {"type", "invalid_request_error"},
-            }}};
-            res.set_content(err.dump(), "application/json");
+            res.set_content(R"({"error":{"message":"invalid 'name': must be [A-Za-z0-9_.-]{1,64}, not '.'-prefixed, not 'default'","type":"invalid_request_error"}})",
+                            "application/json");
             return;
         }
 
-        // ICL mode: also encode reference audio to discrete speech codes
-        std::vector<int32_t> ref_codes;
-        int32_t n_ref_frames = 0;
-        if (!ref_text.empty()) {
-            std::vector<float> samples;
-            int sample_rate = 0;
-            if (!qwen3_tts::load_audio_file(tmppath, samples, sample_rate)) {
-                unlink(tmppath);
-                res.status = 400;
-                res.set_content(R"({"error":{"message":"failed to load audio for codec encoding","type":"invalid_request_error"}})",
-                                "application/json");
-                return;
-            }
+        std::string ref_text;
+        if (req.has_param("ref_text")) ref_text = req.get_param_value("ref_text");
+        if (req.has_file("ref_text"))  ref_text = req.get_file_value("ref_text").content;
 
-            // resample to 24kHz if needed
-            if (sample_rate != 24000 && sample_rate > 0) {
-                int64_t new_len = (int64_t)samples.size() * 24000 / sample_rate;
-                std::vector<float> resampled(new_len);
-                for (int64_t i = 0; i < new_len; i++) {
-                    float src = (float)i * sample_rate / 24000.0f;
-                    int idx = (int)src;
-                    float frac = src - idx;
-                    if (idx + 1 < (int)samples.size()) {
-                        resampled[i] = samples[idx] * (1 - frac) + samples[idx + 1] * frac;
-                    } else {
-                        resampled[i] = samples[std::min(idx, (int)samples.size() - 1)];
-                    }
-                }
-                samples = std::move(resampled);
-            }
-
-            bool codec_ok;
-            {
-                std::lock_guard<std::mutex> lock(synth_mutex);
-                codec_ok = tts.encode_speech_codes(samples.data(),
-                                                    (int32_t)samples.size(),
-                                                    ref_codes, n_ref_frames);
-            }
-            if (!codec_ok) {
-                unlink(tmppath);
-                res.status = 500;
-                json err = {{"error", {
-                    {"message", "failed to encode speech codes: " + tts.get_error()},
-                    {"type", "server_error"},
-                }}};
-                res.set_content(err.dump(), "application/json");
-                return;
-            }
-            fprintf(stderr, "encoded %d reference frames for ICL voice cloning\n", n_ref_frames);
+        auto audio_file = req.get_file_value("audio_sample");
+        std::string err;
+        if (!voice_store.create(name, audio_file.content, ref_text, err)) {
+            res.status = 400;
+            json e = {{"error", {{"message", "failed to create voice: " + err},
+                                  {"type", "invalid_request_error"}}}};
+            res.set_content(e.dump(), "application/json");
+            return;
         }
 
-        unlink(tmppath);
-
-        // store voice
-        std::string voice_id;
-        {
-            std::lock_guard<std::mutex> lock(voices_mutex);
-            voice_id = "voice_" + std::to_string(next_voice_id++);
-            voices[voice_id] = {name, std::move(embedding), ref_text,
-                                std::move(ref_codes), n_ref_frames};
-        }
-
-        fprintf(stderr, "created voice '%s' (id: %s%s)\n", name.c_str(), voice_id.c_str(),
-                ref_text.empty() ? "" : ", ICL mode");
-        json resp = {{"id", voice_id}, {"name", name}};
-        if (!ref_text.empty()) {
-            resp["mode"] = "icl";
-            resp["ref_frames"] = n_ref_frames;
-        }
+        fprintf(stderr, "created voice '%s'%s\n", name.c_str(),
+                ref_text.empty() ? "" : " (ICL mode)");
+        json resp = {{"id", name}, {"name", name}};
+        if (!ref_text.empty()) resp["mode"] = "icl";
         res.set_content(resp.dump(), "application/json");
     });
 
     // --- DELETE /v1/audio/voices/:id ---
     svr.Delete(R"(/v1/audio/voices/(.+))",
-        [&voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
+        [&voice_store](const httplib::Request & req, httplib::Response & res) {
         std::string voice_id = req.matches[1];
-        std::lock_guard<std::mutex> lock(voices_mutex);
-        if (voices.erase(voice_id)) {
+        std::string err;
+        if (voice_store.remove(voice_id, err)) {
             res.set_content(R"({"deleted":true})", "application/json");
         } else {
-            res.status = 404;
-            res.set_content(R"({"error":{"message":"voice not found","type":"not_found"}})",
-                            "application/json");
+            res.status = (err == "not found") ? 404 : 400;
+            json e = {{"error", {{"message", err},
+                                  {"type", res.status == 404 ? "not_found" : "invalid_request_error"}}}};
+            res.set_content(e.dump(), "application/json");
         }
     });
 
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
-        [&tts, &synth_mutex, &sp, &voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -882,7 +803,7 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> voice_ref_codes;
         int32_t voice_n_ref_frames = 0;
         if (!voice.empty() && voice != "default") {
-            // try built-in speaker first (custom_voice models)
+            // built-in speaker (CustomVoice models)
             if (tts.get_speaker_id(voice) >= 0) {
                 std::lock_guard<std::mutex> lock(synth_mutex);
                 if (!tts.get_speaker_embedding(voice, voice_embedding)) {
@@ -895,10 +816,9 @@ int main(int argc, char ** argv) {
                     return;
                 }
             } else {
-                // try user-created cloned voice
-                std::lock_guard<std::mutex> lock(voices_mutex);
-                auto it = voices.find(voice);
-                if (it == voices.end()) {
+                // on-disk cloned voice
+                voice_entry ve;
+                if (!voice_store.get(voice, ve)) {
                     res.status = 400;
                     json err = {{"error", {
                         {"message", "unknown voice '" + voice + "'"},
@@ -907,10 +827,10 @@ int main(int argc, char ** argv) {
                     res.set_content(err.dump(), "application/json");
                     return;
                 }
-                voice_embedding = it->second.embedding;
-                voice_ref_text = it->second.ref_text;
-                voice_ref_codes = it->second.ref_codes;
-                voice_n_ref_frames = it->second.n_ref_frames;
+                voice_embedding    = std::move(ve.embedding);
+                voice_ref_text     = std::move(ve.ref_text);
+                voice_ref_codes    = std::move(ve.ref_codes);
+                voice_n_ref_frames = ve.n_ref_frames;
             }
         }
 

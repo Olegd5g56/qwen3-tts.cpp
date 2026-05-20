@@ -240,6 +240,7 @@ target_link_libraries(test_icl_dump PRIVATE
 if(QWEN3_TTS_SERVER)
     add_executable(qwen3-tts-server
         src/server.cpp
+        src/voice_store.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
         qwen3_tts
