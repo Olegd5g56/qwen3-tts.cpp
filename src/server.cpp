@@ -16,12 +16,16 @@
 #include <nlohmann/json.hpp>
 #include <opusenc.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -293,6 +297,7 @@ struct server_params {
     int         port      = 8080;
     int         n_threads = 4;
     bool        verbose   = false;
+    int         idle_timeout_sec   = 0;  // 0 = disabled (keep model loaded forever)
     float       temperature        = 0.9f;
     int         top_k              = 50;
     float       repetition_penalty = 1.05f;
@@ -377,6 +382,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  -p,  --port <port>              listen port (default: 8080)\n");
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
     fprintf(stderr, "       --voices-dir <dir>          persistent voice library dir (default: ./voices)\n");
+    fprintf(stderr, "       --idle-timeout <sec>        unload model after N seconds idle, reload on demand (default: 0 = off)\n");
     fprintf(stderr, "  -V,  --verbose                  print per-stage progress and timing\n");
     fprintf(stderr, "       --temperature <f>           sampling temperature default (default: 0.9)\n");
     fprintf(stderr, "       --top-k <n>                 top-k sampling default (default: 50)\n");
@@ -388,7 +394,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  TTS_MODEL, TTS_VOCODER\n");
     fprintf(stderr, "  TTS_HF_REPO, TTS_HF_FILE, TTS_HF_REPO_V, TTS_HF_FILE_V\n");
     fprintf(stderr, "  TTS_HOST, TTS_PORT, TTS_THREADS, TTS_VERBOSE\n");
-    fprintf(stderr, "  TTS_VOICES_DIR\n");
+    fprintf(stderr, "  TTS_VOICES_DIR, TTS_IDLE_TIMEOUT\n");
     fprintf(stderr, "  TTS_TEMPERATURE, TTS_TOP_K, TTS_REPETITION_PENALTY, TTS_SEED\n");
 }
 
@@ -448,6 +454,7 @@ static bool load_env(server_params & sp) {
 
     if (!get_int  ("TTS_PORT",               sp.port))               return false;
     if (!get_int  ("TTS_THREADS",            sp.n_threads))          return false;
+    if (!get_int  ("TTS_IDLE_TIMEOUT",       sp.idle_timeout_sec))   return false;
     if (!get_float("TTS_TEMPERATURE",        sp.temperature))        return false;
     if (!get_int  ("TTS_TOP_K",              sp.top_k))              return false;
     if (!get_float("TTS_REPETITION_PENALTY", sp.repetition_penalty)) return false;
@@ -483,6 +490,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--voices-dir") {
             if (++i >= argc) { fprintf(stderr, "error: missing voices-dir\n"); return false; }
             sp.voices_dir = argv[i];
+        } else if (arg == "--idle-timeout") {
+            if (++i >= argc) { fprintf(stderr, "error: missing idle-timeout\n"); return false; }
+            sp.idle_timeout_sec = std::stoi(argv[i]);
         } else if (arg == "-V" || arg == "--verbose") {
             sp.verbose = true;
         } else if (arg == "-hf" || arg == "--hf-repo") {
@@ -543,19 +553,64 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "resolved vocoder: %s\n", sp.vocoder.c_str());
     }
 
-    // load models
-    Qwen3TTS tts;
+    // model lives in a unique_ptr so the idle watchdog can unload it; the
+    // synth_mutex serializes all access (synthesis itself isn't thread-safe
+    // and the watchdog needs an exclusive window to destroy the model).
+    std::unique_ptr<Qwen3TTS> tts;
+    std::mutex synth_mutex;
+    auto last_used = std::chrono::steady_clock::now();
+
+    auto load_model_into = [&](Qwen3TTS & t) -> bool {
+        if (!t.load_model_files(sp.model, sp.vocoder)) {
+            fprintf(stderr, "model load failed: %s\n", t.get_error().c_str());
+            return false;
+        }
+        t.set_n_threads(sp.n_threads);
+        return true;
+    };
+
+    // ensure_loaded: caller MUST hold synth_mutex. (Re)constructs the model
+    // if it has been idle-unloaded, refreshes last_used, returns the raw ptr.
+    // Returns nullptr only if a reload attempt actually fails.
+    std::function<Qwen3TTS*()> ensure_loaded = [&]() -> Qwen3TTS* {
+        if (!tts) {
+            fprintf(stderr, "reloading model: %s\n", sp.model.c_str());
+            auto t = std::make_unique<Qwen3TTS>();
+            if (!load_model_into(*t)) return nullptr;
+            tts = std::move(t);
+        }
+        last_used = std::chrono::steady_clock::now();
+        return tts.get();
+    };
+
+    // initial load — fail fast on bad path / missing file, otherwise subsequent
+    // requests would hit the same error and confuse clients.
     fprintf(stderr, "loading model: %s\n", sp.model.c_str());
     if (!sp.vocoder.empty()) {
         fprintf(stderr, "loading vocoder: %s\n", sp.vocoder.c_str());
     }
-    if (!tts.load_model_files(sp.model, sp.vocoder)) {
-        fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
+    tts = std::make_unique<Qwen3TTS>();
+    if (!load_model_into(*tts)) {
+        fprintf(stderr, "fatal: initial model load failed\n");
         return 1;
     }
-    tts.set_n_threads(sp.n_threads);
+    // reset the idle clock *after* the load so the watchdog doesn't count the
+    // load itself toward the timeout (otherwise short timeouts would unload
+    // immediately on startup).
+    last_used = std::chrono::steady_clock::now();
+
+    // Snapshot model metadata so /v1/models, /v1/audio/voices listing and the
+    // built-in-speaker check work without forcing a reload when idle-unloaded.
+    const std::string              cached_model_type          = tts->get_model_type();
+    const std::vector<std::string> cached_speaker_names       = tts->get_speaker_names();
+    const bool                     cached_has_speaker_encoder = tts->has_speaker_encoder();
+
     fprintf(stderr, "models loaded (type=%s, speakers=%zu, threads=%d)\n",
-            tts.get_model_type().c_str(), tts.get_speaker_names().size(), sp.n_threads);
+            cached_model_type.c_str(), cached_speaker_names.size(), sp.n_threads);
+    if (sp.idle_timeout_sec > 0) {
+        fprintf(stderr, "idle-timeout: model will unload after %d seconds idle\n",
+                sp.idle_timeout_sec);
+    }
 
     // derive model id from filename (e.g. "qwen3-tts-0.6b-f16" from path)
     std::string model_id = sp.model;
@@ -564,11 +619,9 @@ int main(int argc, char ** argv) {
     auto dot = model_id.rfind('.');
     if (dot != std::string::npos) model_id = model_id.substr(0, dot);
 
-    // synthesis is not thread-safe, serialize all requests
-    std::mutex synth_mutex;
-
     // persistent on-disk voice library; manages embeddings and ICL caches.
-    VoiceStore voice_store(sp.voices_dir, &tts, &synth_mutex);
+    VoiceStore voice_store(sp.voices_dir, ensure_loaded,
+                            cached_has_speaker_encoder, &synth_mutex);
     voice_store.refresh();
     {
         auto v = voice_store.list();
@@ -596,8 +649,14 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /health ---
-    svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
-        res.set_content(R"({"status":"ok"})", "application/json");
+    svr.Get("/health", [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+        bool loaded;
+        {
+            std::lock_guard<std::mutex> lock(synth_mutex);
+            loaded = (tts != nullptr);
+        }
+        json h = {{"status", "ok"}, {"model_loaded", loaded}};
+        res.set_content(h.dump(), "application/json");
     });
 
     // --- GET /v1/models ---
@@ -621,11 +680,12 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /v1/audio/voices ---
-    svr.Get("/v1/audio/voices", [&model_id, &tts, &voice_store](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/v1/audio/voices",
+        [&model_id, &cached_speaker_names, &voice_store](const httplib::Request &, httplib::Response & res) {
         json voice_list = json::array({"default"});
 
         // add built-in speakers from model metadata (custom_voice models)
-        for (auto & name : tts.get_speaker_names()) {
+        for (auto & name : cached_speaker_names) {
             voice_list.push_back(name);
         }
 
@@ -638,12 +698,12 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/voices --- create or replace voice from reference audio
     svr.Post("/v1/audio/voices",
-        [&tts, &voice_store](const httplib::Request & req, httplib::Response & res) {
+        [&cached_model_type, &voice_store](const httplib::Request & req, httplib::Response & res) {
 
         if (!voice_store.can_encode_new()) {
             res.status = 400;
             json err = {{"error", {
-                {"message", "this model variant (" + tts.get_model_type() +
+                {"message", "this model variant (" + cached_model_type +
                             ") does not support voice cloning from audio; "
                             "use the Base variant, or pick a built-in voice via GET /v1/audio/voices"},
                 {"type", "invalid_request_error"},
@@ -713,7 +773,8 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
-        [&tts, &synth_mutex, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
+        [&ensure_loaded, &cached_speaker_names, &last_used,
+         &synth_mutex, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -804,13 +865,27 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> voice_ref_codes;
         int32_t voice_n_ref_frames = 0;
         if (!voice.empty() && voice != "default") {
-            // built-in speaker (CustomVoice models)
-            if (tts.get_speaker_id(voice) >= 0) {
+            // built-in speaker (CustomVoice models). Membership check uses the
+            // metadata snapshot so an idle-unloaded model isn't reloaded just
+            // to recognize a name; the actual embedding fetch happens below
+            // under synth_mutex (which reloads the model if needed).
+            bool is_builtin = false;
+            for (const auto & name : cached_speaker_names) {
+                if (name == voice) { is_builtin = true; break; }
+            }
+            if (is_builtin) {
                 std::lock_guard<std::mutex> lock(synth_mutex);
-                if (!tts.get_speaker_embedding(voice, voice_embedding)) {
+                Qwen3TTS * t = ensure_loaded();
+                if (!t) {
+                    res.status = 503;
+                    res.set_content(R"({"error":{"message":"model reload failed","type":"server_error"}})",
+                                    "application/json");
+                    return;
+                }
+                if (!t->get_speaker_embedding(voice, voice_embedding)) {
                     res.status = 500;
                     json err = {{"error", {
-                        {"message", "failed to get speaker embedding: " + tts.get_error()},
+                        {"message", "failed to get speaker embedding: " + t->get_error()},
                         {"type", "server_error"},
                     }}};
                     res.set_content(err.dump(), "application/json");
@@ -864,7 +939,8 @@ int main(int argc, char ** argv) {
 
             // capture synthesis inputs; move into provider lambda below.
             res.set_chunked_content_provider(ctype,
-                [this_tts = &tts, input = std::move(input), params = std::move(params),
+                [ensure_loaded_p = &ensure_loaded, last_used_p = &last_used,
+                 input = std::move(input), params = std::move(params),
                  voice_embedding = std::move(voice_embedding),
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
@@ -872,6 +948,13 @@ int main(int argc, char ** argv) {
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
+                    Qwen3TTS * this_tts = (*ensure_loaded_p)();
+                    if (!this_tts) {
+                        // can't synthesize without a model; close the stream
+                        // gracefully so the client doesn't hang on partial data.
+                        sink.done();
+                        return false;
+                    }
 
                     // wav header up front (audio mode only). for SSE, the wav
                     // bytes per-delta are raw pcm — clients reconstruct wav.
@@ -952,6 +1035,8 @@ int main(int argc, char ** argv) {
                                                + build_done_event(result) + "\n\n";
                         sink.write(done_frame.data(), done_frame.size());
                     }
+                    // bump idle timer so the watchdog doesn't unload mid-stream
+                    *last_used_p = std::chrono::steady_clock::now();
                     sink.done();
                     return false;
                 });
@@ -962,16 +1047,24 @@ int main(int argc, char ** argv) {
         tts_result result;
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
+            Qwen3TTS * t = ensure_loaded();
+            if (!t) {
+                res.status = 503;
+                res.set_content(R"({"error":{"message":"model reload failed","type":"server_error"}})",
+                                "application/json");
+                return;
+            }
             if (!voice_ref_codes.empty()) {
-                result = tts.synthesize_with_embedding(
+                result = t->synthesize_with_embedding(
                     input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
                     voice_ref_codes.data(), voice_n_ref_frames);
             } else if (!voice_embedding.empty()) {
-                result = tts.synthesize_with_embedding(
+                result = t->synthesize_with_embedding(
                     input, voice_embedding.data(), (int32_t)voice_embedding.size(), params);
             } else {
-                result = tts.synthesize(input, params);
+                result = t->synthesize(input, params);
             }
+            last_used = std::chrono::steady_clock::now();
         }
 
         if (!result.success) {
@@ -1073,8 +1166,37 @@ int main(int argc, char ** argv) {
         }
     });
 
+    // idle watchdog: drops the model after idle_timeout_sec of inactivity.
+    // try_lock avoids racing with an in-flight synth; if it can't grab the
+    // lock, it just skips the tick and tries again next second.
+    std::atomic<bool> watchdog_stop{false};
+    std::thread       watchdog_thread;
+    if (sp.idle_timeout_sec > 0) {
+        watchdog_thread = std::thread([&watchdog_stop, &tts, &synth_mutex, &last_used, &sp]() {
+            using namespace std::chrono;
+            while (!watchdog_stop.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(seconds(1));
+                if (watchdog_stop.load(std::memory_order_relaxed)) break;
+                std::unique_lock<std::mutex> lock(synth_mutex, std::try_to_lock);
+                if (!lock.owns_lock() || !tts) continue;
+                auto idle = steady_clock::now() - last_used;
+                if (idle >= seconds(sp.idle_timeout_sec)) {
+                    fprintf(stderr, "idle %llds: unloading model\n",
+                            (long long)duration_cast<seconds>(idle).count());
+                    tts.reset();
+                }
+            }
+        });
+    }
+
     fprintf(stderr, "server listening on %s:%d\n", sp.host.c_str(), sp.port);
-    if (!svr.listen(sp.host, sp.port)) {
+    bool listen_ok = svr.listen(sp.host, sp.port);
+
+    // signal the watchdog to exit so it doesn't outlive the locals it captures.
+    watchdog_stop.store(true, std::memory_order_relaxed);
+    if (watchdog_thread.joinable()) watchdog_thread.join();
+
+    if (!listen_ok) {
         fprintf(stderr, "fatal: failed to bind to %s:%d\n", sp.host.c_str(), sp.port);
         return 1;
     }

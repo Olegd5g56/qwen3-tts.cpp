@@ -62,11 +62,15 @@ void resample_to_24k(std::vector<float> & samples, int sample_rate) {
 
 } // namespace
 
-VoiceStore::VoiceStore(std::string root_dir, Qwen3TTS * tts, std::mutex * synth_mutex)
-    : root_(std::move(root_dir)), tts_(tts), synth_mutex_(synth_mutex) {}
+VoiceStore::VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
+                        bool has_speaker_encoder, std::mutex * synth_mutex)
+    : root_(std::move(root_dir)),
+      ensure_loaded_(std::move(ensure_loaded)),
+      has_speaker_encoder_(has_speaker_encoder),
+      synth_mutex_(synth_mutex) {}
 
 bool VoiceStore::can_encode_new() const {
-    return tts_->has_speaker_encoder();
+    return has_speaker_encoder_;
 }
 
 bool VoiceStore::valid_id(const std::string & id) {
@@ -143,7 +147,7 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
     }
 
     // No valid cache — must re-encode.
-    if (!tts_->has_speaker_encoder()) {
+    if (!has_speaker_encoder_) {
         error = "no valid cache and model lacks speaker encoder";
         return false;
     }
@@ -155,11 +159,19 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
     {
         std::lock_guard<std::mutex> sl(*synth_mutex_);
 
-        if (!tts_->extract_speaker_embedding(wav, v.embedding)) {
+        // Lazy-load: if the server has idle-unloaded the model, reload it
+        // here (still under the synth mutex so no concurrent synth races).
+        Qwen3TTS * tts = ensure_loaded_ ? ensure_loaded_() : nullptr;
+        if (!tts) {
+            error = "model not available (load failed)";
+            return false;
+        }
+
+        if (!tts->extract_speaker_embedding(wav, v.embedding)) {
             // ICL with ref_text alone can still work without an embedding,
             // so only fail outright when there's nothing left to fall back on.
             if (v.ref_text.empty()) {
-                error = "extract_speaker_embedding failed: " + tts_->get_error();
+                error = "extract_speaker_embedding failed: " + tts->get_error();
                 return false;
             }
             v.embedding.clear();
@@ -173,9 +185,9 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
                 return false;
             }
             resample_to_24k(samples, sr);
-            if (!tts_->encode_speech_codes(samples.data(), (int32_t)samples.size(),
+            if (!tts->encode_speech_codes(samples.data(), (int32_t)samples.size(),
                                             v.ref_codes, v.n_ref_frames)) {
-                error = "encode_speech_codes failed: " + tts_->get_error();
+                error = "encode_speech_codes failed: " + tts->get_error();
                 return false;
             }
         }
@@ -288,7 +300,7 @@ bool VoiceStore::create(const std::string & id, const std::string & wav_bytes,
         error = "invalid voice name (must be [A-Za-z0-9_.-]{1,64}, not '.'-prefixed, not 'default')";
         return false;
     }
-    if (!tts_->has_speaker_encoder()) {
+    if (!has_speaker_encoder_) {
         error = "model lacks speaker encoder; voice cloning requires the Base variant";
         return false;
     }

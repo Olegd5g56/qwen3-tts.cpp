@@ -2,12 +2,19 @@
 
 #include "qwen3_tts.h"
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace qwen3_tts {
+
+// Lazy accessor: returns a loaded Qwen3TTS pointer, or nullptr on failure.
+// Called only when the model is actually needed (encoding a fresh voice or
+// refreshing a stale cache). MUST be invoked with the associated synth mutex
+// held by the caller — the loader is not internally serialized.
+using EnsureLoadedFn = std::function<Qwen3TTS*()>;
 
 // One cloned voice. id matches the directory name on disk. embedding holds
 // the 1024-float speaker vector (may be empty for pure-ICL voices). When
@@ -31,7 +38,8 @@ struct voice_entry {
 // only public entry points and they respect this themselves.
 class VoiceStore {
 public:
-    VoiceStore(std::string root_dir, Qwen3TTS * tts, std::mutex * synth_mutex);
+    VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
+               bool has_speaker_encoder, std::mutex * synth_mutex);
 
     // Scan root_, drop entries whose source dirs vanished, (re)load anything
     // with a stale or missing cache. Cheap on warm starts (just stats files).
@@ -71,10 +79,11 @@ private:
                      std::string & error) const;
     static uint64_t file_mtime_ns(const std::string & path);
 
-    std::string  root_;
-    Qwen3TTS *   tts_;
-    std::mutex * synth_mutex_;
-    std::mutex   map_mutex_;
+    std::string     root_;
+    EnsureLoadedFn  ensure_loaded_;
+    bool            has_speaker_encoder_;
+    std::mutex *    synth_mutex_;
+    std::mutex      map_mutex_;
     std::map<std::string, voice_entry> voices_;
 };
 
