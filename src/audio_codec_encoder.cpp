@@ -258,6 +258,9 @@ bool AudioCodecEncoder::load_model(const std::string & model_path) {
         }
     }
 
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
+
     std::vector<ggml_backend_t> backends;
     backends.push_back(state_.backend);
     if (state_.backend_cpu) backends.push_back(state_.backend_cpu);
@@ -830,6 +833,12 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
 
     vq_encode(features_row.data(), n_frames, codes);
     return true;
+}
+
+void AudioCodecEncoder::set_n_threads(int32_t n_threads) {
+    state_.n_threads = n_threads;
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
 }
 
 void free_codec_encoder_model(codec_encoder_model & model) {

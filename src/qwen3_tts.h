@@ -197,6 +197,11 @@ public:
     // The callback is stored and automatically re-applied after lazy load/reload.
     void set_abort_callback(ggml_abort_callback callback, void * data);
 
+    // Set CPU thread count for all components. Stored and re-applied to
+    // any lazy-loaded component on its first load. Pass 0 to leave ggml's
+    // built-in default in effect.
+    void set_n_threads(int32_t n_threads);
+
     // Get error message
     const std::string & get_error() const { return error_msg_; }
 
@@ -232,6 +237,7 @@ private:
     tts_progress_callback_t progress_callback_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
+    int32_t n_threads_ = 0;
 };
 
 // Utility: Load audio file (WAV format)

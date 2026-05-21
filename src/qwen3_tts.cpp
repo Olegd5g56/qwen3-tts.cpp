@@ -882,6 +882,17 @@ void Qwen3TTS::set_abort_callback(ggml_abort_callback callback, void * data) {
     audio_decoder_.set_abort_callback(callback, data);
 }
 
+void Qwen3TTS::set_n_threads(int32_t n_threads) {
+    n_threads_ = n_threads;
+    // Push into every component — whether or not it's currently loaded.
+    // Each stores the value and (re)applies it on next backend init, so
+    // lazy-loaded components inherit the setting automatically.
+    transformer_.set_n_threads(n_threads);
+    audio_encoder_.set_n_threads(n_threads);
+    codec_encoder_.set_n_threads(n_threads);
+    audio_decoder_.set_n_threads(n_threads);
+}
+
 // Mix an interleaved multi-channel buffer down to mono, storing results in `out`.
 // InputT must be convertible to float; `scale` is applied before summing.
 template<typename InputT>

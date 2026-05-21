@@ -201,11 +201,13 @@ struct tts_transformer_state {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
-    
+
     std::vector<uint8_t> compute_meta;
-    
+
     tts_kv_cache cache;           // Talker KV cache (28 layers)
     tts_kv_cache code_pred_cache; // Code predictor KV cache (5 layers)
+
+    int32_t n_threads = 0;        // 0 = leave ggml default, otherwise applied to CPU backend(s)
 };
 
 // TTS Transformer class
@@ -303,6 +305,11 @@ public:
 
     // Set abort callback checked before each graph compute (thread-safe)
     void set_abort_callback(ggml_abort_callback callback, void * data);
+
+    // Set the CPU thread count for this component's CPU backend(s). Safe to
+    // call before or after load_model() — the value is stored and reapplied
+    // whenever the backends are (re)created.
+    void set_n_threads(int32_t n_threads);
 
     // Fired inside generate() after each frame's 16 codebook codes are
     // pushed onto the output vector. The callback receives the frame

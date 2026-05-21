@@ -262,6 +262,9 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
         }
     }
 
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
+
     std::vector<ggml_backend_t> backends;
     backends.push_back(state_.backend);
     if (state_.backend_cpu) {
@@ -771,6 +774,12 @@ void AudioTokenizerEncoder::set_abort_callback(ggml_abort_callback callback, voi
 
 bool AudioTokenizerEncoder::is_aborted() const {
     return abort_cb_ && abort_cb_(abort_data_);
+}
+
+void AudioTokenizerEncoder::set_n_threads(int32_t n_threads) {
+    state_.n_threads = n_threads;
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
 }
 
 } // namespace qwen3_tts

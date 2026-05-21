@@ -77,6 +77,11 @@ bool load_tensor_data_from_file(
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg);
 void release_preferred_backend(ggml_backend_t backend);
 
+// Set the thread count on `backend` if and only if it is a CPU backend.
+// No-op for GPU/accelerator backends (which ignore thread count). Safe to call
+// with a null backend or non-positive n_threads.
+void apply_n_threads_to_backend(ggml_backend_t backend, int32_t n_threads);
+
 // Helper function to free model resources
 void free_ggml_resources(struct ggml_context * ctx, ggml_backend_buffer_t buffer);
 

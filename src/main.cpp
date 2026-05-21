@@ -191,7 +191,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }
-    
+    tts.set_n_threads(params.n_threads);
+
     // Set progress callback
     tts.set_progress_callback([](int tokens, int max_tokens) {
         fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);

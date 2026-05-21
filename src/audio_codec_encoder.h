@@ -99,6 +99,7 @@ struct codec_encoder_state {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
+    int32_t n_threads = 0;        // 0 = leave ggml default, otherwise applied to CPU backend(s)
 };
 
 // encodes audio waveform → discrete speech codes for ICL voice cloning
@@ -119,6 +120,11 @@ public:
 
     const codec_encoder_config & get_config() const { return model_.config; }
     const std::string & get_error() const { return error_msg_; }
+
+    // Set the CPU thread count for this component's CPU backend(s). Safe to
+    // call before or after load_model() — the value is stored and reapplied
+    // whenever the backends are (re)created.
+    void set_n_threads(int32_t n_threads);
 
 private:
     struct ggml_cgraph * build_graph(int32_t n_samples);

@@ -137,7 +137,10 @@ bool TTSTransformer::load_model(const std::string & model_path) {
             return false;
         }
     }
-    
+
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
+
     std::vector<ggml_backend_t> backends;
     backends.push_back(state_.backend);
     if (state_.backend_cpu) {
@@ -148,14 +151,20 @@ bool TTSTransformer::load_model(const std::string & model_path) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
     }
-    
+
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
 
     if (!try_init_coreml_code_predictor(model_path)) {
         return false;
     }
-    
+
     return true;
+}
+
+void TTSTransformer::set_n_threads(int32_t n_threads) {
+    state_.n_threads = n_threads;
+    apply_n_threads_to_backend(state_.backend,     state_.n_threads);
+    apply_n_threads_to_backend(state_.backend_cpu, state_.n_threads);
 }
 
 bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_path) {

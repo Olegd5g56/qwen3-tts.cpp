@@ -155,6 +155,7 @@ struct audio_decoder_state {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
+    int32_t n_threads = 0;        // 0 = leave ggml default, otherwise applied to CPU backend(s)
 };
 
 // Audio tokenizer decoder (vocoder) class
@@ -167,6 +168,11 @@ public:
     // Set abort callback checked before each graph compute (thread-safe)
     void set_abort_callback(ggml_abort_callback callback, void * data);
     bool is_aborted() const;
+
+    // Set the CPU thread count for this component's CPU backend(s). Safe to
+    // call before or after load_model() — the value is stored and reapplied
+    // whenever the backends are (re)created.
+    void set_n_threads(int32_t n_threads);
 
     // Load model from GGUF file (tokenizer model)
     bool load_model(const std::string & model_path);

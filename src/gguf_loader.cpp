@@ -1,4 +1,5 @@
 #include "gguf_loader.h"
+#include "ggml-cpu.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +7,14 @@
 #include <fstream>
 
 namespace qwen3_tts {
+
+void apply_n_threads_to_backend(ggml_backend_t backend, int32_t n_threads) {
+    if (!backend || n_threads <= 0) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) return;
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return;
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+}
 
 namespace {
 struct shared_backend_state {

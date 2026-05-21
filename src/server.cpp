@@ -553,8 +553,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
         return 1;
     }
-    fprintf(stderr, "models loaded (type=%s, speakers=%zu)\n",
-            tts.get_model_type().c_str(), tts.get_speaker_names().size());
+    tts.set_n_threads(sp.n_threads);
+    fprintf(stderr, "models loaded (type=%s, speakers=%zu, threads=%d)\n",
+            tts.get_model_type().c_str(), tts.get_speaker_names().size(), sp.n_threads);
 
     // derive model id from filename (e.g. "qwen3-tts-0.6b-f16" from path)
     std::string model_id = sp.model;
