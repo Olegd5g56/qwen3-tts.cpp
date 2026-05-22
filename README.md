@@ -238,15 +238,29 @@ files yourself.
   alice/
     sample.wav     # or sample.mp3 (wav wins if both exist)
     sample.txt     # optional reference transcript (enables ICL)
-    .cache.bin     # encoded embedding + ref_codes, regenerated automatically
+    cache.bin      # encoded embedding + ref_codes, regenerated automatically
   bob/
     sample.mp3
-    .cache.bin
+    cache.bin
+```
+
+At startup the server pre-warms the whole library so the first request for
+any voice is fast. Progress is logged per voice — `cached` for warm starts,
+`encoded in N.Ns` when the cache is missing or stale:
+
+```
+voice library: ./voices (3 voices found, preloading...)
+  alice: cached (0ms)
+  bob:   encoded in 8.2s
+  carol: cached (1ms)
+voice library: ready (3 loaded, 8.3s total)
 ```
 
 Cache invalidation is by file mtime — editing the sample audio or
-`sample.txt` re-encodes on next use. `DELETE /v1/audio/voices/:id`
-returns **409** on a disk-backed id; remove the directory instead.
+`sample.txt` re-encodes on next use. The cache file is `cache.bin` (not
+hidden), so it's easy to spot and delete by hand if something goes wrong.
+`DELETE /v1/audio/voices/:id` returns **409** on a disk-backed id; remove
+the directory instead.
 
 **2. Session (ephemeral).** `POST /v1/audio/voices` decodes the uploaded
 WAV or MP3, encodes embedding + ICL prefix in RAM, and registers the voice
@@ -292,9 +306,14 @@ echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
 # inline reference audio — .wav or .mp3 (Base model)
 ./build/qwen3-tts-cli -m ./base -r reference.mp3 -t "Hello" -o cloned.wav
 
-# list everything visible to the loaded model
+# list everything visible to the loaded model (cheap — no encoding)
 ./build/qwen3-tts-cli -m ./model --voices-dir ./voices --list-voices
 ```
+
+Unlike the server, the CLI loads voices lazily — only the one passed to
+`-v` is encoded, and `--list-voices` doesn't touch any sample audio. On a
+cache miss you'll see `voice 'X': loading... / ready (N.Ns)` so the wait is
+visible. On a warm cache that whole step is sub-second.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
