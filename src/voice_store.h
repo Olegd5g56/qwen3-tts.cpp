@@ -32,12 +32,23 @@ struct voice_entry {
     bool disk_backed = true;
 };
 
+// Result of a single voice load reported through preload_all. ms is wall-clock
+// load time; from_cache distinguishes a fast cache.bin hit from a real encode.
+// error is empty on success.
+struct preload_progress {
+    std::string id;
+    bool        from_cache = false;
+    int64_t     ms = 0;
+    std::string error;
+};
+
 // Voice library combining two sources:
-//   * Disk: <root>/<id>/{sample.wav|sample.mp3, sample.txt?, .cache.bin}.
-//     Scanned on startup, refreshed on demand. `.cache.bin` stores the
-//     encoder outputs keyed by sample/text mtimes, so warm starts skip the
-//     expensive re-encoding. The server treats these as read-only — they
-//     are curated by manipulating files on disk.
+//   * Disk: <root>/<id>/{sample.wav|sample.mp3, sample.txt?, cache.bin}.
+//     refresh() discovers ids but does NOT touch audio or model — encoding is
+//     deferred until the voice is actually requested via get(), or until the
+//     caller explicitly calls preload_all() (server startup uses this for
+//     pre-warming with progress logging; the CLI uses lazy get() to avoid
+//     paying the cost for voices it isn't going to use).
 //   * Session: created via the upload endpoint, kept entirely in RAM. They
 //     survive idle-unload of the model (just data), but not process restart.
 //
@@ -49,17 +60,24 @@ public:
     VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
                bool has_speaker_encoder, std::mutex * synth_mutex);
 
-    // Scan root_, drop disk entries whose source dirs vanished, (re)load
-    // anything with a stale or missing cache. Session voices are not
-    // touched. Cheap on warm starts (just stats files). Returns true if
-    // the root dir is usable (created on demand if missing).
+    // Rescan root_ and rebuild the disk index. Cheap: only directory listing
+    // and a few stat() calls per voice, no audio I/O or encoding. Drops
+    // loaded disk entries whose source dirs disappeared. Session voices are
+    // preserved. Returns true if the root dir is usable (created on demand).
     bool refresh();
 
-    // Names of all currently-known voices, sorted.
+    // Force-load every discovered disk voice (cache hit or fresh encode), one
+    // by one. on_voice fires once per voice with its load time and outcome.
+    // Returns the number of voices that loaded successfully. Safe to call
+    // multiple times — already-loaded voices are skipped silently.
+    size_t preload_all(std::function<void(const preload_progress &)> on_voice);
+
+    // Names of all currently-known voices, sorted. Cheap — does not load.
     std::vector<std::string> list();
 
-    // Copy out a voice by id. If not in the in-memory map, refreshes from
-    // disk once before giving up. Returns false if no such voice exists.
+    // Copy out a voice by id. Lazy: if the voice is in the disk index but
+    // hasn't been loaded yet, this is the call that pays the encoding cost.
+    // Returns false if no such voice exists.
     bool get(const std::string & id, voice_entry & out);
 
     // Decode an uploaded audio buffer (WAV or MP3, sniffed by magic bytes),
@@ -67,7 +85,7 @@ public:
     // Nothing is written to disk. Returns false (and sets error) on:
     //   * invalid id / missing speaker encoder
     //   * empty or malformed audio
-    //   * collision with an existing disk-backed voice (id reserved)
+    //   * collision with a disk-backed voice (loaded OR merely indexed)
     //   * encoder failure
     // If a session voice with the same id already exists it is replaced.
     bool create(const std::string & id, const std::string & audio_bytes,
@@ -86,7 +104,15 @@ public:
     static bool valid_id(const std::string & id);
 
 private:
-    bool load_voice_locked(const std::string & id, voice_entry & out, std::string & error);
+    // What refresh() records per discovered disk voice. Holding only paths
+    // here keeps refresh fast — the actual audio is decoded only on demand.
+    struct disk_voice_info {
+        std::string sample_path;     // sample.wav or sample.mp3 (whichever exists; wav wins)
+        std::string ref_text_path;   // sample.txt, or empty when absent
+    };
+
+    bool load_voice_locked(const std::string & id, voice_entry & out,
+                           bool & from_cache, std::string & error);
     bool read_cache(const std::string & dir, voice_entry & out,
                     uint64_t expected_wav_mtime, uint64_t expected_txt_mtime,
                     std::string & error) const;
@@ -100,7 +126,8 @@ private:
     bool            has_speaker_encoder_;
     std::mutex *    synth_mutex_;
     std::mutex      map_mutex_;
-    std::map<std::string, voice_entry> voices_;
+    std::map<std::string, disk_voice_info> disk_index_;
+    std::map<std::string, voice_entry>     voices_;
 };
 
 } // namespace qwen3_tts

@@ -627,9 +627,29 @@ int main(int argc, char ** argv) {
                             cached_has_speaker_encoder, &synth_mutex);
     if (!sp.voices_dir.empty()) {
         voice_store.refresh();
-        auto v = voice_store.list();
-        fprintf(stderr, "voice library: %s (%zu voice%s)\n",
-                sp.voices_dir.c_str(), v.size(), v.size() == 1 ? "" : "s");
+        auto discovered = voice_store.list();
+        fprintf(stderr, "voice library: %s (%zu voice%s found, preloading...)\n",
+                sp.voices_dir.c_str(), discovered.size(),
+                discovered.size() == 1 ? "" : "s");
+        const auto t_start = std::chrono::steady_clock::now();
+        const size_t loaded = voice_store.preload_all([](const preload_progress & p) {
+            if (!p.error.empty()) {
+                fprintf(stderr, "  %s: FAILED (%s)\n", p.id.c_str(), p.error.c_str());
+            } else if (p.from_cache) {
+                fprintf(stderr, "  %s: cached (%lldms)\n", p.id.c_str(), (long long)p.ms);
+            } else {
+                fprintf(stderr, "  %s: encoded in %.1fs\n",
+                        p.id.c_str(), (double)p.ms / 1000.0);
+            }
+        });
+        const auto t_total = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_start).count();
+        std::string failed_suffix;
+        if (loaded < discovered.size()) {
+            failed_suffix = ", " + std::to_string(discovered.size() - loaded) + " failed";
+        }
+        fprintf(stderr, "voice library: ready (%zu loaded%s, %.1fs total)\n",
+                loaded, failed_suffix.c_str(), (double)t_total / 1000.0);
     }
 
     httplib::Server svr;

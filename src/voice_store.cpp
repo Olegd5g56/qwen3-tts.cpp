@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@ namespace {
 
 constexpr char     CACHE_MAGIC[8] = {'Q','3','T','V','O','I','C','E'};
 constexpr uint32_t CACHE_VERSION  = 1;
+constexpr const char * CACHE_FILE = "cache.bin";
 
 #pragma pack(push, 1)
 struct cache_header {
@@ -58,6 +60,11 @@ void resample_to_24k(std::vector<float> & samples, int sample_rate) {
         }
     }
     samples = std::move(resampled);
+}
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 } // namespace
@@ -106,9 +113,9 @@ bool VoiceStore::refresh() {
         }
     }
 
-    // Build the new disk-voice set first, then merge with the existing
-    // session voices (which live only in RAM and aren't reflected on disk).
-    std::map<std::string, voice_entry> next;
+    // Cheap pass: list directory entries and record sample paths. No audio
+    // is decoded and no model is touched here — that's preload_all()'s job.
+    std::map<std::string, disk_voice_info> next_index;
     for (const auto & ent : fs::directory_iterator(root_, ec)) {
         if (ec) break;
         if (!ent.is_directory(ec)) continue;
@@ -117,56 +124,95 @@ bool VoiceStore::refresh() {
             fprintf(stderr, "voice_store: skipping '%s' (invalid name)\n", id.c_str());
             continue;
         }
-        voice_entry v;
-        std::string err;
-        if (load_voice_locked(id, v, err)) {
-            next.emplace(id, std::move(v));
+        const std::string dir = root_ + "/" + id;
+        // Prefer sample.wav; fall back to sample.mp3.
+        std::string sample = dir + "/sample.wav";
+        if (file_mtime_ns(sample) == 0) {
+            std::string mp3 = dir + "/sample.mp3";
+            if (file_mtime_ns(mp3) == 0) {
+                fprintf(stderr, "voice_store: skipping '%s' (no sample.wav or sample.mp3)\n",
+                        id.c_str());
+                continue;
+            }
+            sample = mp3;
+        }
+        disk_voice_info info;
+        info.sample_path = sample;
+        const std::string txt = dir + "/sample.txt";
+        if (file_mtime_ns(txt) != 0) info.ref_text_path = txt;
+        next_index.emplace(std::move(id), std::move(info));
+    }
+
+    // Drop loaded disk-backed voices whose source directory disappeared.
+    // Session voices stay regardless.
+    for (auto it = voices_.begin(); it != voices_.end(); ) {
+        if (it->second.disk_backed && next_index.find(it->first) == next_index.end()) {
+            it = voices_.erase(it);
         } else {
-            fprintf(stderr, "voice_store: skipping '%s': %s\n", id.c_str(), err.c_str());
+            ++it;
         }
     }
-    // Carry over any session voices. Disk wins on name collision — session
-    // voices can't shadow a disk-backed name (create() refuses such collisions
-    // up front, but be defensive in case one slipped in before a fresh dir
-    // appeared).
-    for (auto & kv : voices_) {
-        if (!kv.second.disk_backed && next.find(kv.first) == next.end()) {
-            next.emplace(kv.first, std::move(kv.second));
-        }
-    }
-    voices_ = std::move(next);
+
+    disk_index_ = std::move(next_index);
     return true;
 }
 
-bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, std::string & error) {
-    const std::string dir = root_ + "/" + id;
-    const std::string txt = dir + "/sample.txt";
-
-    // Accept sample.wav or sample.mp3; wav wins if both are present
-    // (keeps existing voices using the cached path unchanged).
-    std::string wav = dir + "/sample.wav";
-    uint64_t wav_mtime = file_mtime_ns(wav);
-    if (wav_mtime == 0) {
-        const std::string mp3 = dir + "/sample.mp3";
-        const uint64_t mp3_mtime = file_mtime_ns(mp3);
-        if (mp3_mtime != 0) {
-            wav = mp3;
-            wav_mtime = mp3_mtime;
+size_t VoiceStore::preload_all(std::function<void(const preload_progress &)> on_voice) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    size_t loaded = 0;
+    for (const auto & kv : disk_index_) {
+        const std::string & id = kv.first;
+        if (voices_.find(id) != voices_.end()) {
+            loaded++;
+            continue;
+        }
+        preload_progress prog;
+        prog.id = id;
+        const int64_t t0 = now_ms();
+        voice_entry v;
+        bool from_cache = false;
+        if (load_voice_locked(id, v, from_cache, prog.error)) {
+            voices_[id] = std::move(v);
+            prog.from_cache = from_cache;
+            prog.ms = now_ms() - t0;
+            if (on_voice) on_voice(prog);
+            loaded++;
+        } else {
+            prog.ms = now_ms() - t0;
+            if (on_voice) on_voice(prog);
         }
     }
-    if (wav_mtime == 0) {
-        error = "missing sample audio (expected sample.wav or sample.mp3)";
+    return loaded;
+}
+
+bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out,
+                                    bool & from_cache, std::string & error) {
+    from_cache = false;
+    auto it = disk_index_.find(id);
+    if (it == disk_index_.end()) {
+        error = "voice not present in disk index";
         return false;
     }
-    const uint64_t txt_mtime = file_mtime_ns(txt); // 0 = absent, which is valid
+    const std::string & wav = it->second.sample_path;
+    const std::string & txt = it->second.ref_text_path;
+
+    const uint64_t wav_mtime = file_mtime_ns(wav);
+    if (wav_mtime == 0) {
+        error = "sample file disappeared: " + wav;
+        return false;
+    }
+    const uint64_t txt_mtime = txt.empty() ? 0 : file_mtime_ns(txt);
+
+    const std::string dir = root_ + "/" + id;
 
     voice_entry cached;
     std::string cerr;
     if (read_cache(dir, cached, wav_mtime, txt_mtime, cerr)) {
         cached.id = id;
         cached.disk_backed = true;
-        if (txt_mtime != 0) cached.ref_text = read_text_trimmed(txt);
+        if (!txt.empty()) cached.ref_text = read_text_trimmed(txt);
         out = std::move(cached);
+        from_cache = true;
         return true;
     }
 
@@ -179,7 +225,7 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
     voice_entry v;
     v.id = id;
     v.disk_backed = true;
-    if (txt_mtime != 0) v.ref_text = read_text_trimmed(txt);
+    if (!txt.empty()) v.ref_text = read_text_trimmed(txt);
 
     {
         std::lock_guard<std::mutex> sl(*synth_mutex_);
@@ -230,7 +276,7 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
 bool VoiceStore::read_cache(const std::string & dir, voice_entry & out,
                              uint64_t expected_wav_mtime, uint64_t expected_txt_mtime,
                              std::string & error) const {
-    const std::string path = dir + "/.cache.bin";
+    const std::string path = dir + "/" + CACHE_FILE;
     std::ifstream f(path, std::ios::binary);
     if (!f) { error = "no cache"; return false; }
     cache_header hdr{};
@@ -260,7 +306,7 @@ bool VoiceStore::read_cache(const std::string & dir, voice_entry & out,
 bool VoiceStore::write_cache(const std::string & dir, const voice_entry & v,
                               uint64_t wav_mtime, uint64_t txt_mtime,
                               std::string & error) const {
-    const std::string path = dir + "/.cache.bin";
+    const std::string path = dir + "/" + CACHE_FILE;
     const std::string tmp  = path + ".tmp";
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
     if (!f) { error = std::strerror(errno); return false; }
@@ -297,25 +343,36 @@ bool VoiceStore::write_cache(const std::string & dir, const voice_entry & v,
 }
 
 std::vector<std::string> VoiceStore::list() {
-    refresh();
     std::lock_guard<std::mutex> lock(map_mutex_);
     std::vector<std::string> out;
-    out.reserve(voices_.size());
-    for (const auto & kv : voices_) out.push_back(kv.first);
+    out.reserve(disk_index_.size() + voices_.size());
+    for (const auto & kv : disk_index_) out.push_back(kv.first);
+    for (const auto & kv : voices_) {
+        if (disk_index_.find(kv.first) == disk_index_.end()) {
+            // session voice not shadowed by disk
+            out.push_back(kv.first);
+        }
+    }
+    std::sort(out.begin(), out.end());
     return out;
 }
 
 bool VoiceStore::get(const std::string & id, voice_entry & out) {
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        auto it = voices_.find(id);
-        if (it != voices_.end()) { out = it->second; return true; }
-    }
-    refresh();
     std::lock_guard<std::mutex> lock(map_mutex_);
-    auto it = voices_.find(id);
-    if (it == voices_.end()) return false;
-    out = it->second;
+    auto vit = voices_.find(id);
+    if (vit != voices_.end()) { out = vit->second; return true; }
+    if (disk_index_.find(id) == disk_index_.end()) return false;
+
+    // Discovered but not loaded yet — pay the cost now.
+    voice_entry v;
+    bool from_cache = false;
+    std::string err;
+    if (!load_voice_locked(id, v, from_cache, err)) {
+        fprintf(stderr, "voice_store: failed to load '%s': %s\n", id.c_str(), err.c_str());
+        return false;
+    }
+    voices_[id] = v;
+    out = std::move(v);
     return true;
 }
 
@@ -334,11 +391,16 @@ bool VoiceStore::create(const std::string & id, const std::string & audio_bytes,
         return false;
     }
 
-    // Refuse to shadow a disk-backed voice. Disk voices are curated by file
-    // management, and silently overlaying them in-memory would confuse the
-    // operator.
+    // Refuse to shadow a disk-backed voice — whether already loaded into
+    // voices_ or merely indexed by refresh() and not yet encoded. Disk voices
+    // are curated by file management; silently overlaying them in-memory
+    // would confuse the operator.
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
+        if (disk_index_.find(id) != disk_index_.end()) {
+            error = "voice id is reserved by a disk-backed voice; pick a different name";
+            return false;
+        }
         auto it = voices_.find(id);
         if (it != voices_.end() && it->second.disk_backed) {
             error = "voice id is reserved by a disk-backed voice; pick a different name";
@@ -391,6 +453,10 @@ bool VoiceStore::create(const std::string & id, const std::string & audio_bytes,
         std::lock_guard<std::mutex> lock(map_mutex_);
         // Re-check collision in case a disk refresh raced and added a
         // matching disk voice while we were encoding.
+        if (disk_index_.find(id) != disk_index_.end()) {
+            error = "voice id is reserved by a disk-backed voice; pick a different name";
+            return false;
+        }
         auto it = voices_.find(id);
         if (it != voices_.end() && it->second.disk_backed) {
             error = "voice id is reserved by a disk-backed voice; pick a different name";
@@ -404,9 +470,14 @@ bool VoiceStore::create(const std::string & id, const std::string & audio_bytes,
 bool VoiceStore::remove(const std::string & id, std::string & error) {
     if (!valid_id(id)) { error = "invalid voice id"; return false; }
     std::lock_guard<std::mutex> lock(map_mutex_);
+    if (disk_index_.find(id) != disk_index_.end()) {
+        error = "voice is disk-backed; remove the directory on disk instead";
+        return false;
+    }
     auto it = voices_.find(id);
     if (it == voices_.end()) { error = "not found"; return false; }
     if (it->second.disk_backed) {
+        // belt-and-braces — disk_index_ should have caught this above
         error = "voice is disk-backed; remove the directory on disk instead";
         return false;
     }

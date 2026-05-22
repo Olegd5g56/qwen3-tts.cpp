@@ -2,6 +2,7 @@
 #include "voice_store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -320,10 +321,19 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             qwen3_tts::voice_entry ve;
+            // get() pays the cost of cache lookup or fresh encoding only when
+            // it actually misses — but the CLI was previously silent during
+            // that wait, so print a heads-up plus the timing afterwards.
+            fprintf(stderr, "voice '%s': loading...\n", voice_name.c_str());
+            auto t_voice0 = std::chrono::steady_clock::now();
             if (!voice_store.get(voice_name, ve)) {
                 fprintf(stderr, "Error: unknown voice '%s'\n", voice_name.c_str());
                 return 1;
             }
+            auto t_voice_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_voice0).count();
+            fprintf(stderr, "voice '%s': ready (%.1fs)\n",
+                    voice_name.c_str(), (double)t_voice_ms / 1000.0);
             voice_embedding    = std::move(ve.embedding);
             params.ref_text    = std::move(ve.ref_text);
             voice_ref_codes    = std::move(ve.ref_codes);
