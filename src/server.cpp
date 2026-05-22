@@ -619,11 +619,21 @@ int main(int argc, char ** argv) {
     auto dot = model_id.rfind('.');
     if (dot != std::string::npos) model_id = model_id.substr(0, dot);
 
+    // Cloned voices only make sense on Base — they're encoded by the Base
+    // speaker_encoder and the embedding space doesn't transfer to other variants.
+    if (cached_model_type != "base" && !sp.voices_dir.empty()) {
+        fprintf(stderr, "warning: model type '%s' cannot use cloned voices; "
+                        "voice library at '%s' will be ignored. "
+                        "Use a Base model for voice cloning.\n",
+                cached_model_type.c_str(), sp.voices_dir.c_str());
+        sp.voices_dir.clear();
+    }
+
     // persistent on-disk voice library; manages embeddings and ICL caches.
     VoiceStore voice_store(sp.voices_dir, ensure_loaded,
                             cached_has_speaker_encoder, &synth_mutex);
-    voice_store.refresh();
-    {
+    if (!sp.voices_dir.empty()) {
+        voice_store.refresh();
         auto v = voice_store.list();
         fprintf(stderr, "voice library: %s (%zu voice%s)\n",
                 sp.voices_dir.c_str(), v.size(), v.size() == 1 ? "" : "s");

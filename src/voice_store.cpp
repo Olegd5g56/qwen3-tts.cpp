@@ -94,6 +94,8 @@ uint64_t VoiceStore::file_mtime_ns(const std::string & path) {
 bool VoiceStore::refresh() {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
+    if (root_.empty()) return false;
+
     std::error_code ec;
     if (!fs::exists(root_, ec)) {
         fs::create_directories(root_, ec);

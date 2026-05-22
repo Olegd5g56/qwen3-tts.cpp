@@ -177,6 +177,7 @@ target_link_libraries(qwen3tts_shared PRIVATE
 # CLI executable
 add_executable(qwen3-tts-cli
     src/main.cpp
+    src/voice_store.cpp
 )
 target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts

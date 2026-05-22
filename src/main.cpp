@@ -1,9 +1,30 @@
 #include "qwen3_tts.h"
+#include "voice_store.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <unistd.h>
+
+static bool parse_language(const std::string & lang, int32_t & out_id) {
+    if      (lang == "en" || lang == "english")    out_id = 2050;
+    else if (lang == "ru" || lang == "russian")    out_id = 2069;
+    else if (lang == "zh" || lang == "chinese")    out_id = 2055;
+    else if (lang == "ja" || lang == "japanese")   out_id = 2058;
+    else if (lang == "ko" || lang == "korean")     out_id = 2064;
+    else if (lang == "de" || lang == "german")     out_id = 2053;
+    else if (lang == "fr" || lang == "french")     out_id = 2061;
+    else if (lang == "es" || lang == "spanish")    out_id = 2054;
+    else if (lang == "it" || lang == "italian")    out_id = 2070;
+    else if (lang == "pt" || lang == "portuguese") out_id = 2071;
+    else return false;
+    return true;
+}
 
 void print_usage(const char * program) {
     fprintf(stderr, "Usage: %s [options] -m <model_dir> -t <text>\n", program);
@@ -11,9 +32,12 @@ void print_usage(const char * program) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -m, --model <path>     Talker gguf file, or directory containing talker+tokenizer ggufs (required)\n");
     fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
-    fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
+    fprintf(stderr, "  -t, --text <text>      Text to synthesize (or piped via stdin)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "  -v, --voice <name>     Built-in speaker or a voice from --voices-dir\n");
+    fprintf(stderr, "      --voices-dir <d>   Voice library directory (same layout as the server)\n");
+    fprintf(stderr, "      --list-voices      List available voices (built-in + library) and exit\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
@@ -25,9 +49,15 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -j, --threads <n>      Number of threads (default: 4)\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "Environment variables (overridden by CLI flags):\n");
+    fprintf(stderr, "  TTS_MODEL, TTS_VOCODER, TTS_THREADS\n");
+    fprintf(stderr, "  TTS_VOICE, TTS_VOICES_DIR, TTS_LANGUAGE\n");
+    fprintf(stderr, "  TTS_TEMPERATURE, TTS_TOP_K, TTS_REPETITION_PENALTY, TTS_SEED\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "Example:\n");
     fprintf(stderr, "  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
     fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
+    fprintf(stderr, "  echo \"Hello!\" | %s -m ./models -o hello.wav\n", program);
 }
 
 int main(int argc, char ** argv) {
@@ -36,10 +66,33 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
+    std::string voice_name;
+    std::string voices_dir;
+    bool        list_voices = false;
     int32_t streaming_batch_size = 0;
 
     qwen3_tts::tts_params params;
-    
+
+    // Defaults from environment. CLI flags below take precedence.
+    auto env_str = [](const char * name, std::string & dst) {
+        if (const char * v = std::getenv(name)) dst = v;
+    };
+    env_str("TTS_MODEL",      model_path);
+    env_str("TTS_VOCODER",    vocoder_path);
+    env_str("TTS_VOICE",      voice_name);
+    env_str("TTS_VOICES_DIR", voices_dir);
+    if (const char * v = std::getenv("TTS_LANGUAGE")) {
+        if (!parse_language(v, params.language_id)) {
+            fprintf(stderr, "Error: TTS_LANGUAGE='%s' is not a supported language\n", v);
+            return 1;
+        }
+    }
+    if (const char * v = std::getenv("TTS_THREADS"))            params.n_threads          = std::stoi(v);
+    if (const char * v = std::getenv("TTS_TEMPERATURE"))        params.temperature        = std::stof(v);
+    if (const char * v = std::getenv("TTS_TOP_K"))              params.top_k              = std::stoi(v);
+    if (const char * v = std::getenv("TTS_REPETITION_PENALTY")) params.repetition_penalty = std::stof(v);
+    if (const char * v = std::getenv("TTS_SEED"))               params.seed               = std::stoll(v);
+
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -74,6 +127,14 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             reference_audio = argv[i];
+        } else if (arg == "-v" || arg == "--voice") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing voice name\n"); return 1; }
+            voice_name = argv[i];
+        } else if (arg == "--voices-dir") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing voices dir\n"); return 1; }
+            voices_dir = argv[i];
+        } else if (arg == "--list-voices") {
+            list_voices = true;
         } else if (arg == "--ref-text") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing ref-text\n");
@@ -121,19 +182,8 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "Error: missing language value\n");
                 return 1;
             }
-            std::string lang = argv[i];
-            if (lang == "en" || lang == "english")       params.language_id = 2050;
-            else if (lang == "ru" || lang == "russian")  params.language_id = 2069;
-            else if (lang == "zh" || lang == "chinese")  params.language_id = 2055;
-            else if (lang == "ja" || lang == "japanese")  params.language_id = 2058;
-            else if (lang == "ko" || lang == "korean")   params.language_id = 2064;
-            else if (lang == "de" || lang == "german")   params.language_id = 2053;
-            else if (lang == "fr" || lang == "french")   params.language_id = 2061;
-            else if (lang == "es" || lang == "spanish")  params.language_id = 2054;
-            else if (lang == "it" || lang == "italian")  params.language_id = 2070;
-            else if (lang == "pt" || lang == "portuguese") params.language_id = 2071;
-            else {
-                fprintf(stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str());
+            if (!parse_language(argv[i], params.language_id)) {
+                fprintf(stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", argv[i]);
                 return 1;
             }
         } else if (arg == "-i" || arg == "--instructions") {
@@ -163,10 +213,29 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 1;
     }
-    
-    if (text.empty()) {
-        fprintf(stderr, "Error: text is required\n");
+
+    // Read text from stdin when -t/--text was not given and stdin is piped.
+    if (!list_voices && text.empty() && !isatty(fileno(stdin))) {
+        std::string buf;
+        char chunk[4096];
+        while (size_t n = fread(chunk, 1, sizeof(chunk), stdin)) {
+            buf.append(chunk, n);
+        }
+        while (!buf.empty() && (buf.back() == '\n' || buf.back() == '\r' ||
+                                buf.back() == ' '  || buf.back() == '\t')) {
+            buf.pop_back();
+        }
+        text = std::move(buf);
+    }
+
+    if (!list_voices && text.empty()) {
+        fprintf(stderr, "Error: text is required (pass via -t or pipe to stdin)\n");
         print_usage(argv[0]);
+        return 1;
+    }
+
+    if (!voice_name.empty() && !reference_audio.empty()) {
+        fprintf(stderr, "Error: --voice and --reference are mutually exclusive\n");
         return 1;
     }
     
@@ -193,14 +262,81 @@ int main(int argc, char ** argv) {
     }
     tts.set_n_threads(params.n_threads);
 
+    // Cloned voices only make sense on Base — they're encoded by the Base
+    // speaker_encoder and the embedding space doesn't transfer to other variants.
+    const bool model_supports_cloned_voices = (tts.get_model_type() == "base");
+    if (!voices_dir.empty() && !model_supports_cloned_voices) {
+        fprintf(stderr, "warning: model type '%s' cannot use cloned voices; "
+                        "ignoring --voices-dir. Use a Base model for voice cloning.\n",
+                tts.get_model_type().c_str());
+        voices_dir.clear();
+    }
+
+    // Voice library — same on-disk layout as the server, optional.
+    std::mutex synth_mutex;
+    std::function<qwen3_tts::Qwen3TTS*()> ensure_loaded = [&tts]() { return &tts; };
+    qwen3_tts::VoiceStore voice_store(voices_dir, ensure_loaded,
+                                       tts.has_speaker_encoder(), &synth_mutex);
+    if (!voices_dir.empty()) {
+        voice_store.refresh();
+    }
+
+    const std::vector<std::string> & builtin_speakers = tts.get_speaker_names();
+
+    if (list_voices) {
+        fprintf(stderr, "Built-in speakers (%zu):\n", builtin_speakers.size());
+        for (const auto & n : builtin_speakers) printf("  %s\n", n.c_str());
+        if (!voices_dir.empty()) {
+            auto lib = voice_store.list();
+            fprintf(stderr, "Library voices in %s (%zu):\n", voices_dir.c_str(), lib.size());
+            for (const auto & n : lib) printf("  %s\n", n.c_str());
+        }
+        return 0;
+    }
+
+    // Resolve --voice to either a built-in speaker embedding or an on-disk entry.
+    std::vector<float>   voice_embedding;
+    std::vector<int32_t> voice_ref_codes;
+    int32_t              voice_n_ref_frames = 0;
+    if (!voice_name.empty() && voice_name != "default") {
+        bool is_builtin = std::find(builtin_speakers.begin(), builtin_speakers.end(),
+                                    voice_name) != builtin_speakers.end();
+        if (is_builtin) {
+            if (!tts.get_speaker_embedding(voice_name, voice_embedding)) {
+                fprintf(stderr, "Error: failed to get speaker embedding for '%s': %s\n",
+                        voice_name.c_str(), tts.get_error().c_str());
+                return 1;
+            }
+        } else {
+            if (voices_dir.empty()) {
+                if (!model_supports_cloned_voices) {
+                    fprintf(stderr, "Error: voice '%s' not found among built-in speakers; "
+                                    "this model can't use cloned voices either\n", voice_name.c_str());
+                } else {
+                    fprintf(stderr, "Error: unknown voice '%s' (no --voices-dir set)\n", voice_name.c_str());
+                }
+                return 1;
+            }
+            qwen3_tts::voice_entry ve;
+            if (!voice_store.get(voice_name, ve)) {
+                fprintf(stderr, "Error: unknown voice '%s'\n", voice_name.c_str());
+                return 1;
+            }
+            voice_embedding    = std::move(ve.embedding);
+            params.ref_text    = std::move(ve.ref_text);
+            voice_ref_codes    = std::move(ve.ref_codes);
+            voice_n_ref_frames = ve.n_ref_frames;
+        }
+    }
+
     // Set progress callback
     tts.set_progress_callback([](int tokens, int max_tokens) {
         fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
     });
-    
+
     // Generate speech
     qwen3_tts::tts_result result;
-    
+
     qwen3_tts::streaming_opts stream_opts;
     size_t stream_batches_seen = 0;
     if (streaming_batch_size > 0) {
@@ -212,7 +348,20 @@ int main(int argc, char ** argv) {
         };
     }
 
-    if (reference_audio.empty()) {
+    if (!voice_embedding.empty()) {
+        fprintf(stderr, "Synthesizing with voice '%s': \"%s\"\n", voice_name.c_str(), text.c_str());
+        if (!voice_ref_codes.empty()) {
+            result = tts.synthesize_with_embedding(
+                text, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
+                voice_ref_codes.data(), voice_n_ref_frames,
+                streaming_batch_size > 0 ? &stream_opts : nullptr);
+        } else {
+            result = tts.synthesize_with_embedding(
+                text, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
+                nullptr, 0,
+                streaming_batch_size > 0 ? &stream_opts : nullptr);
+        }
+    } else if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
         if (streaming_batch_size > 0) {
             result = tts.synthesize(text, params, &stream_opts);
