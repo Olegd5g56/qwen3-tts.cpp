@@ -1,322 +1,371 @@
 # qwen3-tts.cpp
 
-## Added In This Fork
-
-This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) layers the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
-
-- **1.7B model support** with MTP projection bridging the 2048-dim talker and 1024-dim code predictor, plus dynamic model detection
-- **ICL voice cloning** via Mimi codec encoder — reference audio is encoded to discrete speech codes and combined with `ref_text` in prefill, as an alternative to x-vector speaker embeddings
-- **Voice steering** via `--instructions` flag and server API (1.7B+ only)
-- **Multi-language synthesis** via `-l/--language` (en, zh, ja, ko, ru, de, fr, es, it, pt)
-- **Proper UTF-8 tokenization** via GPT-2 regex pre-tokenization (fixes tokenization of non-ASCII text)
-- **WAVE_FORMAT_EXTENSIBLE** WAV header support (e.g. macOS screen recordings)
-- **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
-- **ICL encoder parity fix**: correct conv-layer bias loading (a subtle `sscanf` partial-match bug silently dropped input-conv and resunit biases), raising encoder/Python cosine similarity from ~0.989 to ~0.99999 per stage and eliminating the ~350ms start-of-audio noise in cloned voices
-- **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
-- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading GGUFs from the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts)
-- **Streaming audio output**: chunked vocoder decode with causal tails, per-layer KV rolling, and conv-transpose overlap state, so PCM is emitted frame-by-frame while the transformer is still generating. Exposed via the CLI `--streaming-batch-size N` flag and wired through the server for live HTTP responses; parity-tested against one-shot decode
-- **Real token accounting** in `tts_result` (text / prefill / audio tokens, plus prefill time broken out of total generate time) for accurate OpenAI `usage` reporting
-- **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
-- **Batch model conversion** script that downloads and converts all Qwen3-TTS variants in one shot
-
-### HuggingFace Models
-
-Pre-converted GGUF artifacts are published in the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts):
-
-| Repo | Variant |
-|------|---------|
-| [`khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF) | 0.6B, ICL voice clone |
-| [`khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF) | 0.6B, speaker presets |
-| [`khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF) | 1.7B, ICL voice clone |
-| [`khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF) | 1.7B, speaker presets |
-| [`khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF) | 1.7B, `--instructions` steering |
-| [`khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF) | shared vocoder |
-
-Each repo ships F16 and Q8_0 quants. The server auto-downloads and caches them via `--hf-repo`:
-
-```bash
-./build/qwen3-tts-server \
-    --hf-repo khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF:Q8_0 \
-    --hf-repo-v khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16
-```
-
-`--hf-repo <repo>[:<quant>]` defaults to `Q8_0`; override the exact GGUF filename with `--hf-file`.
-
-The rest of this README is the original from upstream.
-
----
-
-![PyTorch vs qwen3-tts.cpp benchmark](./docs/benchmark_pytorch_vs_cpp.png)
-
-**Benchmark Snapshot (PyTorch vs qwen3-tts.cpp):** Basic 3.19x faster, Clone 4.07x faster. Peak RSS delta: Basic +19.0%, Clone +7.7%.
-
-C++ inference for [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) using the [GGML](https://github.com/ggml-org/ggml) tensor library.
-
-Runs the full TTS pipeline in pure C++17, including text tokenization, speaker encoding, transformer code generation, and vocoder decoding, without Python or PyTorch at inference time.
+C++17 inference for [Qwen3-TTS](https://huggingface.co/collections/khimaros/qwen3-tts)
+built on [GGML](https://github.com/ggml-org/ggml). Ships an OpenAI-compatible
+HTTP server with live audio streaming, voice cloning, and a CLI for one-shot
+synthesis. No Python or PyTorch at inference time.
 
 ## Features
 
-- Full text-to-speech pipeline in C++17 with GGML backend
-- Voice cloning from reference audio (ECAPA-TDNN x-vector extraction)
-- Greedy and sampled decoding (temperature, top-k, repetition penalty)
-- GGUF model format (F16 and Q8_0 quantization)
-- Runtime backend selection with GPU/Metal preference and CPU fallback
-- Deterministic reference tests comparing C++ output against Python
-- Compile-time timing instrumentation with zero overhead in normal builds
+- OpenAI-compatible `/v1/audio/speech` server with `wav`, `pcm`, and `opus` output
+- Live streaming: PCM/WAV/Opus chunks flushed to the wire as the vocoder produces
+  them (`stream_format=audio` or SSE)
+- Voice library shared between server and CLI — drop reference WAVs into a
+  directory and address them by name
+- Voice cloning via Mimi-codec ICL prefix (Base models) and built-in speaker
+  presets (CustomVoice models)
+- Voice steering via `instructions` (VoiceDesign 1.7B)
+- Multi-language: `en`, `ru`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `it`, `pt`
+- Backend selection at runtime: Vulkan / CUDA / Metal / CPU (via GGML)
+- Idle-unload watchdog for memory-constrained hosts
+- F16 and Q8_0 GGUFs auto-downloaded from Hugging Face
 
-## Prerequisites
+## Quickstart
 
-- C++17 compiler (GCC 9+ or Clang 10+)
-- CMake 3.14+
-- [GGML](https://github.com/ggml-org/ggml) built from source
-- Python 3.10+ with [uv](https://github.com/astral-sh/uv) (model conversion only)
-
-## Quickstart (macOS, copy/paste)
-
-Run these commands from a fresh clone:
+The shortest path to a running server (Vulkan + CPU fallback, Arch Linux):
 
 ```bash
-git clone https://github.com/predict-woo/qwen3-tts.cpp.git
+git clone https://github.com/Olegd5g56/qwen3-tts.cpp.git
 cd qwen3-tts.cpp
 git submodule update --init --recursive
 
-# 1) Build GGML with Metal
-cmake -S ggml -B ggml/build -DGGML_METAL=ON
-cmake --build ggml/build -j4
+# build with Vulkan
+cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 
-# 2) Build qwen3-tts.cpp
-cmake -S . -B build
-cmake --build build -j4
-
-# 3) Create a uv Python environment for setup/conversion tools
-uv venv .venv
-source .venv/bin/activate
-
-# 4) Install Python dependencies
-uv pip install --upgrade pip
-uv pip install huggingface_hub gguf torch safetensors numpy tqdm coremltools
-
-# Optional if model access requires auth:
-# hf auth login
-
-# 5) Download and generate all runtime model artifacts
-python scripts/setup_pipeline_models.py
-
-# 6) Basic synthesis example
-./build/qwen3-tts-cli \
-  -m models \
-  -t "Hello from qwen3-tts.cpp running on macOS with CoreML by default." \
-  -o examples/readme_example_basic.wav
-
-# 7) Voice-clone example using sample audio in this repo
-./build/qwen3-tts-cli \
-  -m models \
-  -r examples/readme_clone_input.wav \
-  -t "This is a voice cloning example generated from the sample audio file in this directory." \
-  -o examples/readme_example_clone.wav
+# run — models are downloaded on first launch
+./build/qwen3-tts-server \
+    --hf-repo   khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF:Q8_0 \
+    --hf-repo-v khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16 \
+    --host 0.0.0.0 --port 8080
 ```
 
-Expected model artifacts after step 5:
+Synthesize:
 
-- `models/qwen3-tts-0.6b-f16.gguf`
-- `models/qwen3-tts-tokenizer-f16.gguf`
-- `models/coreml/code_predictor.mlpackage` (on macOS)
-
-Expected audio outputs after steps 6-7:
-
-- `examples/readme_example_basic.wav`
-- `examples/readme_example_clone.wav`
-
-Included voice-clone input/output pair (so users can compare directly):
-
-- Input reference audio: `examples/readme_clone_input.wav`
-- Generated output audio: `examples/readme_example_clone.wav`
-
-Audio preview (inline):
-
-<audio controls src="./examples/readme_clone_input.wav"></audio>
-<br/>
-<audio controls src="./examples/readme_example_clone.wav"></audio>
-
-If your Markdown renderer does not show inline controls, use direct links:
-
-- [Play input reference WAV](./examples/readme_clone_input.wav)
-- [Play generated output WAV](./examples/readme_example_clone.wav)
+```bash
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Hello from qwen3-tts.cpp", "language": "en"}' \
+  --output hello.wav
+```
 
 ## Build
 
-```bash
-git clone https://github.com/predict-woo/qwen3-tts.cpp.git
-cd qwen3-tts.cpp
-git submodule update --init --recursive
+### Dependencies
 
-# Build GGML (vendored in ./ggml)
-cmake -S ggml -B ggml/build -DGGML_METAL=ON
-cmake --build ggml/build -j4
+- C++17 compiler (GCC 11+ or Clang 14+)
+- CMake 3.14+
+- `libopusenc` (server, Ogg/Opus encoding) — Arch: `pacman -S libopusenc`
+- Vulkan SDK if `-DGGML_VULKAN=ON`
 
-# Build qwen3-tts.cpp
-cmake -S . -B build
-cmake --build build -j4
-```
-
-> **Note:** The top-level CMake currently expects GGML in `./ggml` with libraries under `./ggml/build/src`.
-
-## Model Setup (Recommended)
-
-Use the one-shot setup script:
+GGML is vendored as a submodule and built as part of the top-level CMake.
+Backend selection is passed through to GGML:
 
 ```bash
-source .venv/bin/activate
-python scripts/setup_pipeline_models.py
+# CPU only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+# Vulkan (broad GPU support, recommended for AMD/Intel/Nvidia)
+cmake -S . -B build -DGGML_VULKAN=ON   -DCMAKE_BUILD_TYPE=Release
+
+# HIP (AMD ROCm)
+cmake -S . -B build -DGGML_HIP=ON      -DCMAKE_BUILD_TYPE=Release
+
+# CUDA
+cmake -S . -B build -DGGML_CUDA=ON     -DCMAKE_BUILD_TYPE=Release
 ```
 
-Useful flags:
+Build options:
 
-- `--force` re-downloads and re-generates all artifacts.
-- `--coreml auto|on|off` controls CoreML export behavior.
-- `--skip-download` skips HF download and uses existing local model dirs.
+- `QWEN3_TTS_SERVER=ON/OFF` — build the HTTP server (default: ON)
+- `QWEN3_TTS_TIMING=ON/OFF` — compile-in detailed per-stage timing (default: OFF)
 
-## Manual Model Conversion (Advanced)
+Outputs:
 
-Convert HuggingFace models to GGUF format:
+- `build/qwen3-tts-server` — HTTP server
+- `build/qwen3-tts-cli`    — one-shot CLI
+
+## Models
+
+Pre-converted GGUFs live in the [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-tts)
+collection. Each repo ships F16 and Q8_0 quants.
+
+| Repo | Variant | Voice cloning | `instructions` | Built-in speakers |
+|------|---------|---------------|----------------|-------------------|
+| [`khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF) | 0.6B Base | yes | no | no |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF) | 1.7B Base | yes | no | no |
+| [`khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF) | 0.6B CustomVoice | no | no | yes |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF) | 1.7B CustomVoice | no | no | yes |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF) | 1.7B VoiceDesign | no | yes | no |
+| [`khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF) | shared vocoder | — | — | — |
+
+Only **Base** variants support voice cloning (they have a speaker encoder).
+CustomVoice variants use built-in speaker presets addressed by name.
+VoiceDesign uses free-form `instructions` to describe the desired voice.
+The CLI and server both warn and disable the voice library if a non-Base
+model is loaded.
+
+### Auto-download via `--hf-repo`
 
 ```bash
-# Download the model
-hf download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-    --local-dir models/Qwen3-TTS-12Hz-0.6B-Base
-
-# Convert TTS model (transformer + speaker encoder + tokenizer)
-python scripts/convert_tts_to_gguf.py \
-    models/Qwen3-TTS-12Hz-0.6B-Base \
-    models/qwen3-tts-0.6b-f16.gguf
-
-# Convert vocoder (audio decoder)
-python scripts/convert_tokenizer_to_gguf.py \
-    models/Qwen3-TTS-12Hz-0.6B-Base \
-    models/qwen3-tts-tokenizer-f16.gguf
+./build/qwen3-tts-server \
+    --hf-repo   khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF:Q8_0 \
+    --hf-repo-v khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16
 ```
 
-Place both `.gguf` files in a `models/` directory.
+Format is `<repo>[:<quant>]` (default `Q8_0`). Override the exact filename
+with `--hf-file` / `--hf-file-v`. Downloaded files are cached under
+`~/.cache/huggingface/`.
 
-## Usage
+### Manual local files
 
 ```bash
-# Basic synthesis
-./build/qwen3-tts-cli -m models -t "Hello, world!" -o hello.wav
-
-# Voice cloning from reference audio
-./build/qwen3-tts-cli -m models -t "Hello! How are you?" -r reference.wav -o cloned.wav
-
-# Greedy decoding with max length
-./build/qwen3-tts-cli -m models -t "Hello!" -r ref.wav -o out.wav \
-    --temperature 0 --max-tokens 2048
+./build/qwen3-tts-server \
+    -m /path/to/qwen3-tts-base.gguf \
+    -v /path/to/qwen3-tts-tokenizer.gguf
 ```
 
-### CLI Options
+`-m` accepts either a single GGUF file or a directory containing both the
+talker and the tokenizer; in the directory case the vocoder is auto-discovered.
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-m, --model <dir>` | Model directory containing GGUF files | (required) |
-| `-t, --text <text>` | Text to synthesize | (required) |
-| `-o, --output <file>` | Output WAV file path | `output.wav` |
-| `-r, --reference <file>` | Reference audio for voice cloning | (none) |
-| `--temperature <val>` | Sampling temperature (0 = greedy) | 0.9 |
-| `--top-k <n>` | Top-k sampling (0 = disabled) | 50 |
-| `--top-p <val>` | Top-p sampling | 1.0 |
-| `--max-tokens <n>` | Maximum audio frames to generate | 4096 |
-| `--repetition-penalty <val>` | Repetition penalty on codebook-0 token generation | 1.05 |
-| `-j, --threads <n>` | Number of compute threads | 4 |
+## Server
 
-`--top-p` is currently parsed by the CLI but not yet wired into transformer sampling.
+### Configuration
 
-On macOS, CoreML code predictor is enabled by default when `models/coreml/code_predictor.mlpackage` exists.
-Set `QWEN3_TTS_USE_COREML=0` to disable it. Low-memory mode is opt-in via `QWEN3_TTS_LOW_MEM=1`.
+All flags have matching `TTS_*` environment variables (CLI flags override env,
+env overrides defaults). Convenient for Docker / systemd.
 
-### Backend Selection
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `-m, --model <path>` | `TTS_MODEL` | — | talker GGUF (file or directory) |
+| `-v, --vocoder <file>` | `TTS_VOCODER` | auto | vocoder GGUF |
+| `-hf, --hf-repo <repo[:quant]>` | `TTS_HF_REPO` | — | HuggingFace talker repo |
+| `--hf-file <name>` | `TTS_HF_FILE` | derived | override talker GGUF filename |
+| `--hf-repo-v <repo[:quant]>` | `TTS_HF_REPO_V` | — | HuggingFace vocoder repo |
+| `--hf-file-v <name>` | `TTS_HF_FILE_V` | derived | override vocoder GGUF filename |
+| `-H, --host <host>` | `TTS_HOST` | `127.0.0.1` | listen address |
+| `-p, --port <port>` | `TTS_PORT` | `8080` | listen port |
+| `-j, --threads <n>` | `TTS_THREADS` | `4` | compute threads |
+| `--voices-dir <dir>` | `TTS_VOICES_DIR` | — | voice library directory |
+| `--idle-timeout <s>` | `TTS_IDLE_TIMEOUT` | `0` | unload model after N idle seconds (0 = off) |
+| `-V, --verbose` | `TTS_VERBOSE` | off | per-stage progress and timing |
+| `--temperature <f>` | `TTS_TEMPERATURE` | `0.9` | default sampling temperature |
+| `--top-k <n>` | `TTS_TOP_K` | `50` | default top-k |
+| `--repetition-penalty <f>` | `TTS_REPETITION_PENALTY` | `1.05` | default repetition penalty |
+| `--seed <n>` | `TTS_SEED` | `-1` | default sampling seed (-1 = random) |
 
-At runtime, each component logs its selected backend (for example, `TTSTransformer backend: MTL0` or `BLAS`).
+### Endpoints
 
-- Preferred order: `IGPU` -> `GPU` -> `ACCEL` -> `CPU`
-- Encoder and transformer can run on Metal/other accelerators with CPU fallback in the scheduler
-- Decoder now follows the same backend preference and will use Metal when available
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | health check |
+| `GET` | `/v1/models` | currently-loaded model id |
+| `GET` | `/v1/audio/languages` | supported language codes |
+| `GET` | `/v1/audio/voices` | list built-in + library voices |
+| `POST` | `/v1/audio/voices` | create a voice from reference audio (multipart) |
+| `DELETE` | `/v1/audio/voices/:id` | delete a library voice |
+| `POST` | `/v1/audio/speech` | synthesize (one-shot or streaming) |
+
+### `POST /v1/audio/speech`
+
+```json
+{
+  "input": "Text to synthesize (max 4096 chars)",
+  "voice": "default | <built-in name> | <library voice id>",
+  "instructions": "(VoiceDesign only) describe the desired voice",
+  "language": "en",
+  "response_format": "wav | pcm | opus",
+  "stream_format": "audio | sse",
+  "stream_batch_size": 16,
+  "temperature": 0.9,
+  "top_k": 50,
+  "repetition_penalty": 1.05,
+  "seed": -1
+}
+```
+
+Output:
+
+- **One-shot** (default, `stream_format` omitted): the full audio in
+  `response_format` after generation completes.
+- **`stream_format=audio`**: HTTP chunked transfer with bytes in the chosen
+  `response_format`. WAV uses a placeholder-size header so playback can begin
+  immediately; Opus produces a self-contained Ogg stream.
+- **`stream_format=sse`**: Server-Sent Events emitting `speech.audio.delta`
+  frames (base64-encoded audio) followed by `speech.audio.done` with usage
+  and timing.
+
+For *live* streaming you must set **both** `stream_format` and a non-zero
+`stream_batch_size`. With `stream_batch_size=0` the whole utterance is
+buffered before being flushed.
+
+### Streaming example
+
+Pipe straight into ALSA for the lowest latency:
+
+```bash
+curl -sN -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input": "Hello, this is streaming PCM straight to the speakers.",
+    "response_format": "pcm",
+    "stream_format": "audio",
+    "stream_batch_size": 16,
+    "language": "en"
+  }' \
+| aplay -q -f S16_LE -r 24000 -c 1
+```
+
+PCM is always 24 kHz, mono, signed 16-bit little-endian.
+
+### Voice library
+
+Pass `--voices-dir <path>` to the server. The directory layout is:
+
+```
+<voices-dir>/
+  alice/
+    sample.wav
+    sample.txt     # optional reference transcript (enables ICL)
+    .cache.bin     # encoded embedding + ref_codes, regenerated automatically
+  bob/
+    sample.wav
+    .cache.bin
+```
+
+The cache is invalidated by file mtime, so editing `sample.wav` or `sample.txt`
+triggers a re-encode on the next request that uses the voice. Voices added via
+`POST /v1/audio/voices` are written here.
+
+Voice library entries are only loaded on Base models. With CustomVoice or
+VoiceDesign models the directory is ignored (with a warning at startup),
+because their architecture has no speaker encoder.
+
+### Idle unload
+
+`--idle-timeout 600` drops the loaded model after 10 minutes of inactivity
+and reloads it lazily on the next request. Useful when running several model
+variants on the same host through something like `llama-swap`. Voice library
+membership is preserved across reloads (it's stored on disk).
+
+## CLI
+
+`qwen3-tts-cli` is a one-shot synthesis tool. Same `TTS_*` env vars as the
+server where they overlap, same voice-library layout, same model-type rules.
+
+```bash
+# basic
+./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.wav
+
+# from stdin
+echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
+
+# built-in speaker (CustomVoice model)
+./build/qwen3-tts-cli -m ./customvoice -v alice -t "Hi there" -o alice.wav
+
+# library voice (Base model)
+./build/qwen3-tts-cli -m ./base --voices-dir ./voices -v bob \
+    -t "Hello, bob" -o bob.wav
+
+# inline reference WAV (Base model)
+./build/qwen3-tts-cli -m ./base -r reference.wav -t "Hello" -o cloned.wav
+
+# list everything visible to the loaded model
+./build/qwen3-tts-cli -m ./model --voices-dir ./voices --list-voices
+```
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `-m, --model <path>` | `TTS_MODEL` | — | talker GGUF (file or directory) |
+| `--vocoder <file>` | `TTS_VOCODER` | auto | vocoder GGUF |
+| `-t, --text <s>` | — | stdin | text to synthesize (or piped via stdin) |
+| `-o, --output <file>` | — | `output.wav` | output WAV path |
+| `-r, --reference <file>` | — | — | inline reference WAV (mutually exclusive with `-v`) |
+| `-v, --voice <name>` | `TTS_VOICE` | — | built-in or library voice |
+| `--voices-dir <dir>` | `TTS_VOICES_DIR` | — | voice library directory |
+| `--list-voices` | — | — | print available voices and exit |
+| `--ref-text <s>` | — | — | reference transcript for `-r` (enables ICL) |
+| `-l, --language <code>` | `TTS_LANGUAGE` | `en` | one of: en, ru, zh, ja, ko, de, fr, es, it, pt |
+| `-i, --instructions <s>` | — | — | voice steering (VoiceDesign 1.7B only) |
+| `--temperature <f>` | `TTS_TEMPERATURE` | `0.9` | sampling temperature (0 = greedy) |
+| `--top-k <n>` | `TTS_TOP_K` | `50` | top-k sampling |
+| `--top-p <f>` | — | `1.0` | reserved (not yet wired into sampling) |
+| `--max-tokens <n>` | — | `2048` | maximum audio tokens to generate |
+| `--repetition-penalty <f>` | `TTS_REPETITION_PENALTY` | `1.05` | repetition penalty |
+| `--seed <n>` | `TTS_SEED` | `-1` | sampling seed |
+| `--streaming-batch-size <n>` | — | `0` | enable streaming vocoder decode (parity-tested against one-shot) |
+| `-j, --threads <n>` | `TTS_THREADS` | `4` | compute threads |
 
 ## Architecture
 
 ```
-Text ──► [Tokenizer] ──► token IDs
-                              │
-Reference Audio ──► [Speaker Encoder] ──► speaker embedding
-                              │
-token IDs + speaker embedding ──► [TTS Transformer] ──► speech codes (N frames x 16 codebooks)
-                              │
-speech codes ──► [Vocoder] ──► audio waveform (24kHz)
+Text ──► [Tokenizer] ──► token IDs ─┐
+                                    │
+Reference WAV ──► [Speaker Encoder] ──► speaker embedding (1024-dim x-vector)
+Reference WAV ──► [Audio Tokenizer Enc] ──► ref_codes (ICL prefix)
+                                    │
+        prefix + token IDs ──► [TTS Transformer] ──► speech codes
+                                    │
+                                    ▼
+                              [Vocoder] ──► 24 kHz PCM
 ```
 
-### Source Files
+The TTS transformer generates speech codes in two stages per frame:
 
-| File | Component | Description |
-|------|-----------|-------------|
-| `text_tokenizer.{h,cpp}` | Tokenizer | BPE text tokenizer from GGUF |
-| `audio_tokenizer_encoder.{h,cpp}` | Speaker Encoder | ECAPA-TDNN x-vector extractor |
-| `tts_transformer.{h,cpp}` | TTS Transformer | 28-layer Qwen2 talker + 5-layer code predictor |
-| `audio_tokenizer_decoder.{h,cpp}` | Vocoder | WavTokenizer decoder (codes to waveform) |
-| `qwen3_tts.{h,cpp}` | Pipeline | Full pipeline orchestration |
-| `main.cpp` | CLI | Command-line interface |
-| `gguf_loader.{h,cpp}` | GGUF | Model loading utilities |
+1. **Talker** (28 layers for 0.6B / larger for 1.7B) produces a hidden state and codebook-0 logits.
+2. **Code Predictor** (5 layers) autoregressively emits codebooks 1–15 from that hidden state.
 
-### TTS Transformer Details
+The vocoder decodes these codes into a 24 kHz waveform. Under streaming mode
+the vocoder is run on rolling chunks with preserved KV/tail state, so PCM is
+produced frame-by-frame while the transformer is still generating.
 
-The transformer generates speech codes in two stages per frame:
+### Source layout
 
-1. **Talker** (28 layers, 16 heads, 1024 hidden) produces a hidden state and codebook-0 logits.
-2. **Code Predictor** (5 layers) autoregressively generates codebooks 1-15 from that hidden state.
-
-The prefill embedding mirrors the Python pipeline exactly:
-- Positions 0-2: text-projected role tokens (`<|im_start|>`, `assistant`, `\n`)
-- Positions 3-6: TTS pad + codec embeddings (think tokens, language ID)
-- Position 7: TTS pad + speaker embedding
-- Position 8: TTS BOS + codec pad embedding
-- Position 9+: text-projected text tokens + codec BOS/embeddings
+| File | Component |
+|------|-----------|
+| `src/text_tokenizer.{h,cpp}` | BPE text tokenizer (loaded from GGUF) |
+| `src/audio_tokenizer_encoder.{h,cpp}` | ECAPA-TDNN x-vector + Mimi codec encoder |
+| `src/audio_tokenizer_decoder.{h,cpp}` | WavTokenizer vocoder (with streaming state) |
+| `src/tts_transformer.{h,cpp}` | Talker + code predictor |
+| `src/qwen3_tts.{h,cpp}` | Pipeline orchestration |
+| `src/voice_store.{h,cpp}` | Shared on-disk voice library |
+| `src/main.cpp` | CLI |
+| `src/server.cpp` | HTTP server |
 
 ## Testing
 
 ```bash
-# Run full test suite
+# full suite
 bash scripts/run_all_tests.sh
 
-# Individual component tests
-./build/test_tokenizer --model models/qwen3-tts-0.6b-f16.gguf
-./build/test_encoder --tokenizer models/qwen3-tts-0.6b-f16.gguf \
-    --audio clone.wav --reference reference/ref_audio_embedding.bin
-./build/test_transformer --model models/qwen3-tts-0.6b-f16.gguf \
-    --ref-dir reference/
-./build/test_decoder --tokenizer models/qwen3-tts-tokenizer-f16.gguf \
-    --codes reference/speech_codes.bin --reference reference/decoded_audio.bin
+# individual stages
+./build/test_tokenizer    --model models/qwen3-tts-0.6b-f16.gguf
+./build/test_encoder      --tokenizer models/qwen3-tts-0.6b-f16.gguf \
+                          --audio clone.wav --reference reference/ref_audio_embedding.bin
+./build/test_transformer  --model models/qwen3-tts-0.6b-f16.gguf --ref-dir reference/
+./build/test_decoder      --tokenizer models/qwen3-tts-tokenizer-f16.gguf \
+                          --codes reference/speech_codes.bin --reference reference/decoded_audio.bin
 
-# End-to-end Python vs C++ comparison
+# end-to-end Python vs C++
 uv run python scripts/compare_e2e.py
-
-# Generate deterministic reference data from Python
-uv run python scripts/generate_deterministic_reference.py
 ```
 
-### Test Results (F16 model)
+Reference results on F16:
 
-- Prefill logits: cosine similarity = 0.99999994 with Python reference
-- Codebook 0 match rate: 81% (frame-level exact match)
-- Codebooks 1-4: ~84% match rate
-- Audio output is perceptually equivalent; low waveform correlation is expected due to autoregressive divergence from F16 precision
+- Prefill logits cosine similarity vs Python: `0.99999994`
+- Codebook 0 frame-level match: ~81%
+- Codebooks 1–4 match: ~84%
+- Audio is perceptually equivalent; low waveform correlation is expected due
+  to autoregressive divergence under F16.
 
 ## Profiling
 
-Build with compile-time timing instrumentation (zero overhead when disabled):
-
 ```bash
-cmake .. -DQWEN3_TTS_TIMING=ON
-make -j4
+cmake -S . -B build -DQWEN3_TTS_TIMING=ON
+cmake --build build -j$(nproc)
 ```
 
-Example output (92 frames, 7.3s audio):
+Example output (92 frames, 7.3 s audio):
 
 ```
 === Detailed Generation Timing (92 frames) ===
@@ -325,23 +374,24 @@ Example output (92 frames, 7.3s audio):
       Compute:           175.9 ms
 
   Talker forward_step:
-      Graph build:        21.8 ms   (0.2 ms/frame)
-      Graph alloc:        34.1 ms   (0.4 ms/frame)
       Compute:          7717.4 ms   (83.9 ms/frame)
 
   Code predictor:
-      Init/KV/embed:       7.7 ms   (0.1 ms/frame)
-      Prefill (2tok):   1393.2 ms   (15.1 ms/frame)
       Steps (14):      19531.7 ms   (212.3 ms/frame)
       Compute:         20702.6 ms   (225.0 ms/frame)
 
   Total generate:      28915.0 ms   (3.2 frames/s)
 ```
 
-The code predictor (15 sequential forward passes per frame) accounts for ~71% of generation time.
+The code predictor (15 sequential forward passes per frame) dominates
+generation time at ~71%.
 
 ## Acknowledgments
 
-- [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) by Alibaba Qwen team
-- [GGML](https://github.com/ggml-org/ggml) tensor library by Georgi Gerganov
+- [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) by Alibaba's Qwen team
+- [GGML](https://github.com/ggml-org/ggml) by Georgi Gerganov and contributors
 - [WavTokenizer](https://github.com/jishengpeng/WavTokenizer) vocoder architecture
+- Upstream chain:
+  [`predict-woo/qwen3-tts.cpp`](https://github.com/predict-woo/qwen3-tts.cpp)
+  → [`khimaros/qwen3-tts.cpp`](https://github.com/khimaros/qwen3-tts.cpp)
+  (1.7B support, ICL voice cloning, HTTP server, streaming vocoder, HuggingFace integration)
