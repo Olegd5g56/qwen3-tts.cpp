@@ -147,10 +147,14 @@ public:
                                       const tts_params & params = tts_params());
 
     // Extract speaker embedding from reference audio file (without synthesis)
-    // reference_audio: path to reference audio file (WAV)
+    // reference_audio: path to reference audio file (WAV or MP3)
     // embedding: output vector of 1024 float32 values
     bool extract_speaker_embedding(const std::string & reference_audio,
                                     std::vector<float> & embedding);
+
+    // Same, but from already-decoded samples (resampled to 24kHz internally).
+    bool extract_speaker_embedding(const float * samples, int32_t n_samples,
+                                    int sample_rate, std::vector<float> & embedding);
 
     // Encode audio to discrete speech codes for ICL voice cloning
     // samples: audio samples (24kHz, mono, normalized to [-1, 1])
@@ -240,9 +244,13 @@ private:
     int32_t n_threads_ = 0;
 };
 
-// Utility: Load audio file (WAV format)
-bool load_audio_file(const std::string & path, std::vector<float> & samples, 
+// Utility: Load audio file (WAV or MP3, dispatched by extension)
+bool load_audio_file(const std::string & path, std::vector<float> & samples,
                      int & sample_rate);
+
+// Utility: Load audio from a memory buffer (WAV or MP3, sniffed by magic bytes)
+bool load_audio_bytes(const void * data, size_t len,
+                      std::vector<float> & samples, int & sample_rate);
 
 // Utility: Save audio file (WAV format)
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,

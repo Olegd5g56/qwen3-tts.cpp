@@ -106,6 +106,8 @@ bool VoiceStore::refresh() {
         }
     }
 
+    // Build the new disk-voice set first, then merge with the existing
+    // session voices (which live only in RAM and aren't reflected on disk).
     std::map<std::string, voice_entry> next;
     for (const auto & ent : fs::directory_iterator(root_, ec)) {
         if (ec) break;
@@ -121,6 +123,15 @@ bool VoiceStore::refresh() {
             next.emplace(id, std::move(v));
         } else {
             fprintf(stderr, "voice_store: skipping '%s': %s\n", id.c_str(), err.c_str());
+        }
+    }
+    // Carry over any session voices. Disk wins on name collision — session
+    // voices can't shadow a disk-backed name (create() refuses such collisions
+    // up front, but be defensive in case one slipped in before a fresh dir
+    // appeared).
+    for (auto & kv : voices_) {
+        if (!kv.second.disk_backed && next.find(kv.first) == next.end()) {
+            next.emplace(kv.first, std::move(kv.second));
         }
     }
     voices_ = std::move(next);
@@ -153,6 +164,7 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
     std::string cerr;
     if (read_cache(dir, cached, wav_mtime, txt_mtime, cerr)) {
         cached.id = id;
+        cached.disk_backed = true;
         if (txt_mtime != 0) cached.ref_text = read_text_trimmed(txt);
         out = std::move(cached);
         return true;
@@ -166,6 +178,7 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, st
 
     voice_entry v;
     v.id = id;
+    v.disk_backed = true;
     if (txt_mtime != 0) v.ref_text = read_text_trimmed(txt);
 
     {
@@ -306,7 +319,7 @@ bool VoiceStore::get(const std::string & id, voice_entry & out) {
     return true;
 }
 
-bool VoiceStore::create(const std::string & id, const std::string & wav_bytes,
+bool VoiceStore::create(const std::string & id, const std::string & audio_bytes,
                          const std::string & ref_text, std::string & error) {
     if (!valid_id(id)) {
         error = "invalid voice name (must be [A-Za-z0-9_.-]{1,64}, not '.'-prefixed, not 'default')";
@@ -316,64 +329,88 @@ bool VoiceStore::create(const std::string & id, const std::string & wav_bytes,
         error = "model lacks speaker encoder; voice cloning requires the Base variant";
         return false;
     }
-    if (wav_bytes.empty()) {
+    if (audio_bytes.empty()) {
         error = "empty audio";
         return false;
     }
 
-    const std::string dir      = root_ + "/" + id;
-    // TODO(mp3-upload): the read path now accepts sample.wav OR sample.mp3, but
-    // POST /v1/audio/voices still drops the bytes here as sample.wav unconditionally.
-    // If the upload is actually an MP3, decoding will fail. Detect the format
-    // (Content-Type, multipart filename, or magic bytes) and pick the extension.
-    const std::string wav_path = dir + "/sample.wav";
-    const std::string txt_path = dir + "/sample.txt";
-
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) { error = ec.message(); return false; }
-
-    {
-        std::ofstream f(wav_path, std::ios::binary | std::ios::trunc);
-        if (!f) { error = std::strerror(errno); return false; }
-        f.write(wav_bytes.data(), (std::streamsize)wav_bytes.size());
-        if (!f) { error = "writing sample.wav failed"; return false; }
-    }
-    if (ref_text.empty()) {
-        fs::remove(txt_path, ec);
-    } else {
-        std::ofstream f(txt_path, std::ios::binary | std::ios::trunc);
-        if (!f) { error = std::strerror(errno); return false; }
-        f.write(ref_text.data(), (std::streamsize)ref_text.size());
-        if (!f) { error = "writing sample.txt failed"; return false; }
-    }
-    // force re-encode by deleting any stale cache
-    fs::remove(dir + "/.cache.bin", ec);
-
-    voice_entry v;
-    std::string lerr;
+    // Refuse to shadow a disk-backed voice. Disk voices are curated by file
+    // management, and silently overlaying them in-memory would confuse the
+    // operator.
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        if (!load_voice_locked(id, v, lerr)) {
-            error = lerr;
+        auto it = voices_.find(id);
+        if (it != voices_.end() && it->second.disk_backed) {
+            error = "voice id is reserved by a disk-backed voice; pick a different name";
             return false;
         }
-        voices_[id] = v;
+    }
+
+    std::vector<float> samples;
+    int sample_rate = 0;
+    if (!load_audio_bytes(audio_bytes.data(), audio_bytes.size(), samples, sample_rate)) {
+        error = "failed to decode reference audio (expected WAV or MP3)";
+        return false;
+    }
+
+    voice_entry v;
+    v.id = id;
+    v.ref_text = ref_text;
+    v.disk_backed = false;
+
+    {
+        std::lock_guard<std::mutex> sl(*synth_mutex_);
+
+        Qwen3TTS * tts = ensure_loaded_ ? ensure_loaded_() : nullptr;
+        if (!tts) {
+            error = "model not available (load failed)";
+            return false;
+        }
+
+        if (!tts->extract_speaker_embedding(samples.data(), (int32_t)samples.size(),
+                                             sample_rate, v.embedding)) {
+            if (v.ref_text.empty()) {
+                error = "extract_speaker_embedding failed: " + tts->get_error();
+                return false;
+            }
+            v.embedding.clear();
+        }
+
+        if (!v.ref_text.empty()) {
+            std::vector<float> ref_samples = samples;
+            resample_to_24k(ref_samples, sample_rate);
+            if (!tts->encode_speech_codes(ref_samples.data(), (int32_t)ref_samples.size(),
+                                            v.ref_codes, v.n_ref_frames)) {
+                error = "encode_speech_codes failed: " + tts->get_error();
+                return false;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        // Re-check collision in case a disk refresh raced and added a
+        // matching disk voice while we were encoding.
+        auto it = voices_.find(id);
+        if (it != voices_.end() && it->second.disk_backed) {
+            error = "voice id is reserved by a disk-backed voice; pick a different name";
+            return false;
+        }
+        voices_[id] = std::move(v);
     }
     return true;
 }
 
 bool VoiceStore::remove(const std::string & id, std::string & error) {
     if (!valid_id(id)) { error = "invalid voice id"; return false; }
-    const std::string dir = root_ + "/" + id;
-    std::error_code ec;
-    if (!fs::exists(dir, ec)) { error = "not found"; return false; }
-    fs::remove_all(dir, ec);
-    if (ec) { error = ec.message(); return false; }
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        voices_.erase(id);
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto it = voices_.find(id);
+    if (it == voices_.end()) { error = "not found"; return false; }
+    if (it->second.disk_backed) {
+        error = "voice is disk-backed; remove the directory on disk instead";
+        return false;
     }
+    voices_.erase(it);
     return true;
 }
 

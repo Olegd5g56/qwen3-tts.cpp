@@ -16,34 +16,43 @@ namespace qwen3_tts {
 // held by the caller — the loader is not internally serialized.
 using EnsureLoadedFn = std::function<Qwen3TTS*()>;
 
-// One cloned voice. id matches the directory name on disk. embedding holds
-// the 1024-float speaker vector (may be empty for pure-ICL voices). When
-// ref_text is non-empty, ref_codes carries the encoded reference frames
-// and the voice is used in ICL mode.
+// One cloned voice. embedding holds the 1024-float speaker vector (may be
+// empty for pure-ICL voices). When ref_text is non-empty, ref_codes carries
+// the encoded reference frames and the voice is used in ICL mode.
+//
+// disk_backed=true means the voice was loaded from <root>/<id>/ and survives
+// process restarts. disk_backed=false means it was created in-memory via the
+// upload endpoint and dies on restart or DELETE.
 struct voice_entry {
     std::string id;
     std::vector<float> embedding;
     std::string ref_text;
     std::vector<int32_t> ref_codes;
     int32_t n_ref_frames = 0;
+    bool disk_backed = true;
 };
 
-// Filesystem-backed voice library at <root>/<id>/{sample.wav, sample.txt?, .cache.bin}.
-// .cache.bin stores the encoder outputs (embedding + ref_codes) keyed by
-// the mtimes of sample.wav and sample.txt, so subsequent startups skip the
-// expensive re-encoding. Thread-safe.
+// Voice library combining two sources:
+//   * Disk: <root>/<id>/{sample.wav|sample.mp3, sample.txt?, .cache.bin}.
+//     Scanned on startup, refreshed on demand. `.cache.bin` stores the
+//     encoder outputs keyed by sample/text mtimes, so warm starts skip the
+//     expensive re-encoding. The server treats these as read-only — they
+//     are curated by manipulating files on disk.
+//   * Session: created via the upload endpoint, kept entirely in RAM. They
+//     survive idle-unload of the model (just data), but not process restart.
 //
-// Lock order: callers must release the internal map mutex before acquiring
-// the synthesis mutex externally. get()/list()/create()/remove() are the
-// only public entry points and they respect this themselves.
+// Thread-safe. Lock order: callers must release the internal map mutex
+// before acquiring the synthesis mutex externally. Public entry points
+// respect this themselves.
 class VoiceStore {
 public:
     VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
                bool has_speaker_encoder, std::mutex * synth_mutex);
 
-    // Scan root_, drop entries whose source dirs vanished, (re)load anything
-    // with a stale or missing cache. Cheap on warm starts (just stats files).
-    // Returns true if the root dir is usable (created on demand if missing).
+    // Scan root_, drop disk entries whose source dirs vanished, (re)load
+    // anything with a stale or missing cache. Session voices are not
+    // touched. Cheap on warm starts (just stats files). Returns true if
+    // the root dir is usable (created on demand if missing).
     bool refresh();
 
     // Names of all currently-known voices, sorted.
@@ -53,13 +62,20 @@ public:
     // disk once before giving up. Returns false if no such voice exists.
     bool get(const std::string & id, voice_entry & out);
 
-    // Write sample.wav (+ sample.txt if ref_text non-empty), encode, persist
-    // .cache.bin, and register in the map. Fails on invalid id, missing
-    // speaker encoder, or any I/O / encoding failure.
-    bool create(const std::string & id, const std::string & wav_bytes,
+    // Decode an uploaded audio buffer (WAV or MP3, sniffed by magic bytes),
+    // encode embedding + ref_codes in RAM, and register as a session voice.
+    // Nothing is written to disk. Returns false (and sets error) on:
+    //   * invalid id / missing speaker encoder
+    //   * empty or malformed audio
+    //   * collision with an existing disk-backed voice (id reserved)
+    //   * encoder failure
+    // If a session voice with the same id already exists it is replaced.
+    bool create(const std::string & id, const std::string & audio_bytes,
                 const std::string & ref_text, std::string & error);
 
-    // rm -rf the voice dir and drop it from the map. Returns false if absent.
+    // Drop a session voice from the in-memory map. Disk-backed voices are
+    // immutable through this API and removing them returns false with
+    // error="voice is disk-backed; remove the directory on disk instead".
     bool remove(const std::string & id, std::string & error);
 
     // True only on Base variants — needed for create() and for refreshing

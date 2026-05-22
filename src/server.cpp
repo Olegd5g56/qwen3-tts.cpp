@@ -752,16 +752,19 @@ int main(int argc, char ** argv) {
         auto audio_file = req.get_file_value("audio_sample");
         std::string err;
         if (!voice_store.create(name, audio_file.content, ref_text, err)) {
-            res.status = 400;
+            // Name collision with a disk-backed voice → 409 Conflict; everything
+            // else is treated as a malformed request.
+            const bool conflict = err.find("reserved by a disk-backed voice") != std::string::npos;
+            res.status = conflict ? 409 : 400;
             json e = {{"error", {{"message", "failed to create voice: " + err},
-                                  {"type", "invalid_request_error"}}}};
+                                  {"type", conflict ? "conflict" : "invalid_request_error"}}}};
             res.set_content(e.dump(), "application/json");
             return;
         }
 
-        fprintf(stderr, "created voice '%s'%s\n", name.c_str(),
+        fprintf(stderr, "created session voice '%s'%s\n", name.c_str(),
                 ref_text.empty() ? "" : " (ICL mode)");
-        json resp = {{"id", name}, {"name", name}};
+        json resp = {{"id", name}, {"name", name}, {"ephemeral", true}};
         if (!ref_text.empty()) resp["mode"] = "icl";
         res.set_content(resp.dump(), "application/json");
     });
@@ -774,9 +777,15 @@ int main(int argc, char ** argv) {
         if (voice_store.remove(voice_id, err)) {
             res.set_content(R"({"deleted":true})", "application/json");
         } else {
-            res.status = (err == "not found") ? 404 : 400;
-            json e = {{"error", {{"message", err},
-                                  {"type", res.status == 404 ? "not_found" : "invalid_request_error"}}}};
+            // Disk-backed voices can't be removed through the API. Missing
+            // ids → 404, disk refusal → 409, anything else → 400.
+            const bool not_found = (err == "not found");
+            const bool conflict  = err.find("disk-backed") != std::string::npos;
+            res.status = not_found ? 404 : (conflict ? 409 : 400);
+            const char * type = not_found ? "not_found"
+                              : conflict  ? "conflict"
+                              : "invalid_request_error";
+            json e = {{"error", {{"message", err}, {"type", type}}}};
             res.set_content(e.dump(), "application/json");
         }
     });

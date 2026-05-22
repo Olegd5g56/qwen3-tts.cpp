@@ -11,7 +11,8 @@ synthesis. No Python or PyTorch at inference time.
 - Live streaming: PCM/WAV/Opus chunks flushed to the wire as the vocoder produces
   them (`stream_format=audio` or SSE)
 - Voice library shared between server and CLI — drop reference audio
-  (`.wav` or `.mp3`) into a directory and address them by name
+  (`.wav` or `.mp3`) into a directory, or upload session voices to the
+  server in-memory via `POST /v1/audio/voices`
 - Voice cloning via Mimi-codec ICL prefix (Base models) and built-in speaker
   presets (CustomVoice models)
 - Voice steering via `instructions` (VoiceDesign 1.7B)
@@ -163,8 +164,8 @@ env overrides defaults). Convenient for Docker / systemd.
 | `GET` | `/v1/models` | currently-loaded model id |
 | `GET` | `/v1/audio/languages` | supported language codes |
 | `GET` | `/v1/audio/voices` | list built-in + library voices |
-| `POST` | `/v1/audio/voices` | create a voice from reference audio (multipart) |
-| `DELETE` | `/v1/audio/voices/:id` | delete a library voice |
+| `POST` | `/v1/audio/voices` | upload an in-memory session voice (multipart) |
+| `DELETE` | `/v1/audio/voices/:id` | drop a session voice |
 | `POST` | `/v1/audio/speech` | synthesize (one-shot or streaming) |
 
 ### `POST /v1/audio/speech`
@@ -221,7 +222,12 @@ PCM is always 24 kHz, mono, signed 16-bit little-endian.
 
 ### Voice library
 
-Pass `--voices-dir <path>` to the server. The directory layout is:
+The server's voice catalogue has two sources, and they never overlap:
+
+**1. Disk-backed (curated).** Drop reference audio into `--voices-dir <path>`
+and the server picks it up on startup. The server treats this directory as
+**read-only** — no API call writes to it. Manage these voices by editing
+files yourself.
 
 ```
 <voices-dir>/
@@ -234,13 +240,20 @@ Pass `--voices-dir <path>` to the server. The directory layout is:
     .cache.bin
 ```
 
-The cache is invalidated by file mtime, so editing the sample audio or
-`sample.txt` triggers a re-encode on the next request that uses the voice.
-Voices added via `POST /v1/audio/voices` are written here as `sample.wav`.
+Cache invalidation is by file mtime — editing the sample audio or
+`sample.txt` re-encodes on next use. `DELETE /v1/audio/voices/:id`
+returns **409** on a disk-backed id; remove the directory instead.
 
-Voice library entries are only loaded on Base models. With CustomVoice or
-VoiceDesign models the directory is ignored (with a warning at startup),
-because their architecture has no speaker encoder.
+**2. Session (ephemeral).** `POST /v1/audio/voices` decodes the uploaded
+WAV or MP3, encodes embedding + ICL prefix in RAM, and registers the voice
+under the given name. The voice **survives idle-unload** of the model but
+**dies on process restart**. Re-upload after every restart if you need it.
+Collisions with a disk-backed name return **409 Conflict** — pick a
+different id rather than shadow a curated voice.
+
+Voice cloning (both paths) requires the Base variant. With CustomVoice or
+VoiceDesign models the disk directory is ignored and uploads are rejected
+(no speaker encoder in those gguf's).
 
 ### Idle unload
 

@@ -365,23 +365,31 @@ tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
 
 bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
                                            std::vector<float> & embedding) {
+    std::vector<float> ref_samples;
+    int ref_sample_rate = 0;
+    if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+        error_msg_ = "Failed to load reference audio: " + reference_audio;
+        return false;
+    }
+    return extract_speaker_embedding(ref_samples.data(), (int32_t)ref_samples.size(),
+                                      ref_sample_rate, embedding);
+}
+
+bool Qwen3TTS::extract_speaker_embedding(const float * samples, int32_t n_samples,
+                                           int sample_rate, std::vector<float> & embedding) {
     if (!models_loaded_) {
         error_msg_ = "Models not loaded";
         return false;
     }
 
-    std::vector<float> ref_samples;
-    int ref_sample_rate;
-    if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
-        error_msg_ = "Failed to load reference audio: " + reference_audio;
-        return false;
-    }
-
     const int target_rate = 24000;
-    if (ref_sample_rate != target_rate) {
-        std::vector<float> resampled;
-        resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
-        ref_samples = std::move(resampled);
+    std::vector<float> resampled_storage;
+    const float * use_samples = samples;
+    int32_t use_n = n_samples;
+    if (sample_rate != target_rate) {
+        resample_linear(samples, (int)n_samples, sample_rate, resampled_storage, target_rate);
+        use_samples = resampled_storage.data();
+        use_n = (int32_t)resampled_storage.size();
     }
 
     if (!encoder_loaded_) {
@@ -397,7 +405,7 @@ bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
         encoder_loaded_ = true;
     }
 
-    if (!audio_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(), embedding)) {
+    if (!audio_encoder_.encode(use_samples, use_n, embedding)) {
         error_msg_ = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
         return false;
     }
@@ -920,33 +928,26 @@ static std::string get_file_extension(const std::string & path) {
     return ext;
 }
 
-// WAV file loading (16-bit PCM, 32-bit PCM, or 32-bit IEEE float)
-static bool load_wav_file(const std::string & path, std::vector<float> & samples,
-                          int & sample_rate) {
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) {
-        fprintf(stderr, "ERROR: Cannot open WAV file: %s\n", path.c_str());
-        return false;
-    }
-
+// WAV stream loading (16-bit PCM, 32-bit PCM, or 32-bit IEEE float).
+// Takes an already-opened FILE* so both real files and fmemopen()-wrapped
+// byte buffers go through the same parser. Caller owns the FILE*.
+static bool load_wav_stream(FILE * f, std::vector<float> & samples,
+                            int & sample_rate) {
     // Read RIFF header
     char riff[4];
     if (fread(riff, 1, 4, f) != 4 || strncmp(riff, "RIFF", 4) != 0) {
         fprintf(stderr, "ERROR: Not a RIFF file\n");
-        fclose(f);
         return false;
     }
 
     uint32_t file_size;
     if (fread(&file_size, 4, 1, f) != 1) {
-        fclose(f);
         return false;
     }
 
     char wave[4];
     if (fread(wave, 1, 4, f) != 4 || strncmp(wave, "WAVE", 4) != 0) {
         fprintf(stderr, "ERROR: Not a WAVE file\n");
-        fclose(f);
         return false;
     }
 
@@ -992,7 +993,6 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
                     int n_samples = chunk_size / (2 * num_channels);
                     std::vector<int16_t> raw(n_samples * num_channels);
                     if (fread(raw.data(), 2, n_samples * num_channels, f) != (size_t)(n_samples * num_channels)) {
-                        fclose(f);
                         return false;
                     }
                     mix_to_mono(raw.data(), n_samples, num_channels, 1.0f / 32768.0f, samples);
@@ -1001,14 +1001,12 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
                     int n_samples = chunk_size / (4 * num_channels);
                     std::vector<int32_t> raw(n_samples * num_channels);
                     if (fread(raw.data(), 4, n_samples * num_channels, f) != (size_t)(n_samples * num_channels)) {
-                        fclose(f);
                         return false;
                     }
                     mix_to_mono(raw.data(), n_samples, num_channels, 1.0f / 2147483648.0f, samples);
                 }
                 else {
                     fprintf(stderr, "ERROR: Unsupported bits per sample: %d\n", bits_per_sample);
-                    fclose(f);
                     return false;
                 }
             }
@@ -1016,18 +1014,15 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
                 int n_samples = chunk_size / (4 * num_channels);
                 std::vector<float> raw(n_samples * num_channels);
                 if (fread(raw.data(), 4, n_samples * num_channels, f) != (size_t)(n_samples * num_channels)) {
-                    fclose(f);
                     return false;
                 }
                 mix_to_mono(raw.data(), n_samples, num_channels, 1.0f, samples);
             }
             else {
                 fprintf(stderr, "ERROR: Unsupported audio format: %d\n", audio_format);
-                fclose(f);
                 return false;
             }
 
-            fclose(f);
             return true;
         }
         else {
@@ -1037,13 +1032,40 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
     }
 
     fprintf(stderr, "ERROR: No data chunk found\n");
-    fclose(f);
     return false;
 }
 
-// MP3 file loading via libmpg123. Decodes to interleaved float32 and folds to mono.
-static bool load_mp3_file(const std::string & path, std::vector<float> & samples,
+// Path-based WAV loader: opens the file and delegates to load_wav_stream.
+static bool load_wav_file(const std::string & path, std::vector<float> & samples,
                           int & sample_rate) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: Cannot open WAV file: %s\n", path.c_str());
+        return false;
+    }
+    bool ok = load_wav_stream(f, samples, sample_rate);
+    fclose(f);
+    return ok;
+}
+
+// Bytes-based WAV loader: wraps the buffer with fmemopen so the existing
+// parser can read from memory unchanged.
+static bool load_wav_bytes(const void * data, size_t len,
+                           std::vector<float> & samples, int & sample_rate) {
+    FILE * f = fmemopen(const_cast<void*>(data), len, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: fmemopen failed for WAV bytes\n");
+        return false;
+    }
+    bool ok = load_wav_stream(f, samples, sample_rate);
+    fclose(f);
+    return ok;
+}
+
+// Initialise mpg123 once per process and return a handle preconfigured to
+// emit float32 mono/stereo at whatever rate the source frame announces.
+// Caller takes ownership of the handle (mpg123_close + mpg123_delete).
+static mpg123_handle * mpg123_make_float_handle() {
     static std::once_flag mpg123_init_flag;
     std::call_once(mpg123_init_flag, []() { mpg123_init(); });
 
@@ -1051,11 +1073,12 @@ static bool load_mp3_file(const std::string & path, std::vector<float> & samples
     mpg123_handle * h = mpg123_new(nullptr, &err);
     if (!h) {
         fprintf(stderr, "ERROR: mpg123_new failed: %s\n", mpg123_plain_strerror(err));
-        return false;
+        return nullptr;
     }
 
-    // Restrict output to float32 BEFORE opening — once the first frame is
-    // parsed the format is locked, and changing it later is silently ignored.
+    // Restrict allowed output formats to float32 BEFORE the first decode —
+    // once a frame is parsed the format is locked, and later format calls
+    // are silently ignored.
     const long * rates_list = nullptr;
     size_t n_rates = 0;
     mpg123_rates(&rates_list, &n_rates);
@@ -1063,26 +1086,22 @@ static bool load_mp3_file(const std::string & path, std::vector<float> & samples
     for (size_t i = 0; i < n_rates; i++) {
         mpg123_format(h, rates_list[i], MPG123_MONO | MPG123_STEREO, MPG123_ENC_FLOAT_32);
     }
+    return h;
+}
 
-    if (mpg123_open(h, path.c_str()) != MPG123_OK) {
-        fprintf(stderr, "ERROR: Cannot open MP3 file '%s': %s\n", path.c_str(), mpg123_strerror(h));
-        mpg123_delete(h);
-        return false;
-    }
-
+// Drain a fully-prepared mpg123 handle into mono float samples at the
+// source rate. Common tail of the file and the in-memory MP3 paths.
+static bool mpg123_drain_to_mono(mpg123_handle * h, std::vector<float> & samples,
+                                  int & sample_rate) {
     long rate = 0;
     int channels = 0;
     int encoding = 0;
     if (mpg123_getformat(h, &rate, &channels, &encoding) != MPG123_OK) {
         fprintf(stderr, "ERROR: mpg123_getformat failed: %s\n", mpg123_strerror(h));
-        mpg123_close(h);
-        mpg123_delete(h);
         return false;
     }
     if (encoding != MPG123_ENC_FLOAT_32) {
         fprintf(stderr, "ERROR: mpg123 negotiated encoding %d, expected float32\n", encoding);
-        mpg123_close(h);
-        mpg123_delete(h);
         return false;
     }
 
@@ -1091,23 +1110,17 @@ static bool load_mp3_file(const std::string & path, std::vector<float> & samples
     std::vector<unsigned char> buf(chunk_floats * sizeof(float));
     size_t done = 0;
     int rc;
-    while ((rc = mpg123_read(h, buf.data(), buf.size(), &done)) == MPG123_OK ||
-           rc == MPG123_NEW_FORMAT || rc == MPG123_DONE) {
+    while (true) {
+        rc = mpg123_read(h, buf.data(), buf.size(), &done);
         if (done > 0) {
             const float * f = reinterpret_cast<const float *>(buf.data());
             interleaved.insert(interleaved.end(), f, f + done / sizeof(float));
         }
-        if (rc == MPG123_DONE) break;
-    }
-    if (rc != MPG123_OK && rc != MPG123_DONE) {
+        if (rc == MPG123_DONE || rc == MPG123_NEED_MORE) break;
+        if (rc == MPG123_OK || rc == MPG123_NEW_FORMAT) continue;
         fprintf(stderr, "ERROR: mpg123_read failed: %s\n", mpg123_strerror(h));
-        mpg123_close(h);
-        mpg123_delete(h);
         return false;
     }
-
-    mpg123_close(h);
-    mpg123_delete(h);
 
     if (channels <= 0 || interleaved.empty()) {
         fprintf(stderr, "ERROR: MP3 decoded to zero samples\n");
@@ -1118,6 +1131,49 @@ static bool load_mp3_file(const std::string & path, std::vector<float> & samples
     mix_to_mono(interleaved.data(), n_samples, channels, 1.0f, samples);
     sample_rate = (int)rate;
     return true;
+}
+
+// MP3 file loading via libmpg123.
+static bool load_mp3_file(const std::string & path, std::vector<float> & samples,
+                          int & sample_rate) {
+    mpg123_handle * h = mpg123_make_float_handle();
+    if (!h) return false;
+
+    if (mpg123_open(h, path.c_str()) != MPG123_OK) {
+        fprintf(stderr, "ERROR: Cannot open MP3 file '%s': %s\n", path.c_str(), mpg123_strerror(h));
+        mpg123_delete(h);
+        return false;
+    }
+
+    const bool ok = mpg123_drain_to_mono(h, samples, sample_rate);
+    mpg123_close(h);
+    mpg123_delete(h);
+    return ok;
+}
+
+// MP3 in-memory loading via libmpg123 feed API. Used for HTTP uploads where
+// the bytes never hit the filesystem.
+static bool load_mp3_bytes(const void * data, size_t len,
+                           std::vector<float> & samples, int & sample_rate) {
+    mpg123_handle * h = mpg123_make_float_handle();
+    if (!h) return false;
+
+    if (mpg123_open_feed(h) != MPG123_OK) {
+        fprintf(stderr, "ERROR: mpg123_open_feed failed: %s\n", mpg123_strerror(h));
+        mpg123_delete(h);
+        return false;
+    }
+    if (mpg123_feed(h, static_cast<const unsigned char *>(data), len) != MPG123_OK) {
+        fprintf(stderr, "ERROR: mpg123_feed failed: %s\n", mpg123_strerror(h));
+        mpg123_close(h);
+        mpg123_delete(h);
+        return false;
+    }
+
+    const bool ok = mpg123_drain_to_mono(h, samples, sample_rate);
+    mpg123_close(h);
+    mpg123_delete(h);
+    return ok;
 }
 
 // Audio file loading - dispatches to format-specific loaders based on file extension
@@ -1133,6 +1189,34 @@ bool load_audio_file(const std::string & path, std::vector<float> & samples,
         fprintf(stderr, "ERROR: Unsupported audio format '%s'. Supported formats: .wav, .mp3\n", ext.c_str());
         return false;
     }
+}
+
+// In-memory audio loading. Sniffs the first few bytes to pick a decoder so
+// callers (the voice-upload endpoint) don't need to track the source format.
+bool load_audio_bytes(const void * data, size_t len,
+                      std::vector<float> & samples, int & sample_rate) {
+    if (len < 4) {
+        fprintf(stderr, "ERROR: audio buffer too small (%zu bytes)\n", len);
+        return false;
+    }
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+
+    // RIFF....WAVE — wav
+    if (p[0] == 'R' && p[1] == 'I' && p[2] == 'F' && p[3] == 'F') {
+        return load_wav_bytes(data, len, samples, sample_rate);
+    }
+    // "ID3" tag header — mp3 with metadata
+    if (p[0] == 'I' && p[1] == 'D' && p[2] == '3') {
+        return load_mp3_bytes(data, len, samples, sample_rate);
+    }
+    // Raw MPEG frame sync: 0xFF and top 3 bits of next byte set
+    if (p[0] == 0xFF && (p[1] & 0xE0) == 0xE0) {
+        return load_mp3_bytes(data, len, samples, sample_rate);
+    }
+
+    fprintf(stderr, "ERROR: Unrecognised audio format (magic bytes: %02X %02X %02X %02X)\n",
+            p[0], p[1], p[2], p[3]);
+    return false;
 }
 
 // WAV file saving (16-bit PCM at specified sample rate)
