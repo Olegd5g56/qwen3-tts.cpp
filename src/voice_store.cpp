@@ -129,12 +129,22 @@ bool VoiceStore::refresh() {
 
 bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out, std::string & error) {
     const std::string dir = root_ + "/" + id;
-    const std::string wav = dir + "/sample.wav";
     const std::string txt = dir + "/sample.txt";
 
-    const uint64_t wav_mtime = file_mtime_ns(wav);
+    // Accept sample.wav or sample.mp3; wav wins if both are present
+    // (keeps existing voices using the cached path unchanged).
+    std::string wav = dir + "/sample.wav";
+    uint64_t wav_mtime = file_mtime_ns(wav);
     if (wav_mtime == 0) {
-        error = "missing sample.wav";
+        const std::string mp3 = dir + "/sample.mp3";
+        const uint64_t mp3_mtime = file_mtime_ns(mp3);
+        if (mp3_mtime != 0) {
+            wav = mp3;
+            wav_mtime = mp3_mtime;
+        }
+    }
+    if (wav_mtime == 0) {
+        error = "missing sample audio (expected sample.wav or sample.mp3)";
         return false;
     }
     const uint64_t txt_mtime = file_mtime_ns(txt); // 0 = absent, which is valid
@@ -312,6 +322,10 @@ bool VoiceStore::create(const std::string & id, const std::string & wav_bytes,
     }
 
     const std::string dir      = root_ + "/" + id;
+    // TODO(mp3-upload): the read path now accepts sample.wav OR sample.mp3, but
+    // POST /v1/audio/voices still drops the bytes here as sample.wav unconditionally.
+    // If the upload is actually an MP3, decoding will fail. Detect the format
+    // (Content-Type, multipart filename, or magic bytes) and pick the extension.
     const std::string wav_path = dir + "/sample.wav";
     const std::string txt_path = dir + "/sample.txt";
 

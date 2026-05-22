@@ -56,7 +56,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Example:\n");
     fprintf(stderr, "  %s -m ./models -t \"Hello, world!\" -o hello.wav\n", program);
-    fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
+    fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.mp3 -o cloned.wav\n", program);
     fprintf(stderr, "  echo \"Hello!\" | %s -m ./models -o hello.wav\n", program);
 }
 

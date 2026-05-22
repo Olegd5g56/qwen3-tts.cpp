@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+
+#include <mpg123.h>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -1038,6 +1041,85 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
     return false;
 }
 
+// MP3 file loading via libmpg123. Decodes to interleaved float32 and folds to mono.
+static bool load_mp3_file(const std::string & path, std::vector<float> & samples,
+                          int & sample_rate) {
+    static std::once_flag mpg123_init_flag;
+    std::call_once(mpg123_init_flag, []() { mpg123_init(); });
+
+    int err = MPG123_OK;
+    mpg123_handle * h = mpg123_new(nullptr, &err);
+    if (!h) {
+        fprintf(stderr, "ERROR: mpg123_new failed: %s\n", mpg123_plain_strerror(err));
+        return false;
+    }
+
+    // Restrict output to float32 BEFORE opening — once the first frame is
+    // parsed the format is locked, and changing it later is silently ignored.
+    const long * rates_list = nullptr;
+    size_t n_rates = 0;
+    mpg123_rates(&rates_list, &n_rates);
+    mpg123_format_none(h);
+    for (size_t i = 0; i < n_rates; i++) {
+        mpg123_format(h, rates_list[i], MPG123_MONO | MPG123_STEREO, MPG123_ENC_FLOAT_32);
+    }
+
+    if (mpg123_open(h, path.c_str()) != MPG123_OK) {
+        fprintf(stderr, "ERROR: Cannot open MP3 file '%s': %s\n", path.c_str(), mpg123_strerror(h));
+        mpg123_delete(h);
+        return false;
+    }
+
+    long rate = 0;
+    int channels = 0;
+    int encoding = 0;
+    if (mpg123_getformat(h, &rate, &channels, &encoding) != MPG123_OK) {
+        fprintf(stderr, "ERROR: mpg123_getformat failed: %s\n", mpg123_strerror(h));
+        mpg123_close(h);
+        mpg123_delete(h);
+        return false;
+    }
+    if (encoding != MPG123_ENC_FLOAT_32) {
+        fprintf(stderr, "ERROR: mpg123 negotiated encoding %d, expected float32\n", encoding);
+        mpg123_close(h);
+        mpg123_delete(h);
+        return false;
+    }
+
+    std::vector<float> interleaved;
+    const size_t chunk_floats = 16384;
+    std::vector<unsigned char> buf(chunk_floats * sizeof(float));
+    size_t done = 0;
+    int rc;
+    while ((rc = mpg123_read(h, buf.data(), buf.size(), &done)) == MPG123_OK ||
+           rc == MPG123_NEW_FORMAT || rc == MPG123_DONE) {
+        if (done > 0) {
+            const float * f = reinterpret_cast<const float *>(buf.data());
+            interleaved.insert(interleaved.end(), f, f + done / sizeof(float));
+        }
+        if (rc == MPG123_DONE) break;
+    }
+    if (rc != MPG123_OK && rc != MPG123_DONE) {
+        fprintf(stderr, "ERROR: mpg123_read failed: %s\n", mpg123_strerror(h));
+        mpg123_close(h);
+        mpg123_delete(h);
+        return false;
+    }
+
+    mpg123_close(h);
+    mpg123_delete(h);
+
+    if (channels <= 0 || interleaved.empty()) {
+        fprintf(stderr, "ERROR: MP3 decoded to zero samples\n");
+        return false;
+    }
+
+    const int n_samples = (int)(interleaved.size() / channels);
+    mix_to_mono(interleaved.data(), n_samples, channels, 1.0f, samples);
+    sample_rate = (int)rate;
+    return true;
+}
+
 // Audio file loading - dispatches to format-specific loaders based on file extension
 bool load_audio_file(const std::string & path, std::vector<float> & samples,
                      int & sample_rate) {
@@ -1045,8 +1127,10 @@ bool load_audio_file(const std::string & path, std::vector<float> & samples,
 
     if (ext == ".wav") {
         return load_wav_file(path, samples, sample_rate);
+    } else if (ext == ".mp3") {
+        return load_mp3_file(path, samples, sample_rate);
     } else {
-        fprintf(stderr, "ERROR: Unsupported audio format '%s'. Supported formats: .wav\n", ext.c_str());
+        fprintf(stderr, "ERROR: Unsupported audio format '%s'. Supported formats: .wav, .mp3\n", ext.c_str());
         return false;
     }
 }

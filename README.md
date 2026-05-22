@@ -10,8 +10,8 @@ synthesis. No Python or PyTorch at inference time.
 - OpenAI-compatible `/v1/audio/speech` server with `wav`, `pcm`, and `opus` output
 - Live streaming: PCM/WAV/Opus chunks flushed to the wire as the vocoder produces
   them (`stream_format=audio` or SSE)
-- Voice library shared between server and CLI — drop reference WAVs into a
-  directory and address them by name
+- Voice library shared between server and CLI — drop reference audio
+  (`.wav` or `.mp3`) into a directory and address them by name
 - Voice cloning via Mimi-codec ICL prefix (Base models) and built-in speaker
   presets (CustomVoice models)
 - Voice steering via `instructions` (VoiceDesign 1.7B)
@@ -55,6 +55,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 
 - C++17 compiler (GCC 11+ or Clang 14+)
 - CMake 3.14+
+- `libmpg123` (MP3 reference audio) — Arch: `pacman -S mpg123`
 - `libopusenc` (server, Ogg/Opus encoding) — Arch: `pacman -S libopusenc`
 - Vulkan SDK if `-DGGML_VULKAN=ON`
 
@@ -225,17 +226,17 @@ Pass `--voices-dir <path>` to the server. The directory layout is:
 ```
 <voices-dir>/
   alice/
-    sample.wav
+    sample.wav     # or sample.mp3 (wav wins if both exist)
     sample.txt     # optional reference transcript (enables ICL)
     .cache.bin     # encoded embedding + ref_codes, regenerated automatically
   bob/
-    sample.wav
+    sample.mp3
     .cache.bin
 ```
 
-The cache is invalidated by file mtime, so editing `sample.wav` or `sample.txt`
-triggers a re-encode on the next request that uses the voice. Voices added via
-`POST /v1/audio/voices` are written here.
+The cache is invalidated by file mtime, so editing the sample audio or
+`sample.txt` triggers a re-encode on the next request that uses the voice.
+Voices added via `POST /v1/audio/voices` are written here as `sample.wav`.
 
 Voice library entries are only loaded on Base models. With CustomVoice or
 VoiceDesign models the directory is ignored (with a warning at startup),
@@ -267,8 +268,8 @@ echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
 ./build/qwen3-tts-cli -m ./base --voices-dir ./voices -v bob \
     -t "Hello, bob" -o bob.wav
 
-# inline reference WAV (Base model)
-./build/qwen3-tts-cli -m ./base -r reference.wav -t "Hello" -o cloned.wav
+# inline reference audio — .wav or .mp3 (Base model)
+./build/qwen3-tts-cli -m ./base -r reference.mp3 -t "Hello" -o cloned.wav
 
 # list everything visible to the loaded model
 ./build/qwen3-tts-cli -m ./model --voices-dir ./voices --list-voices
@@ -280,7 +281,7 @@ echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
 | `--vocoder <file>` | `TTS_VOCODER` | auto | vocoder GGUF |
 | `-t, --text <s>` | — | stdin | text to synthesize (or piped via stdin) |
 | `-o, --output <file>` | — | `output.wav` | output WAV path |
-| `-r, --reference <file>` | — | — | inline reference WAV (mutually exclusive with `-v`) |
+| `-r, --reference <file>` | — | — | inline reference audio, `.wav` or `.mp3` (mutually exclusive with `-v`) |
 | `-v, --voice <name>` | `TTS_VOICE` | — | built-in or library voice |
 | `--voices-dir <dir>` | `TTS_VOICES_DIR` | — | voice library directory |
 | `--list-voices` | — | — | print available voices and exit |

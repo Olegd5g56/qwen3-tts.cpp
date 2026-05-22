@@ -27,6 +27,12 @@ endif()
 # Find threads
 find_package(Threads REQUIRED)
 
+# System pkg-config deps shared across targets
+find_package(PkgConfig REQUIRED)
+
+# libmpg123 — MP3 decoding for reference audio (CLI --reference *.mp3, voice library sample.mp3)
+pkg_check_modules(MPG123 REQUIRED IMPORTED_TARGET libmpg123)
+
 # Server dependencies (header-only, fetched at configure time)
 option(QWEN3_TTS_SERVER "Build the OpenAI-compatible TTS server" ON)
 if(QWEN3_TTS_SERVER)
@@ -42,7 +48,6 @@ if(QWEN3_TTS_SERVER)
     FetchContent_MakeAvailable(httplib nlohmann_json)
 
     # libopusenc — system dependency, Ogg/Opus encoding for the /v1/audio/speech endpoint
-    find_package(PkgConfig REQUIRED)
     pkg_check_modules(OPUSENC REQUIRED IMPORTED_TARGET libopusenc)
 endif()
 
@@ -156,6 +161,9 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_codec_encoder
     audio_tokenizer_decoder
     Threads::Threads
+)
+target_link_libraries(qwen3_tts PRIVATE
+    PkgConfig::MPG123
 )
 
 # Shared library with C API (for Nim FFI)
