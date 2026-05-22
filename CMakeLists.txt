@@ -30,8 +30,14 @@ find_package(Threads REQUIRED)
 # System pkg-config deps shared across targets
 find_package(PkgConfig REQUIRED)
 
-# libmpg123 — MP3 decoding for reference audio (CLI --reference *.mp3, voice library sample.mp3)
-pkg_check_modules(MPG123 REQUIRED IMPORTED_TARGET libmpg123)
+# Audio codec dependencies — used by both the CLI (save_audio_file ext sniffing) and the server.
+# libmpg123: MP3 decoding for reference audio (CLI --reference *.mp3, voice library sample.mp3).
+# libopusenc: Ogg/Opus encoding for output (-o foo.opus, server response_format=opus).
+# lame: MP3 encoding for output (-o foo.mp3, server response_format=mp3) — pkg-config module is `lame`,
+#       library is libmp3lame; we use VBR -V 2 (~190 kbps avg) as the default, no client-facing knob.
+pkg_check_modules(MPG123  REQUIRED IMPORTED_TARGET libmpg123)
+pkg_check_modules(OPUSENC REQUIRED IMPORTED_TARGET libopusenc)
+pkg_check_modules(LAME    REQUIRED IMPORTED_TARGET lame)
 
 # Server dependencies (header-only, fetched at configure time)
 option(QWEN3_TTS_SERVER "Build the OpenAI-compatible TTS server" ON)
@@ -46,9 +52,6 @@ if(QWEN3_TTS_SERVER)
         GIT_TAG        v3.11.3
     )
     FetchContent_MakeAvailable(httplib nlohmann_json)
-
-    # libopusenc — system dependency, Ogg/Opus encoding for the /v1/audio/speech endpoint
-    pkg_check_modules(OPUSENC REQUIRED IMPORTED_TARGET libopusenc)
 endif()
 
 # PIC is needed for the shared library — set globally so GGML libs get it too
@@ -164,6 +167,8 @@ target_link_libraries(qwen3_tts PUBLIC
 )
 target_link_libraries(qwen3_tts PRIVATE
     PkgConfig::MPG123
+    PkgConfig::OPUSENC
+    PkgConfig::LAME
 )
 
 # Shared library with C API (for Nim FFI)
@@ -255,7 +260,12 @@ if(QWEN3_TTS_SERVER)
         qwen3_tts
         httplib::httplib
         nlohmann_json::nlohmann_json
+        # opus / lame are needed for the streaming encoders (opus_streamer,
+        # mp3_streamer) that live in server.cpp. The one-shot encoders are in
+        # qwen3_tts.cpp and link these PRIVATE, so headers aren't transitively
+        # exposed — pull them in directly here.
         PkgConfig::OPUSENC
+        PkgConfig::LAME
     )
 endif()
 

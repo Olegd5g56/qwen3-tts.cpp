@@ -15,6 +15,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <opusenc.h>
+#include <lame/lame.h>
 
 #include <atomic>
 #include <chrono>
@@ -47,57 +48,8 @@ static int language_to_id(const std::string & lang) {
     return -1;
 }
 
-// encode float32 audio samples as a WAV byte buffer (16-bit PCM)
-static std::string encode_wav(const std::vector<float> & samples, int sample_rate) {
-    const int num_channels = 1;
-    const int bits_per_sample = 16;
-    const int byte_rate = sample_rate * num_channels * bits_per_sample / 8;
-    const int block_align = num_channels * bits_per_sample / 8;
-    const int data_size = (int)samples.size() * block_align;
-    const int file_size = 36 + data_size;
-
-    std::string buf;
-    buf.resize(44 + data_size);
-    char * p = buf.data();
-
-    auto write_u32 = [](char * dst, uint32_t v) {
-        dst[0] = (char)(v & 0xff);
-        dst[1] = (char)((v >> 8) & 0xff);
-        dst[2] = (char)((v >> 16) & 0xff);
-        dst[3] = (char)((v >> 24) & 0xff);
-    };
-    auto write_u16 = [](char * dst, uint16_t v) {
-        dst[0] = (char)(v & 0xff);
-        dst[1] = (char)((v >> 8) & 0xff);
-    };
-
-    // RIFF header
-    memcpy(p, "RIFF", 4);      write_u32(p + 4, file_size);
-    memcpy(p + 8, "WAVE", 4);
-
-    // fmt chunk
-    memcpy(p + 12, "fmt ", 4);  write_u32(p + 16, 16);
-    write_u16(p + 20, 1);       // PCM
-    write_u16(p + 22, num_channels);
-    write_u32(p + 24, sample_rate);
-    write_u32(p + 28, byte_rate);
-    write_u16(p + 32, block_align);
-    write_u16(p + 34, bits_per_sample);
-
-    // data chunk
-    memcpy(p + 36, "data", 4);  write_u32(p + 40, data_size);
-
-    // convert float32 [-1,1] to int16
-    int16_t * dst = reinterpret_cast<int16_t *>(p + 44);
-    for (size_t i = 0; i < samples.size(); i++) {
-        float s = samples[i];
-        if (s > 1.0f)  s = 1.0f;
-        if (s < -1.0f) s = -1.0f;
-        dst[i] = (int16_t)(s * 32767.0f);
-    }
-
-    return buf;
-}
+// One-shot encoders (encode_wav, encode_mp3, encode_opus) live in qwen3_tts.cpp
+// so the CLI can reuse them — they're brought in via `using namespace qwen3_tts`.
 
 // stateful Ogg/Opus encoder. write() consumes float PCM (mono); whenever
 // libopusenc finishes a page, on_page is invoked with the encoded bytes
@@ -143,19 +95,60 @@ struct opus_streamer {
     static int close_cb(void *) { return 0; }
 };
 
-// encode float32 audio samples as a self-contained Ogg/Opus byte buffer
-static std::string encode_opus(const std::vector<float> & samples, int sample_rate) {
-    std::string out;
-    opus_streamer s;
-    s.on_page = [&out](const char * p, size_t n) {
-        out.append(p, n);
+// stateful LAME MP3 encoder. write() consumes float PCM (mono); the encoded
+// MP3 frames are pushed to on_page as soon as LAME emits any (some calls
+// produce 0 bytes when LAME is buffering for its next frame). finish() flushes
+// the residual frames. VBR -V 2 — same defaults as encode_mp3() in qwen3_tts.
+struct mp3_streamer {
+    lame_t                                    lame = nullptr;
+    std::function<bool(const char *, size_t)> on_page;
+    bool                                      failed = false;
+    std::vector<unsigned char>                buf;
+
+    bool open(int sample_rate) {
+        lame = lame_init();
+        if (!lame) return false;
+        lame_set_in_samplerate(lame, sample_rate);
+        lame_set_num_channels (lame, 1);
+        lame_set_mode         (lame, MONO);
+        lame_set_VBR          (lame, vbr_default);
+        lame_set_VBR_quality  (lame, 2.0f);
+        lame_set_quality      (lame, 2);
+        if (lame_init_params(lame) < 0) {
+            lame_close(lame);
+            lame = nullptr;
+            return false;
+        }
         return true;
-    };
-    if (!s.open(sample_rate)) return {};
-    if (!samples.empty()) s.write(samples.data(), samples.size());
-    s.finish();
-    return out;
-}
+    }
+    bool write(const float * pcm, size_t n_samples) {
+        if (!lame || failed) return false;
+        const size_t cap = (size_t)(1.25 * (double)n_samples) + 7200;
+        if (buf.size() < cap) buf.resize(cap);
+        int written = lame_encode_buffer_ieee_float(lame, pcm, nullptr,
+                                                    (int)n_samples,
+                                                    buf.data(), (int)buf.size());
+        if (written < 0) { failed = true; return false; }
+        if (written > 0 && on_page) {
+            if (!on_page(reinterpret_cast<const char *>(buf.data()), (size_t)written)) {
+                failed = true;
+                return false;
+            }
+        }
+        return true;
+    }
+    void finish() {
+        if (!lame || failed) return;
+        if (buf.size() < 7200) buf.resize(7200);
+        int flushed = lame_encode_flush(lame, buf.data(), (int)buf.size());
+        if (flushed > 0 && on_page) {
+            on_page(reinterpret_cast<const char *>(buf.data()), (size_t)flushed);
+        }
+    }
+    ~mp3_streamer() {
+        if (lame) lame_close(lame);
+    }
+};
 
 // encode float32 audio samples as raw PCM (int16, little-endian)
 static std::string encode_pcm(const std::vector<float> & samples) {
@@ -855,11 +848,12 @@ int main(int argc, char ** argv) {
         }
 
         // validate response format
-        if (response_format != "wav" && response_format != "pcm" && response_format != "opus") {
+        if (response_format != "wav" && response_format != "pcm" &&
+            response_format != "opus" && response_format != "mp3") {
             res.status = 400;
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
-                            "', supported: wav, pcm, opus"},
+                            "', supported: wav, pcm, opus, mp3"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
@@ -952,9 +946,11 @@ int main(int argc, char ** argv) {
             const bool is_sse  = (stream_format == "sse");
             const bool is_wav  = (response_format == "wav");
             const bool is_opus = (response_format == "opus");
+            const bool is_mp3  = (response_format == "mp3");
             const char * ctype = is_sse ? "text/event-stream"
                                         : (is_wav  ? "audio/wav"
-                                        : (is_opus ? "audio/ogg" : "audio/pcm"));
+                                        : (is_opus ? "audio/ogg"
+                                        : (is_mp3  ? "audio/mpeg" : "audio/pcm")));
 
             // capture synthesis inputs; move into provider lambda below.
             res.set_chunked_content_provider(ctype,
@@ -963,7 +959,7 @@ int main(int argc, char ** argv) {
                  voice_embedding = std::move(voice_embedding),
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
-                 stream_batch_size, is_sse, is_wav, is_opus,
+                 stream_batch_size, is_sse, is_wav, is_opus, is_mp3,
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
@@ -988,26 +984,39 @@ int main(int argc, char ** argv) {
                         header_written = true;
                     };
 
-                    // opus encoder is created lazily so we don't pay the cost
-                    // on a request that fails before producing any pcm.
+                    // compressed encoders are created lazily so we don't pay the
+                    // cost on a request that fails before producing any pcm. the
+                    // on_page callback is the same shape for both: it either
+                    // ships raw bytes (audio mode) or wraps them in an SSE delta.
+                    auto wrap_compressed = [&](const char * p, size_t n) -> bool {
+                        if (is_sse) {
+                            json delta = {
+                                {"type", "speech.audio.delta"},
+                                {"audio", base64_encode(p, n)},
+                            };
+                            std::string frame = "event: speech.audio.delta\ndata: "
+                                              + delta.dump() + "\n\n";
+                            return sink.write(frame.data(), frame.size());
+                        }
+                        return sink.write(p, n);
+                    };
+
                     opus_streamer opus;
                     bool opus_open = false;
                     auto ensure_opus = [&]() -> bool {
                         if (opus_open || !is_opus) return opus_open || !is_opus;
-                        opus.on_page = [&](const char * p, size_t n) -> bool {
-                            if (is_sse) {
-                                json delta = {
-                                    {"type", "speech.audio.delta"},
-                                    {"audio", base64_encode(p, n)},
-                                };
-                                std::string frame = "event: speech.audio.delta\ndata: "
-                                                  + delta.dump() + "\n\n";
-                                return sink.write(frame.data(), frame.size());
-                            }
-                            return sink.write(p, n);
-                        };
+                        opus.on_page = wrap_compressed;
                         opus_open = opus.open(sample_rate_fallback);
                         return opus_open;
+                    };
+
+                    mp3_streamer mp3;
+                    bool mp3_open = false;
+                    auto ensure_mp3 = [&]() -> bool {
+                        if (mp3_open || !is_mp3) return mp3_open || !is_mp3;
+                        mp3.on_page = wrap_compressed;
+                        mp3_open = mp3.open(sample_rate_fallback);
+                        return mp3_open;
                     };
 
                     streaming_opts sopts;
@@ -1017,6 +1026,10 @@ int main(int argc, char ** argv) {
                         if (is_opus) {
                             if (!ensure_opus()) return false;
                             return opus.write(pcm, n);
+                        }
+                        if (is_mp3) {
+                            if (!ensure_mp3()) return false;
+                            return mp3.write(pcm, n);
                         }
                         std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
                         if (is_sse) {
@@ -1046,8 +1059,9 @@ int main(int argc, char ** argv) {
 
                     // ensure a header went out even if no pcm was produced.
                     ensure_header();
-                    // flush any opus samples sitting in libopusenc's lookahead.
+                    // flush samples sitting in the compressed-encoder lookahead.
                     if (opus_open) opus.finish();
+                    if (mp3_open)  mp3.finish();
 
                     if (is_sse) {
                         std::string done_frame = "event: speech.audio.done\ndata: "
@@ -1113,6 +1127,8 @@ int main(int argc, char ** argv) {
                 res.set_content(encode_pcm(result.audio), "audio/pcm");
             } else if (response_format == "opus") {
                 res.set_content(encode_opus(result.audio, result.sample_rate), "audio/ogg");
+            } else if (response_format == "mp3") {
+                res.set_content(encode_mp3(result.audio, result.sample_rate), "audio/mpeg");
             } else {
                 res.set_content(encode_wav(result.audio, result.sample_rate), "audio/wav");
             }
@@ -1121,7 +1137,8 @@ int main(int argc, char ** argv) {
 
         // stream_format=audio: raw chunked bytes in the chosen response_format.
         // wav uses a placeholder-size header so playback can start immediately.
-        // opus produces a self-contained Ogg stream (no separate header).
+        // opus produces a self-contained Ogg stream (no separate header), and
+        // mp3 is self-framing (each MPEG frame stands alone).
         if (stream_format == "audio") {
             std::string header;
             std::string body_bytes;
@@ -1133,6 +1150,9 @@ int main(int argc, char ** argv) {
             } else if (response_format == "opus") {
                 body_bytes = encode_opus(result.audio, result.sample_rate);
                 ctype      = "audio/ogg";
+            } else if (response_format == "mp3") {
+                body_bytes = encode_mp3(result.audio, result.sample_rate);
+                ctype      = "audio/mpeg";
             } else {
                 body_bytes = encode_pcm(result.audio);
             }
@@ -1160,6 +1180,8 @@ int main(int argc, char ** argv) {
                 audio_bytes = encode_wav(result.audio, result.sample_rate);
             } else if (response_format == "opus") {
                 audio_bytes = encode_opus(result.audio, result.sample_rate);
+            } else if (response_format == "mp3") {
+                audio_bytes = encode_mp3(result.audio, result.sample_rate);
             } else {
                 audio_bytes = encode_pcm(result.audio);
             }

@@ -11,9 +11,12 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <mutex>
 
 #include <mpg123.h>
+#include <opusenc.h>
+#include <lame/lame.h>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -1219,56 +1222,171 @@ bool load_audio_bytes(const void * data, size_t len,
     return false;
 }
 
-// WAV file saving (16-bit PCM at specified sample rate)
+// Encode float32 mono PCM as a complete WAV byte buffer (16-bit PCM at sample_rate).
+std::string encode_wav(const std::vector<float> & samples, int sample_rate) {
+    const int num_channels    = 1;
+    const int bits_per_sample = 16;
+    const int byte_rate       = sample_rate * num_channels * bits_per_sample / 8;
+    const int block_align     = num_channels * bits_per_sample / 8;
+    const int data_size       = (int)samples.size() * block_align;
+    const int file_size       = 36 + data_size;
+
+    std::string buf;
+    buf.resize(44 + data_size);
+    char * p = buf.data();
+
+    auto write_u32 = [](char * dst, uint32_t v) {
+        dst[0] = (char)(v & 0xff);
+        dst[1] = (char)((v >> 8) & 0xff);
+        dst[2] = (char)((v >> 16) & 0xff);
+        dst[3] = (char)((v >> 24) & 0xff);
+    };
+    auto write_u16 = [](char * dst, uint16_t v) {
+        dst[0] = (char)(v & 0xff);
+        dst[1] = (char)((v >> 8) & 0xff);
+    };
+
+    memcpy(p,      "RIFF", 4); write_u32(p + 4,  file_size);
+    memcpy(p + 8,  "WAVE", 4);
+    memcpy(p + 12, "fmt ", 4); write_u32(p + 16, 16);
+    write_u16(p + 20, 1); // PCM
+    write_u16(p + 22, num_channels);
+    write_u32(p + 24, sample_rate);
+    write_u32(p + 28, byte_rate);
+    write_u16(p + 32, block_align);
+    write_u16(p + 34, bits_per_sample);
+    memcpy(p + 36, "data", 4); write_u32(p + 40, data_size);
+
+    int16_t * dst = reinterpret_cast<int16_t *>(p + 44);
+    for (size_t i = 0; i < samples.size(); i++) {
+        float s = samples[i];
+        if (s >  1.0f) s =  1.0f;
+        if (s < -1.0f) s = -1.0f;
+        dst[i] = (int16_t)(s * 32767.0f);
+    }
+    return buf;
+}
+
+// Encode float32 mono PCM as a self-contained MP3 byte buffer.
+// VBR -V 2 (~190 kbps avg) — no client-facing knob (OpenAI spec doesn't expose one).
+// Input samples are expected in IEEE float range [-1.0, +1.0].
+std::string encode_mp3(const std::vector<float> & samples, int sample_rate) {
+    lame_t lame = lame_init();
+    if (!lame) return {};
+    lame_set_in_samplerate(lame, sample_rate);
+    lame_set_num_channels (lame, 1);
+    lame_set_mode         (lame, MONO);
+    lame_set_VBR          (lame, vbr_default);
+    lame_set_VBR_quality  (lame, 2.0f);
+    lame_set_quality      (lame, 2); // 0=best/slow .. 9=worst/fast
+    if (lame_init_params(lame) < 0) {
+        lame_close(lame);
+        return {};
+    }
+
+    const int n = (int)samples.size();
+    // LAME guidance: worst-case mp3buf >= 1.25*nsamples + 7200
+    const size_t cap = (size_t)(1.25 * (double)n) + 7200;
+    std::string out;
+    out.resize(cap);
+    auto * mp3 = reinterpret_cast<unsigned char *>(out.data());
+
+    int written = lame_encode_buffer_ieee_float(lame, samples.data(), nullptr, n, mp3, (int)cap);
+    if (written < 0) {
+        fprintf(stderr, "ERROR: lame_encode_buffer_ieee_float failed: %d\n", written);
+        lame_close(lame);
+        return {};
+    }
+    int flushed = lame_encode_flush(lame, mp3 + written, (int)(cap - (size_t)written));
+    if (flushed < 0) {
+        fprintf(stderr, "ERROR: lame_encode_flush failed: %d\n", flushed);
+        lame_close(lame);
+        return {};
+    }
+    out.resize((size_t)(written + flushed));
+    lame_close(lame);
+    return out;
+}
+
+// Encode float32 mono PCM as a self-contained Ogg/Opus byte buffer.
+// sample_rate must be 8/12/16/24/48 kHz (libopusenc constraint).
+std::string encode_opus(const std::vector<float> & samples, int sample_rate) {
+    OggOpusComments * comments = ope_comments_create();
+    int error = 0;
+
+    struct sink_t {
+        std::string * out;
+        bool          failed = false;
+    } sink{ nullptr, false };
+    std::string out;
+    sink.out = &out;
+
+    OpusEncCallbacks cb;
+    cb.write = [](void * user, const unsigned char * ptr, opus_int32 len) -> int {
+        auto * s = static_cast<sink_t *>(user);
+        s->out->append(reinterpret_cast<const char *>(ptr), (size_t)len);
+        return 0;
+    };
+    cb.close = [](void *) -> int { return 0; };
+
+    OggOpusEnc * enc = ope_encoder_create_callbacks(&cb, &sink, comments, sample_rate, 1, 0, &error);
+    if (!enc || error != OPE_OK) {
+        if (enc) ope_encoder_destroy(enc);
+        ope_comments_destroy(comments);
+        return {};
+    }
+    if (!samples.empty()) {
+        ope_encoder_write_float(enc, samples.data(), (int)samples.size());
+    }
+    ope_encoder_drain(enc);
+    ope_encoder_destroy(enc);
+    ope_comments_destroy(comments);
+    return out;
+}
+
+static std::string str_tolower(std::string s) {
+    for (auto & c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+// Save audio to disk, dispatching on file extension:
+//   .wav         -> 16-bit PCM WAV
+//   .mp3         -> LAME VBR -V 2
+//   .opus / .ogg -> Ogg/Opus
+// Unknown extensions are rejected loudly — the CLI is a tool, not a guesser.
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,
                      int sample_rate) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "ERROR: Cannot create WAV file: %s\n", path.c_str());
+    auto dot = path.find_last_of('.');
+    std::string ext = (dot == std::string::npos) ? "" : str_tolower(path.substr(dot + 1));
+
+    std::string bytes;
+    if (ext == "wav") {
+        bytes = encode_wav(samples, sample_rate);
+    } else if (ext == "mp3") {
+        bytes = encode_mp3(samples, sample_rate);
+    } else if (ext == "opus" || ext == "ogg") {
+        bytes = encode_opus(samples, sample_rate);
+    } else {
+        fprintf(stderr, "ERROR: unsupported output extension '.%s' — use .wav, .mp3, .opus, or .ogg\n",
+                ext.c_str());
         return false;
     }
-    
-    // WAV header parameters
-    uint16_t num_channels = 1;
-    uint16_t bits_per_sample = 16;
-    uint32_t byte_rate = sample_rate * num_channels * bits_per_sample / 8;
-    uint16_t block_align = num_channels * bits_per_sample / 8;
-    uint32_t data_size = samples.size() * block_align;
-    uint32_t file_size = 36 + data_size;
-    
-    // Write RIFF header
-    fwrite("RIFF", 1, 4, f);
-    fwrite(&file_size, 4, 1, f);
-    fwrite("WAVE", 1, 4, f);
-    
-    // Write fmt chunk
-    fwrite("fmt ", 1, 4, f);
-    uint32_t fmt_size = 16;
-    fwrite(&fmt_size, 4, 1, f);
-    uint16_t audio_format = 1;  // PCM
-    fwrite(&audio_format, 2, 1, f);
-    fwrite(&num_channels, 2, 1, f);
-    uint32_t sr = sample_rate;
-    fwrite(&sr, 4, 1, f);
-    fwrite(&byte_rate, 4, 1, f);
-    fwrite(&block_align, 2, 1, f);
-    fwrite(&bits_per_sample, 2, 1, f);
-    
-    // Write data chunk
-    fwrite("data", 1, 4, f);
-    fwrite(&data_size, 4, 1, f);
-    
-    // Convert float samples to 16-bit PCM and write
-    for (size_t i = 0; i < samples.size(); ++i) {
-        // Clamp to [-1, 1] and convert to int16
-        float sample = samples[i];
-        if (sample > 1.0f) sample = 1.0f;
-        if (sample < -1.0f) sample = -1.0f;
-        int16_t pcm_sample = (int16_t)(sample * 32767.0f);
-        fwrite(&pcm_sample, 2, 1, f);
+    if (bytes.empty()) {
+        fprintf(stderr, "ERROR: failed to encode audio for %s\n", path.c_str());
+        return false;
     }
-    
+
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "ERROR: Cannot create output file: %s\n", path.c_str());
+        return false;
+    }
+    size_t w = fwrite(bytes.data(), 1, bytes.size(), f);
     fclose(f);
+    if (w != bytes.size()) {
+        fprintf(stderr, "ERROR: short write to %s (%zu/%zu)\n", path.c_str(), w, bytes.size());
+        return false;
+    }
     return true;
 }
 

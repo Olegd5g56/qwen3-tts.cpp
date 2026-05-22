@@ -7,8 +7,8 @@ synthesis. No Python or PyTorch at inference time.
 
 ## Features
 
-- OpenAI-compatible `/v1/audio/speech` server with `wav`, `pcm`, and `opus` output
-- Live streaming: PCM/WAV/Opus chunks flushed to the wire as the vocoder produces
+- OpenAI-compatible `/v1/audio/speech` server with `wav`, `pcm`, `opus`, and `mp3` output
+- Live streaming: PCM/WAV/Opus/MP3 chunks flushed to the wire as the vocoder produces
   them (`stream_format=audio` or SSE)
 - Voice library shared between server and CLI — drop reference audio
   (`.wav` or `.mp3`) into a directory, or upload session voices to the
@@ -56,8 +56,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 
 - C++17 compiler (GCC 11+ or Clang 14+)
 - CMake 3.14+
-- `libmpg123` (MP3 reference audio) — Arch: `pacman -S mpg123`
-- `libopusenc` (server, Ogg/Opus encoding) — Arch: `pacman -S libopusenc`
+- `libmpg123` (MP3 decoding, reference audio) — Arch: `pacman -S mpg123`
+- `libopusenc` (Ogg/Opus encoding for CLI `-o foo.opus` and server `response_format=opus`) — Arch: `pacman -S libopusenc`
+- `lame` / `libmp3lame` (MP3 encoding for CLI `-o foo.mp3` and server `response_format=mp3`) — Arch: `pacman -S lame`
 - Vulkan SDK if `-DGGML_VULKAN=ON`
 
 GGML is vendored as a submodule and built as part of the top-level CMake.
@@ -176,7 +177,7 @@ env overrides defaults). Convenient for Docker / systemd.
   "voice": "default | <built-in name> | <library voice id>",
   "instructions": "(VoiceDesign only) describe the desired voice",
   "language": "en",
-  "response_format": "wav | pcm | opus",
+  "response_format": "wav | pcm | opus | mp3",
   "stream_format": "audio | sse",
   "stream_batch_size": 16,
   "temperature": 0.9,
@@ -192,7 +193,8 @@ Output:
   `response_format` after generation completes.
 - **`stream_format=audio`**: HTTP chunked transfer with bytes in the chosen
   `response_format`. WAV uses a placeholder-size header so playback can begin
-  immediately; Opus produces a self-contained Ogg stream.
+  immediately; Opus produces a self-contained Ogg stream; MP3 is self-framing
+  (each MPEG frame stands alone, so any prefix is playable).
 - **`stream_format=sse`**: Server-Sent Events emitting `speech.audio.delta`
   frames (base64-encoded audio) followed by `speech.audio.done` with usage
   and timing.
@@ -218,7 +220,9 @@ curl -sN -X POST http://localhost:8080/v1/audio/speech \
 | aplay -q -f S16_LE -r 24000 -c 1
 ```
 
-PCM is always 24 kHz, mono, signed 16-bit little-endian.
+PCM is always 24 kHz, mono, signed 16-bit little-endian. MP3 is encoded with
+LAME at VBR `-V 2` (~190 kbps avg) — no client-side knob, by design (the
+OpenAI TTS API doesn't expose a bitrate field, and we mirror that contract).
 
 ### Voice library
 
@@ -271,6 +275,10 @@ server where they overlap, same voice-library layout, same model-type rules.
 # basic
 ./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.wav
 
+# output format is picked from the file extension — .wav, .mp3, .opus, .ogg
+./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.mp3
+./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.opus
+
 # from stdin
 echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
 
@@ -293,7 +301,7 @@ echo "Hello from a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
 | `-m, --model <path>` | `TTS_MODEL` | — | talker GGUF (file or directory) |
 | `--vocoder <file>` | `TTS_VOCODER` | auto | vocoder GGUF |
 | `-t, --text <s>` | — | stdin | text to synthesize (or piped via stdin) |
-| `-o, --output <file>` | — | `output.wav` | output WAV path |
+| `-o, --output <file>` | — | `output.wav` | output path; encoder picked by extension (`.wav`, `.mp3`, `.opus`/`.ogg`) |
 | `-r, --reference <file>` | — | — | inline reference audio, `.wav` or `.mp3` (mutually exclusive with `-v`) |
 | `-v, --voice <name>` | `TTS_VOICE` | — | built-in or library voice |
 | `--voices-dir <dir>` | `TTS_VOICES_DIR` | — | voice library directory |

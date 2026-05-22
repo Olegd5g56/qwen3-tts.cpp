@@ -252,8 +252,18 @@ bool load_audio_file(const std::string & path, std::vector<float> & samples,
 bool load_audio_bytes(const void * data, size_t len,
                       std::vector<float> & samples, int & sample_rate);
 
-// Utility: Save audio file (WAV format)
+// Utility: Save audio file. Dispatches on path extension:
+//   .wav         -> 16-bit PCM WAV
+//   .mp3         -> LAME VBR -V 2 (~190 kbps avg)
+//   .opus / .ogg -> Ogg/Opus
+// Unknown extensions are rejected with an error message.
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,
                      int sample_rate);
+
+// In-memory audio encoders. samples are float32 mono in range [-1.0, +1.0].
+// On encoder failure return an empty string.
+std::string encode_wav (const std::vector<float> & samples, int sample_rate);
+std::string encode_mp3 (const std::vector<float> & samples, int sample_rate);
+std::string encode_opus(const std::vector<float> & samples, int sample_rate);
 
 } // namespace qwen3_tts
