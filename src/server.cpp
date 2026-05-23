@@ -11,11 +11,10 @@
 
 #include "qwen3_tts.h"
 #include "voice_store.h"
+#include "audio_streamers.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <opusenc.h>
-#include <lame/lame.h>
 
 #include <atomic>
 #include <chrono>
@@ -48,107 +47,9 @@ static int language_to_id(const std::string & lang) {
     return -1;
 }
 
-// One-shot encoders (encode_wav, encode_mp3, encode_opus) live in qwen3_tts.cpp
-// so the CLI can reuse them — they're brought in via `using namespace qwen3_tts`.
-
-// stateful Ogg/Opus encoder. write() consumes float PCM (mono); whenever
-// libopusenc finishes a page, on_page is invoked with the encoded bytes
-// (raw page data, ready to ship). finish() drains pending samples and
-// emits the final pages. Sample rate must be one of 8/12/16/24/48 kHz —
-// 24 kHz matches the vocoder output, so no resampling is needed.
-struct opus_streamer {
-    OggOpusEnc *      enc      = nullptr;
-    OggOpusComments * comments = nullptr;
-    std::function<bool(const char *, size_t)> on_page;
-    bool failed = false;
-
-    bool open(int sample_rate) {
-        comments = ope_comments_create();
-        OpusEncCallbacks cb;
-        cb.write = &opus_streamer::write_cb;
-        cb.close = &opus_streamer::close_cb;
-        int error = 0;
-        enc = ope_encoder_create_callbacks(&cb, this, comments, sample_rate, 1, 0, &error);
-        return enc != nullptr && error == OPE_OK;
-    }
-    bool write(const float * pcm, size_t n_samples) {
-        if (!enc || failed) return false;
-        return ope_encoder_write_float(enc, pcm, (int)n_samples) == OPE_OK && !failed;
-    }
-    void finish() {
-        if (enc) ope_encoder_drain(enc);
-    }
-    ~opus_streamer() {
-        if (enc) ope_encoder_destroy(enc);
-        if (comments) ope_comments_destroy(comments);
-    }
-
-    static int write_cb(void * user, const unsigned char * ptr, opus_int32 len) {
-        auto * s = static_cast<opus_streamer *>(user);
-        if (s->failed) return 1;
-        if (!s->on_page(reinterpret_cast<const char *>(ptr), (size_t)len)) {
-            s->failed = true;
-            return 1;
-        }
-        return 0;
-    }
-    static int close_cb(void *) { return 0; }
-};
-
-// stateful LAME MP3 encoder. write() consumes float PCM (mono); the encoded
-// MP3 frames are pushed to on_page as soon as LAME emits any (some calls
-// produce 0 bytes when LAME is buffering for its next frame). finish() flushes
-// the residual frames. VBR -V 2 — same defaults as encode_mp3() in qwen3_tts.
-struct mp3_streamer {
-    lame_t                                    lame = nullptr;
-    std::function<bool(const char *, size_t)> on_page;
-    bool                                      failed = false;
-    std::vector<unsigned char>                buf;
-
-    bool open(int sample_rate) {
-        lame = lame_init();
-        if (!lame) return false;
-        lame_set_in_samplerate(lame, sample_rate);
-        lame_set_num_channels (lame, 1);
-        lame_set_mode         (lame, MONO);
-        lame_set_VBR          (lame, vbr_default);
-        lame_set_VBR_quality  (lame, 2.0f);
-        lame_set_quality      (lame, 2);
-        if (lame_init_params(lame) < 0) {
-            lame_close(lame);
-            lame = nullptr;
-            return false;
-        }
-        return true;
-    }
-    bool write(const float * pcm, size_t n_samples) {
-        if (!lame || failed) return false;
-        const size_t cap = (size_t)(1.25 * (double)n_samples) + 7200;
-        if (buf.size() < cap) buf.resize(cap);
-        int written = lame_encode_buffer_ieee_float(lame, pcm, nullptr,
-                                                    (int)n_samples,
-                                                    buf.data(), (int)buf.size());
-        if (written < 0) { failed = true; return false; }
-        if (written > 0 && on_page) {
-            if (!on_page(reinterpret_cast<const char *>(buf.data()), (size_t)written)) {
-                failed = true;
-                return false;
-            }
-        }
-        return true;
-    }
-    void finish() {
-        if (!lame || failed) return;
-        if (buf.size() < 7200) buf.resize(7200);
-        int flushed = lame_encode_flush(lame, buf.data(), (int)buf.size());
-        if (flushed > 0 && on_page) {
-            on_page(reinterpret_cast<const char *>(buf.data()), (size_t)flushed);
-        }
-    }
-    ~mp3_streamer() {
-        if (lame) lame_close(lame);
-    }
-};
+// One-shot encoders (encode_wav, encode_mp3, encode_opus) and the
+// opus_streamer / mp3_streamer types live in qwen3_tts so CLI and server
+// share the same encoder configuration. Brought in via the includes above.
 
 // encode float32 audio samples as raw PCM (int16, little-endian)
 static std::string encode_pcm(const std::vector<float> & samples) {

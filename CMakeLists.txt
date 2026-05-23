@@ -152,6 +152,7 @@ target_link_libraries(audio_tokenizer_decoder PUBLIC
 # Qwen3 TTS library (full pipeline)
 add_library(qwen3_tts STATIC
     src/qwen3_tts.cpp
+    src/audio_streamers.cpp
 )
 target_include_directories(qwen3_tts PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -167,6 +168,11 @@ target_link_libraries(qwen3_tts PUBLIC
 )
 target_link_libraries(qwen3_tts PRIVATE
     PkgConfig::MPG123
+)
+# OPUSENC + LAME are PUBLIC because the streamer types declared in
+# audio_streamers.h embed lame_t / OggOpusEnc* members, so any consumer
+# that includes that header (e.g. server.cpp) needs the include paths.
+target_link_libraries(qwen3_tts PUBLIC
     PkgConfig::OPUSENC
     PkgConfig::LAME
 )
@@ -260,12 +266,6 @@ if(QWEN3_TTS_SERVER)
         qwen3_tts
         httplib::httplib
         nlohmann_json::nlohmann_json
-        # opus / lame are needed for the streaming encoders (opus_streamer,
-        # mp3_streamer) that live in server.cpp. The one-shot encoders are in
-        # qwen3_tts.cpp and link these PRIVATE, so headers aren't transitively
-        # exposed — pull them in directly here.
-        PkgConfig::OPUSENC
-        PkgConfig::LAME
     )
 endif()
 

@@ -1,5 +1,6 @@
 #include "qwen3_tts.h"
 #include "gguf_loader.h"
+#include "audio_streamers.h"
 
 #include <cstdio>
 #include <cstring>
@@ -15,8 +16,6 @@
 #include <mutex>
 
 #include <mpg123.h>
-#include <opusenc.h>
-#include <lame/lame.h>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -1270,77 +1269,35 @@ std::string encode_wav(const std::vector<float> & samples, int sample_rate) {
 // Encode float32 mono PCM as a self-contained MP3 byte buffer.
 // VBR -V 2 (~190 kbps avg) — no client-facing knob (OpenAI spec doesn't expose one).
 // Input samples are expected in IEEE float range [-1.0, +1.0].
+// Thin wrapper over mp3_streamer with a string-appending sink so the encoder
+// parameters live in one place.
 std::string encode_mp3(const std::vector<float> & samples, int sample_rate) {
-    lame_t lame = lame_init();
-    if (!lame) return {};
-    lame_set_in_samplerate(lame, sample_rate);
-    lame_set_num_channels (lame, 1);
-    lame_set_mode         (lame, MONO);
-    lame_set_VBR          (lame, vbr_default);
-    lame_set_VBR_quality  (lame, 2.0f);
-    lame_set_quality      (lame, 2); // 0=best/slow .. 9=worst/fast
-    if (lame_init_params(lame) < 0) {
-        lame_close(lame);
-        return {};
-    }
-
-    const int n = (int)samples.size();
-    // LAME guidance: worst-case mp3buf >= 1.25*nsamples + 7200
-    const size_t cap = (size_t)(1.25 * (double)n) + 7200;
     std::string out;
-    out.resize(cap);
-    auto * mp3 = reinterpret_cast<unsigned char *>(out.data());
-
-    int written = lame_encode_buffer_ieee_float(lame, samples.data(), nullptr, n, mp3, (int)cap);
-    if (written < 0) {
-        fprintf(stderr, "ERROR: lame_encode_buffer_ieee_float failed: %d\n", written);
-        lame_close(lame);
-        return {};
-    }
-    int flushed = lame_encode_flush(lame, mp3 + written, (int)(cap - (size_t)written));
-    if (flushed < 0) {
-        fprintf(stderr, "ERROR: lame_encode_flush failed: %d\n", flushed);
-        lame_close(lame);
-        return {};
-    }
-    out.resize((size_t)(written + flushed));
-    lame_close(lame);
+    mp3_streamer enc;
+    enc.on_page = [&out](const char * p, size_t n) {
+        out.append(p, n);
+        return true;
+    };
+    if (!enc.open(sample_rate)) return {};
+    if (!samples.empty() && !enc.write(samples.data(), samples.size())) return {};
+    enc.finish();
+    if (enc.failed) return {};
     return out;
 }
 
 // Encode float32 mono PCM as a self-contained Ogg/Opus byte buffer.
 // sample_rate must be 8/12/16/24/48 kHz (libopusenc constraint).
 std::string encode_opus(const std::vector<float> & samples, int sample_rate) {
-    OggOpusComments * comments = ope_comments_create();
-    int error = 0;
-
-    struct sink_t {
-        std::string * out;
-        bool          failed = false;
-    } sink{ nullptr, false };
     std::string out;
-    sink.out = &out;
-
-    OpusEncCallbacks cb;
-    cb.write = [](void * user, const unsigned char * ptr, opus_int32 len) -> int {
-        auto * s = static_cast<sink_t *>(user);
-        s->out->append(reinterpret_cast<const char *>(ptr), (size_t)len);
-        return 0;
+    opus_streamer enc;
+    enc.on_page = [&out](const char * p, size_t n) {
+        out.append(p, n);
+        return true;
     };
-    cb.close = [](void *) -> int { return 0; };
-
-    OggOpusEnc * enc = ope_encoder_create_callbacks(&cb, &sink, comments, sample_rate, 1, 0, &error);
-    if (!enc || error != OPE_OK) {
-        if (enc) ope_encoder_destroy(enc);
-        ope_comments_destroy(comments);
-        return {};
-    }
-    if (!samples.empty()) {
-        ope_encoder_write_float(enc, samples.data(), (int)samples.size());
-    }
-    ope_encoder_drain(enc);
-    ope_encoder_destroy(enc);
-    ope_comments_destroy(comments);
+    if (!enc.open(sample_rate)) return {};
+    if (!samples.empty() && !enc.write(samples.data(), samples.size())) return {};
+    enc.finish();
+    if (enc.failed) return {};
     return out;
 }
 
