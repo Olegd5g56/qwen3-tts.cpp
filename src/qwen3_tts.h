@@ -10,8 +10,30 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <cstddef>
 
 namespace qwen3_tts {
+
+// Public API limits shared by the CLI and the HTTP server. OpenAI's TTS API
+// caps `input` at 4096 characters (codepoints, not bytes); we mirror that
+// exactly so requests that pass us also pass the upstream service. The audio
+// token budget is sized so any valid 4096-char request can be fully
+// synthesized without hitting the per-call cap (1.5x covers worst-case slow
+// voices / long pauses at ~12.5 Hz codec rate).
+inline constexpr size_t  MAX_INPUT_CHARS  = 4096;
+inline constexpr int32_t MAX_AUDIO_TOKENS = 6144;
+
+// Count UTF-8 codepoints in a string. Assumes valid UTF-8 (JSON parser
+// guarantees that on the server path; CLI reads from stdin/argv where we
+// trust the OS encoding). Starter bytes are anything that isn't a
+// continuation byte (10xxxxxx).
+inline size_t utf8_codepoints(const std::string & s) {
+    size_t n = 0;
+    for (unsigned char c : s) {
+        if ((c & 0xC0) != 0x80) ++n;
+    }
+    return n;
+}
 
 // TTS generation parameters
 struct tts_params {

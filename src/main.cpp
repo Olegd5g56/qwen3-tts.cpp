@@ -43,7 +43,6 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
-    fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 2048)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  --seed <n>             Sampling seed (default: -1 = random)\n");
     fprintf(stderr, "  -i, --instructions <s> Voice steering instructions\n");
@@ -162,12 +161,6 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.top_p = std::stof(argv[i]);
-        } else if (arg == "--max-tokens") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing max-tokens value\n");
-                return 1;
-            }
-            params.max_audio_tokens = std::stoi(argv[i]);
         } else if (arg == "--repetition-penalty") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing repetition-penalty value\n");
@@ -236,6 +229,20 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 1;
     }
+
+    if (!list_voices) {
+        size_t n_chars = qwen3_tts::utf8_codepoints(text);
+        if (n_chars > qwen3_tts::MAX_INPUT_CHARS) {
+            fprintf(stderr,
+                    "Error: input text exceeds %zu characters (got %zu). "
+                    "Split it into chunks and synthesize them separately.\n",
+                    qwen3_tts::MAX_INPUT_CHARS, n_chars);
+            return 1;
+        }
+    }
+    // Mirror the server's contract: any input that passed the char limit must
+    // be fully synthesized — the library's 2048-token default would clip.
+    params.max_audio_tokens = qwen3_tts::MAX_AUDIO_TOKENS;
 
     if (!voice_name.empty() && !reference_audio.empty()) {
         fprintf(stderr, "Error: --voice and --reference are mutually exclusive\n");

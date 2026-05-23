@@ -358,8 +358,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // openai text limit is 4096 chars
-        if (input.size() > 4096) {
+        // OpenAI TTS API spec: input is capped at 4096 characters (codepoints,
+        // not bytes — std::string::size() would silently shrink the limit to
+        // ~2048 chars for Cyrillic and ~1365 for CJK).
+        if (qwen3_tts::utf8_codepoints(input) > qwen3_tts::MAX_INPUT_CHARS) {
             res.status = 400;
             res.set_content(R"({"error":{"message":"'input' exceeds 4096 characters","type":"invalid_request_error"}})",
                             "application/json");
@@ -485,6 +487,10 @@ int main(int argc, char ** argv) {
         params.print_timing       = sp.verbose;
         params.instructions       = instructions;
         params.ref_text           = voice_ref_text;
+        // Guarantee that any input that passed MAX_INPUT_CHARS validation can
+        // be fully synthesized — the library default (2048) would silently
+        // truncate long requests.
+        params.max_audio_tokens   = qwen3_tts::MAX_AUDIO_TOKENS;
 
         // live streaming path: when stream_format is set and stream_batch_size
         // > 0, synthesis runs INSIDE set_chunked_content_provider so PCM

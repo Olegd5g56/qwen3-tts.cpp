@@ -173,7 +173,7 @@ env overrides defaults). Convenient for Docker / systemd.
 
 ```json
 {
-  "input": "Text to synthesize (max 4096 chars)",
+  "input": "Text to synthesize (max 4096 UTF-8 codepoints, OpenAI-spec)",
   "voice": "default | <built-in name> | <library voice id>",
   "instructions": "(VoiceDesign only) describe the desired voice",
   "language": "en",
@@ -331,7 +331,6 @@ visible. On a warm cache that whole step is sub-second.
 | `--temperature <f>` | `TTS_TEMPERATURE` | `0.9` | sampling temperature (0 = greedy) |
 | `--top-k <n>` | `TTS_TOP_K` | `50` | top-k sampling |
 | `--top-p <f>` | — | `1.0` | reserved (not yet wired into sampling) |
-| `--max-tokens <n>` | — | `2048` | maximum audio tokens to generate |
 | `--repetition-penalty <f>` | `TTS_REPETITION_PENALTY` | `1.05` | repetition penalty |
 | `--seed <n>` | `TTS_SEED` | `-1` | sampling seed |
 | `--streaming-batch-size <n>` | — | `0` | enable streaming vocoder decode (parity-tested against one-shot) |
