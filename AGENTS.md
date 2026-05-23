@@ -12,29 +12,49 @@ Coding conventions and architecture guide for AI agents working on this codebase
 qwen3-tts.cpp/
   src/                          # C++ source files
     main.cpp                    # CLI entry point
-    qwen3_tts.{h,cpp}          # Full pipeline orchestration
-    tts_transformer.{h,cpp}    # TTS transformer (talker + code predictor)
-    text_tokenizer.{h,cpp}     # BPE text tokenizer
+    qwen3_tts.{h,cpp}           # Pipeline orchestration + audio I/O
+                                #   (load_audio_file/bytes, encode_wav/mp3/opus,
+                                #    save_audio_file with extension sniffing)
+    audio_streamers.{h,cpp}     # opus_streamer / mp3_streamer — stateful encoders
+                                #   used by server live-stream AND one-shot encode_*
+    voice_store.{h,cpp}         # Two-tier voice library (disk + session)
+                                #   used by both CLI and server
+    server.cpp                  # OpenAI-compatible TTS HTTP server entry +
+                                #   handlers + idle watchdog
+    server_args.{h,cpp}         # server_params, env loader, CLI parser,
+                                #   --help banner, hf_resolve / hf_download
+    server_audio.{h,cpp}        # PCM/WAV-header/base64 + SSE done event builder
+    tts_transformer.{h,cpp}     # TTS transformer (talker + code predictor)
+    text_tokenizer.{h,cpp}      # BPE text tokenizer
     audio_tokenizer_encoder.{h,cpp}  # ECAPA-TDNN speaker encoder
-    audio_tokenizer_decoder.{h,cpp}  # WavTokenizer vocoder
-    gguf_loader.{h,cpp}        # GGUF model loading
+    audio_codec_encoder.{h,cpp}      # Mimi codec encoder (for ICL voice cloning)
+    audio_tokenizer_decoder.{h,cpp}  # WavTokenizer vocoder (streaming-capable)
+    qwen3tts_c_api.{h,cpp}      # C ABI shared lib (for Nim/other FFI)
+    gguf_loader.{h,cpp}         # GGUF model loading
+    coreml_code_predictor.{h,mm} # macOS-only Core ML bridge (stub on Linux)
   tests/                        # Component tests
-    test_codebook.cpp
-    test_vq_only.cpp
     test_tokenizer.cpp
     test_encoder.cpp
     test_transformer.cpp        # Deterministic reference comparison
     test_decoder.cpp
-  scripts/                      # Python utilities
-    convert_tts_to_gguf.py      # HuggingFace -> GGUF converter (TTS model)
-    convert_tokenizer_to_gguf.py # HuggingFace -> GGUF converter (vocoder)
-    generate_deterministic_reference.py  # Generate Python reference data
-    compare_e2e.py              # End-to-end Python vs C++ comparison
-    run_all_tests.sh            # Test runner
+    test_streaming_parity.cpp   # Streaming-vs-oneshot decoder parity
+    test_icl_dump.cpp           # ICL diagnostic dump
+  scripts/                      # Python utilities (HF↔GGUF conversion, refs)
   reference/                    # Reference data (*.bin gitignored, *.json tracked)
-  models/                       # GGUF models (gitignored)
+  voices/                       # Default --voices-dir, per-id sample.{wav,mp3,txt}
+                                # + cache.bin (encoded embedding + ref codes)
+  docs/                         # Design notes (streaming, optimization, tensors)
   CMakeLists.txt
 ```
+
+### Targets
+
+- `qwen3_tts` (STATIC) — pipeline + audio I/O + audio_streamers; PUBLIC pkg-config
+  deps on `lame` and `libopusenc` (the streamer header embeds their opaque types)
+- `qwen3tts_shared` (SHARED, soname `libqwen3tts.so`) — C ABI over qwen3_tts
+- `qwen3-tts-cli` — CLI executable, links qwen3_tts + voice_store
+- `qwen3-tts-server` — HTTP server, links qwen3_tts + voice_store + httplib +
+  nlohmann_json. Gated by `-DQWEN3_TTS_SERVER=ON` (default ON).
 
 ## Build System
 
@@ -132,9 +152,18 @@ english_language_id = 2050
 
 ### Key Files to Understand
 
-- `tts_transformer.cpp` — The core file (~2300 lines). Contains `generate()`, `forward_prefill()`, `forward_step()`, `predict_codes_autoregressive()`, and all graph builders.
-- `qwen3_tts.cpp` — Pipeline orchestration. Calls tokenizer, encoder, transformer, decoder in sequence.
-- `CMakeLists.txt` — Build configuration. Each component is a separate static library.
+- `tts_transformer.cpp` — The core file (~3200 lines). Contains `generate()`, `forward_prefill()`, `forward_step()`, `predict_codes_autoregressive()`, and all graph builders.
+- `qwen3_tts.cpp` — Pipeline orchestration. Calls tokenizer, encoder, transformer, decoder in sequence. Also hosts audio I/O helpers (`load_audio_file`, `save_audio_file`, `encode_wav/mp3/opus`).
+- `audio_streamers.h/cpp` — `opus_streamer` and `mp3_streamer`. Both server-side live streaming AND the one-shot `encode_mp3`/`encode_opus` go through these, so VBR settings live in one place.
+- `voice_store.h/cpp` — Two-tier voice library: disk (`<dir>/<id>/{sample.wav|mp3,sample.txt?,cache.bin}`) is read-only via the API, plus an in-memory session tier created via `POST /v1/audio/voices`. `refresh()` is cheap (directory listing only); `preload_all()` and `get()` are where encoding happens. Disk-vs-session collisions return 409.
+- `server.cpp` — HTTP entrypoints. The handlers themselves live here; everything around them was moved out: arg parsing/env/HF download → `server_args.cpp`, PCM/WAV/base64/SSE payload → `server_audio.cpp`.
+- `CMakeLists.txt` — Build configuration. Each pipeline component is a separate static library; `qwen3_tts` aggregates them and embeds the audio I/O + streamer code.
+
+### Compressed-audio encoder invariants
+
+- MP3: LAME VBR -V 2 (`~190 kbps avg`), mono, no client-facing knob — OpenAI's TTS API doesn't expose one. Both one-shot `encode_mp3` and server's `mp3_streamer` go through the same setup in `audio_streamers.cpp::mp3_streamer::open`.
+- Opus: Ogg/Opus via libopusenc, mono, sample rate must be `8/12/16/24/48 kHz` (libopusenc constraint). Vocoder output is 24 kHz, so no resampling needed.
+- WAV: 16-bit PCM, mono, sample rate from the result.
 
 ## Testing
 
@@ -158,9 +187,9 @@ bash scripts/run_all_tests.sh           # Full suite
 ## Git Conventions
 
 - Conventional commits: `feat(scope):`, `fix(scope):`, `docs:`
-- Scopes: `transformer`, `vocoder`, `test`, `timing`
+- Scopes: `transformer`, `vocoder`, `server`, `cli`, `voice`, `audio`, `test`, `timing`, `build`
 - One logical change per commit
-- Do not commit model files (*.gguf) or reference binaries (*.bin)
+- Do not commit model files (*.gguf), reference binaries (*.bin), or build directories (`build/`, `build-vulkan/`, etc.)
 
 ## Known Limitations
 
