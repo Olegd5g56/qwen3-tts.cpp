@@ -88,6 +88,83 @@ Outputs:
 - `build/qwen3-tts-server` — HTTP server
 - `build/qwen3-tts-cli`    — one-shot CLI
 
+## Docker
+
+Two Dockerfiles ship at the repo root, one per backend. Pick the one that
+matches the host you'll actually run on; the resulting image is tagged
+locally and any `docker-compose.yml` elsewhere on the same machine can
+reference it by tag without rebuilding.
+
+> The compiled binary uses `-march=native`, so the image is tuned to the CPU
+> that ran `docker build`. That's fine when you build and run on the same
+> box. Rebuild if you move the image to a different machine.
+
+Make sure the ggml submodule is checked out before building (it's `COPY`-ed
+into the build stage as-is):
+
+```bash
+git submodule update --init --recursive
+```
+
+### Build
+
+```bash
+# AMD/Intel GPU via the host's mesa/RADV Vulkan stack
+docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .
+
+# CPU-only, no GPU passthrough required
+docker build -f Dockerfile.cpu    -t qwen3-tts:cpu    .
+```
+
+Each command produces a runtime image of ~500-700 MB (the builder stage is
+discarded after the install step).
+
+### Run directly
+
+Models and voices are mounted, never baked into the image:
+
+```bash
+docker run --rm -it \
+    --device /dev/dri --group-add video \
+    -p 8081:8081 \
+    -v /path/to/models:/models:ro \
+    -v /path/to/voices:/voices:ro \
+    -e TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    -e TTS_VOCODER=/models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
+    -e TTS_VOICES_DIR=/voices \
+    qwen3-tts:vulkan
+```
+
+For the CPU image drop `--device /dev/dri --group-add video` and swap the
+tag to `qwen3-tts:cpu`. All `TTS_*` env vars from the [Configuration](#configuration)
+section work the same way.
+
+### Use in compose elsewhere
+
+Once the image is built locally, any `docker-compose.yml` on the same host
+can reference it by tag — no `build:` section, no rebuild on each `up`:
+
+```yaml
+services:
+  tts:
+    image: qwen3-tts:vulkan
+    ports: ["8081:8081"]
+    devices: ["/dev/dri"]
+    group_add: ["video"]
+    volumes:
+      - /path/to/models:/models:ro
+      - /path/to/voices:/voices:ro
+    environment:
+      TTS_MODEL:      /models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf
+      TTS_VOCODER:    /models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf
+      TTS_VOICES_DIR: /voices
+    restart: unless-stopped
+```
+
+To switch backends, change the `image:` tag (and remove the `devices` /
+`group_add` lines for the CPU image). To pick up a new build, just
+`docker compose up -d` again — Docker reuses the freshly-tagged local image.
+
 ## Models
 
 Pre-converted GGUFs live in the [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-tts)

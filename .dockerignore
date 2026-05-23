@@ -1,0 +1,49 @@
+# Build artifacts — never copy into the image; the container rebuilds in-stage.
+build/
+build-*/
+ggml/build/
+
+# VCS — git history isn't needed at build time; FetchContent uses its own clones.
+.git/
+.gitignore
+.gitmodules
+.gitattributes
+
+# Local-only launchers, voices, models, sample audio.
+test.sh
+test_cli.sh
+voices/
+models/
+*.wav
+*.mp3
+*.opus
+*.ogg
+!examples/*.wav
+
+# Logs, scratch, forensics.
+forensics/
+*.log
+reference/*.bin
+reference/*.wav
+reference/debug/
+debug_*.bin
+test_output/
+test_results.txt
+
+# Editor / OS / agent state.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
+.sisyphus/
+*.swp
+*.swo
+
+# Docs that aren't needed at build time. Comment out if you want them in the image.
+docs/
+
+# Don't recurse into already-present dockerfiles when scanning.
+Dockerfile.vulkan
+Dockerfile.cpu
+.dockerignore

@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1.7
+#
+# qwen3-tts.cpp — CPU-only build (no GPU backend).
+#
+# Build:
+#   docker build -f Dockerfile.cpu -t qwen3-tts:cpu .
+#
+# Run:
+#   docker run --rm -it \
+#     -p 8081:8081 \
+#     -v /path/to/models:/models:ro \
+#     -v /path/to/voices:/voices:ro \
+#     -e TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+#     -e TTS_VOCODER=/models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
+#     -e TTS_VOICES_DIR=/voices \
+#     -e TTS_THREADS=8 \
+#     qwen3-tts:cpu
+#
+# Note: the binary is compiled with `-march=native` (from CMakeLists.txt), so
+# the image is tuned to the CPU that ran `docker build`. Fine for "build and
+# run on the same box"; not portable across machines with different CPUs.
+
+# ---------- builder ----------
+FROM debian:trixie-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        ninja-build \
+        git \
+        pkg-config \
+        ca-certificates \
+        libmpg123-dev \
+        libopusenc-dev \
+        libmp3lame-dev \
+        libopus-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/qwen3-tts \
+    && cmake --build build -j \
+    && cmake --install build
+
+# ---------- runtime ----------
+FROM debian:trixie-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libmpg123-0 \
+        libopusenc0 \
+        libmp3lame0 \
+        libopus0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/qwen3-tts /opt/qwen3-tts
+
+ENV PATH=/opt/qwen3-tts/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/qwen3-tts/lib \
+    TTS_HOST=0.0.0.0 \
+    TTS_PORT=8081 \
+    TTS_THREADS=8
+
+EXPOSE 8081
+ENTRYPOINT ["/opt/qwen3-tts/bin/qwen3-tts-server"]
