@@ -740,26 +740,28 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
     
-    // ICL: prepend ref_codes to the talker output so the vocoder has warm
-    // context (matches qwen3_tts_model.py:616, torch.cat([ref, new])). We then
-    // slice the ref portion off the decoded wav below. Without this, the
-    // vocoder cold-starts and produces ~350ms of noise at the beginning.
-    std::vector<int32_t> codes_for_decode;
-    int32_t total_frames = n_frames;
-    if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
-        total_frames = n_ref_frames + n_frames;
-        codes_for_decode.resize((size_t)total_frames * n_codebooks);
-        std::memcpy(codes_for_decode.data(),
-                    ref_codes,
-                    (size_t)n_ref_frames * n_codebooks * sizeof(int32_t));
-        std::memcpy(codes_for_decode.data() + (size_t)n_ref_frames * n_codebooks,
-                    speech_codes.data(),
-                    speech_codes.size() * sizeof(int32_t));
+    // Chunked decode via the streaming vocoder path. The one-shot decode()
+    // builds a single graph over all n_frames; the conv pyramid upsamples
+    // 12.5Hz → 24kHz (~480x), so activation memory balloons past 13 GB for
+    // ~3k frames. Chunking caps the working set to one DECODE_BATCH worth of
+    // frames; the persistent KV / tail-ring state stitches chunks together
+    // seamlessly (same mechanism as the live-stream path above).
+    //
+    // ICL: feed ref_codes first and discard their PCM so result.audio starts
+    // at the first generated frame. Equivalent to the old prepend-then-trim
+    // trick, but the streaming path lets us drop the cut math.
+    audio_decoder_.stream_reset();
+    const bool icl = ref_codes && n_ref_frames > 0 && !params.ref_text.empty();
+    if (icl) {
+        std::vector<float> warmup_pcm;
+        if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+            result.error_msg = "Failed to warm-up vocoder with ref codes: "
+                               + audio_decoder_.get_error();
+            return result;
+        }
     }
-    const int32_t * decode_codes =
-        codes_for_decode.empty() ? speech_codes.data() : codes_for_decode.data();
-    fprintf(stderr, "  [icl] ref_frames=%d new_frames=%d total_frames=%d prepended=%d\n",
-            n_ref_frames, n_frames, total_frames, (int)!codes_for_decode.empty());
+    fprintf(stderr, "  [icl] ref_frames=%d new_frames=%d prepended=%d\n",
+            n_ref_frames, n_frames, (int)icl);
     if (const char * dp = std::getenv("QWEN3_TTS_DUMP_CODES")) {
         static std::atomic<int> dump_counter{0};
         int idx = dump_counter.fetch_add(1);
@@ -782,19 +784,19 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
 
-    if (!audio_decoder_.decode(decode_codes, total_frames, result.audio)) {
-        result.error_msg = "Failed to decode speech codes: " + audio_decoder_.get_error();
-        return result;
-    }
-
-    // trim the ref-code portion from the decoded wav (qwen3_tts_model.py:628).
-    if (!codes_for_decode.empty() && !result.audio.empty()) {
-        size_t total_samples = result.audio.size();
-        size_t cut = (size_t)(((int64_t)n_ref_frames * (int64_t)total_samples)
-                               / (int64_t)total_frames);
-        if (cut < total_samples) {
-            result.audio.erase(result.audio.begin(),
-                               result.audio.begin() + (ptrdiff_t)cut);
+    constexpr int32_t DECODE_BATCH = 100;
+    for (int32_t off = 0; off < n_frames; off += DECODE_BATCH) {
+        int32_t batch = std::min(DECODE_BATCH, n_frames - off);
+        if (!audio_decoder_.stream_decode(
+                speech_codes.data() + (size_t)off * n_codebooks,
+                batch, result.audio)) {
+            result.error_msg = "Failed to decode speech codes: "
+                               + audio_decoder_.get_error();
+            return result;
+        }
+        if (is_aborted()) {
+            result.error_msg = "Aborted";
+            return result;
         }
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
