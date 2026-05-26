@@ -12,6 +12,7 @@
 #include "qwen3_tts.h"
 #include "voice_store.h"
 #include "audio_streamers.h"
+#include "log.h"
 #include "server_args.h"
 #include "server_audio.h"
 
@@ -20,11 +21,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -32,85 +31,11 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <unistd.h>
 
 using json = nlohmann::json;
 using namespace qwen3_tts;
 
-// Tiny stderr logger: HH:MM:SS.mmm LEVEL [req_id] message
-// Replaces ad-hoc fprintf calls so server output has uniform timestamps,
-// severity, and per-request correlation for tracing concurrent synth jobs.
 namespace {
-
-constexpr const char * LVL_INFO  = "INFO ";
-constexpr const char * LVL_WARN  = "WARN ";
-constexpr const char * LVL_ERROR = "ERROR";
-
-inline bool log_color_enabled() {
-    static const bool v = isatty(fileno(stderr)) && std::getenv("NO_COLOR") == nullptr;
-    return v;
-}
-
-inline std::string log_ts() {
-    using namespace std::chrono;
-    const auto now = system_clock::now();
-    const auto ms  = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-    const auto t   = system_clock::to_time_t(now);
-    std::tm tm{};
-    localtime_r(&t, &tm);
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03lld",
-             tm.tm_hour, tm.tm_min, tm.tm_sec, (long long)ms.count());
-    return buf;
-}
-
-inline const char * log_color(char tag) {
-    if (!log_color_enabled()) return "";
-    switch (tag) {
-        case 'W': return "\033[33m";
-        case 'E': return "\033[31m";
-        default:  return "\033[2m";
-    }
-}
-inline const char * log_reset() { return log_color_enabled() ? "\033[0m" : ""; }
-
-void log_v(const char * level, const char * req_id, const char * fmt, va_list ap) {
-    // One mutex around the whole emit so concurrent log calls don't shred each
-    // other's lines into pieces (we saw "[a] aborted[b] aborted\n -> 499\n").
-    static std::mutex log_mu;
-    std::lock_guard<std::mutex> lock(log_mu);
-    fprintf(stderr, "%s%s %s%s",
-            log_color(level[0]), log_ts().c_str(), level, log_reset());
-    if (req_id && req_id[0]) fprintf(stderr, " [%s]", req_id);
-    fputc(' ', stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-}
-
-__attribute__((format(printf, 1, 2)))
-void log_info(const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(LVL_INFO, "", fmt, a); va_end(a);
-}
-__attribute__((format(printf, 1, 2)))
-void log_warn(const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(LVL_WARN, "", fmt, a); va_end(a);
-}
-__attribute__((format(printf, 1, 2)))
-void log_error(const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(LVL_ERROR, "", fmt, a); va_end(a);
-}
-__attribute__((format(printf, 2, 3)))
-void log_req(const char * req_id, const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(LVL_INFO, req_id, fmt, a); va_end(a);
-}
-__attribute__((format(printf, 2, 3)))
-void log_req_warn(const char * req_id, const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(LVL_WARN, req_id, fmt, a); va_end(a);
-}
-__attribute__((format(printf, 3, 4)))
-void log_at(const char * level, const char * req_id, const char * fmt, ...) {
-    va_list a; va_start(a, fmt); log_v(level, req_id, fmt, a); va_end(a);
-}
 
 // 4 hex chars (~65k unique) — plenty for in-memory request tracing; seeded from
 // std::random_device so a restart doesn't reuse the same opening IDs.

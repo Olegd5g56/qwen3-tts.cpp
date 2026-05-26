@@ -1,9 +1,9 @@
 #include "voice_store.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -107,8 +107,8 @@ bool VoiceStore::refresh() {
     if (!fs::exists(root_, ec)) {
         fs::create_directories(root_, ec);
         if (ec) {
-            fprintf(stderr, "voice_store: cannot create %s: %s\n",
-                    root_.c_str(), ec.message().c_str());
+            log_error("voice library: cannot create %s: %s",
+                      root_.c_str(), ec.message().c_str());
             return false;
         }
     }
@@ -121,7 +121,7 @@ bool VoiceStore::refresh() {
         if (!ent.is_directory(ec)) continue;
         std::string id = ent.path().filename().string();
         if (!valid_id(id)) {
-            fprintf(stderr, "voice_store: skipping '%s' (invalid name)\n", id.c_str());
+            log_warn("voice %s: skipping (invalid name)", id.c_str());
             continue;
         }
         const std::string dir = root_ + "/" + id;
@@ -130,8 +130,8 @@ bool VoiceStore::refresh() {
         if (file_mtime_ns(sample) == 0) {
             std::string mp3 = dir + "/sample.mp3";
             if (file_mtime_ns(mp3) == 0) {
-                fprintf(stderr, "voice_store: skipping '%s' (no sample.wav or sample.mp3)\n",
-                        id.c_str());
+                log_warn("voice %s: skipping (no sample.wav or sample.mp3)",
+                         id.c_str());
                 continue;
             }
             sample = mp3;
@@ -266,8 +266,8 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out,
 
     std::string werr;
     if (!write_cache(dir, v, wav_mtime, txt_mtime, werr)) {
-        fprintf(stderr, "voice_store: %s: cache write failed (%s) — voice still usable in memory\n",
-                id.c_str(), werr.c_str());
+        log_warn("voice %s: cache write failed (%s) — voice still usable in memory",
+                 id.c_str(), werr.c_str());
     }
     out = std::move(v);
     return true;
@@ -368,7 +368,7 @@ bool VoiceStore::get(const std::string & id, voice_entry & out) {
     bool from_cache = false;
     std::string err;
     if (!load_voice_locked(id, v, from_cache, err)) {
-        fprintf(stderr, "voice_store: failed to load '%s': %s\n", id.c_str(), err.c_str());
+        log_error("voice %s: failed to load (%s)", id.c_str(), err.c_str());
         return false;
     }
     voices_[id] = v;

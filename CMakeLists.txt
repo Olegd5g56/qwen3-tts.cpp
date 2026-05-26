@@ -197,6 +197,7 @@ target_link_libraries(qwen3tts_shared PRIVATE
 add_executable(qwen3-tts-cli
     src/main.cpp
     src/voice_store.cpp
+    src/log.cpp
 )
 target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
@@ -263,6 +264,7 @@ if(QWEN3_TTS_SERVER)
         src/server_args.cpp
         src/server_audio.cpp
         src/voice_store.cpp
+        src/log.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
         qwen3_tts
