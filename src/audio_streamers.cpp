@@ -11,7 +11,12 @@ bool opus_streamer::open(int sample_rate) {
     cb.close = &opus_streamer::close_cb;
     int error = 0;
     enc = ope_encoder_create_callbacks(&cb, this, comments, sample_rate, 1, 0, &error);
-    return enc != nullptr && error == OPE_OK;
+    if (enc == nullptr || error != OPE_OK) return false;
+    // Drop the 512-byte padding libopusenc reserves in OpusTags by default for
+    // future metadata edits — we don't write tags, so it's just trailing junk
+    // and makes strict parsers (ffmpeg) warn "N bytes of comment header remain".
+    ope_encoder_ctl(enc, OPE_SET_COMMENT_PADDING_REQUEST, 0);
+    return true;
 }
 
 bool opus_streamer::write(const float * pcm, size_t n_samples) {
