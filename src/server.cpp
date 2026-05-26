@@ -20,12 +20,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,6 +36,102 @@
 
 using json = nlohmann::json;
 using namespace qwen3_tts;
+
+// Tiny stderr logger: HH:MM:SS.mmm LEVEL [req_id] message
+// Replaces ad-hoc fprintf calls so server output has uniform timestamps,
+// severity, and per-request correlation for tracing concurrent synth jobs.
+namespace {
+
+constexpr const char * LVL_INFO  = "INFO ";
+constexpr const char * LVL_WARN  = "WARN ";
+constexpr const char * LVL_ERROR = "ERROR";
+
+inline bool log_color_enabled() {
+    static const bool v = isatty(fileno(stderr)) && std::getenv("NO_COLOR") == nullptr;
+    return v;
+}
+
+inline std::string log_ts() {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const auto ms  = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    const auto t   = system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03lld",
+             tm.tm_hour, tm.tm_min, tm.tm_sec, (long long)ms.count());
+    return buf;
+}
+
+inline const char * log_color(char tag) {
+    if (!log_color_enabled()) return "";
+    switch (tag) {
+        case 'W': return "\033[33m";
+        case 'E': return "\033[31m";
+        default:  return "\033[2m";
+    }
+}
+inline const char * log_reset() { return log_color_enabled() ? "\033[0m" : ""; }
+
+void log_v(const char * level, const char * req_id, const char * fmt, va_list ap) {
+    // One mutex around the whole emit so concurrent log calls don't shred each
+    // other's lines into pieces (we saw "[a] aborted[b] aborted\n -> 499\n").
+    static std::mutex log_mu;
+    std::lock_guard<std::mutex> lock(log_mu);
+    fprintf(stderr, "%s%s %s%s",
+            log_color(level[0]), log_ts().c_str(), level, log_reset());
+    if (req_id && req_id[0]) fprintf(stderr, " [%s]", req_id);
+    fputc(' ', stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+}
+
+__attribute__((format(printf, 1, 2)))
+void log_info(const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(LVL_INFO, "", fmt, a); va_end(a);
+}
+__attribute__((format(printf, 1, 2)))
+void log_warn(const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(LVL_WARN, "", fmt, a); va_end(a);
+}
+__attribute__((format(printf, 1, 2)))
+void log_error(const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(LVL_ERROR, "", fmt, a); va_end(a);
+}
+__attribute__((format(printf, 2, 3)))
+void log_req(const char * req_id, const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(LVL_INFO, req_id, fmt, a); va_end(a);
+}
+__attribute__((format(printf, 2, 3)))
+void log_req_warn(const char * req_id, const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(LVL_WARN, req_id, fmt, a); va_end(a);
+}
+__attribute__((format(printf, 3, 4)))
+void log_at(const char * level, const char * req_id, const char * fmt, ...) {
+    va_list a; va_start(a, fmt); log_v(level, req_id, fmt, a); va_end(a);
+}
+
+// 4 hex chars (~65k unique) — plenty for in-memory request tracing; seeded from
+// std::random_device so a restart doesn't reuse the same opening IDs.
+std::string make_req_id() {
+    static std::atomic<uint32_t> ctr{[]{
+        std::random_device rd; return (uint32_t)rd();
+    }()};
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%04x",
+             ctr.fetch_add(1, std::memory_order_relaxed) & 0xffff);
+    return buf;
+}
+
+// Set by pre_routing for every request; the speech handler additionally
+// populates tls_req_id so the access-logger line shares an ID with the
+// per-event lines emitted during synthesis. httplib processes each request
+// (and its logger callback) on a single thread, so thread_local survives.
+thread_local std::string                            tls_req_id;
+thread_local std::chrono::steady_clock::time_point  tls_start;
+
+}  // namespace
 
 // supported languages and their model codec token IDs
 static const std::vector<std::pair<std::string, int>> SUPPORTED_LANGUAGES = {
@@ -68,12 +167,12 @@ int main(int argc, char ** argv) {
     if (!sp.hf_repo.empty()) {
         sp.model = hf_resolve(sp.hf_repo, sp.hf_file);
         if (sp.model.empty()) return 1;
-        fprintf(stderr, "resolved model: %s\n", sp.model.c_str());
+        log_info("resolved model: %s", sp.model.c_str());
     }
     if (!sp.hf_repo_v.empty()) {
         sp.vocoder = hf_resolve(sp.hf_repo_v, sp.hf_file_v, "F16");
         if (sp.vocoder.empty()) return 1;
-        fprintf(stderr, "resolved vocoder: %s\n", sp.vocoder.c_str());
+        log_info("resolved vocoder: %s", sp.vocoder.c_str());
     }
 
     // model lives in a unique_ptr so the idle watchdog can unload it; the
@@ -85,7 +184,7 @@ int main(int argc, char ** argv) {
 
     auto load_model_into = [&](Qwen3TTS & t) -> bool {
         if (!t.load_model_files(sp.model, sp.vocoder)) {
-            fprintf(stderr, "model load failed: %s\n", t.get_error().c_str());
+            log_error("model load failed: %s", t.get_error().c_str());
             return false;
         }
         t.set_n_threads(sp.n_threads);
@@ -97,7 +196,7 @@ int main(int argc, char ** argv) {
     // Returns nullptr only if a reload attempt actually fails.
     std::function<Qwen3TTS*()> ensure_loaded = [&]() -> Qwen3TTS* {
         if (!tts) {
-            fprintf(stderr, "reloading model: %s\n", sp.model.c_str());
+            log_info("reloading model: %s", sp.model.c_str());
             auto t = std::make_unique<Qwen3TTS>();
             if (!load_model_into(*t)) return nullptr;
             tts = std::move(t);
@@ -108,13 +207,13 @@ int main(int argc, char ** argv) {
 
     // initial load — fail fast on bad path / missing file, otherwise subsequent
     // requests would hit the same error and confuse clients.
-    fprintf(stderr, "loading model: %s\n", sp.model.c_str());
+    log_info("loading model: %s", sp.model.c_str());
     if (!sp.vocoder.empty()) {
-        fprintf(stderr, "loading vocoder: %s\n", sp.vocoder.c_str());
+        log_info("loading vocoder: %s", sp.vocoder.c_str());
     }
     tts = std::make_unique<Qwen3TTS>();
     if (!load_model_into(*tts)) {
-        fprintf(stderr, "fatal: initial model load failed\n");
+        log_error("fatal: initial model load failed");
         return 1;
     }
     // reset the idle clock *after* the load so the watchdog doesn't count the
@@ -128,11 +227,11 @@ int main(int argc, char ** argv) {
     const std::vector<std::string> cached_speaker_names       = tts->get_speaker_names();
     const bool                     cached_has_speaker_encoder = tts->has_speaker_encoder();
 
-    fprintf(stderr, "models loaded (type=%s, speakers=%zu, threads=%d)\n",
-            cached_model_type.c_str(), cached_speaker_names.size(), sp.n_threads);
+    log_info("models loaded (type=%s, speakers=%zu, threads=%d)",
+             cached_model_type.c_str(), cached_speaker_names.size(), sp.n_threads);
     if (sp.idle_timeout_sec > 0) {
-        fprintf(stderr, "idle-timeout: model will unload after %d seconds idle\n",
-                sp.idle_timeout_sec);
+        log_info("idle-timeout: model will unload after %d seconds idle",
+                 sp.idle_timeout_sec);
     }
 
     // derive model id from filename (e.g. "qwen3-tts-0.6b-f16" from path)
@@ -145,10 +244,9 @@ int main(int argc, char ** argv) {
     // Cloned voices only make sense on Base — they're encoded by the Base
     // speaker_encoder and the embedding space doesn't transfer to other variants.
     if (cached_model_type != "base" && !sp.voices_dir.empty()) {
-        fprintf(stderr, "warning: model type '%s' cannot use cloned voices; "
-                        "voice library at '%s' will be ignored. "
-                        "Use a Base model for voice cloning.\n",
-                cached_model_type.c_str(), sp.voices_dir.c_str());
+        log_warn("model type '%s' cannot use cloned voices; voice library at "
+                 "'%s' will be ignored. Use a Base model for voice cloning.",
+                 cached_model_type.c_str(), sp.voices_dir.c_str());
         sp.voices_dir.clear();
     }
 
@@ -158,18 +256,18 @@ int main(int argc, char ** argv) {
     if (!sp.voices_dir.empty()) {
         voice_store.refresh();
         auto discovered = voice_store.list();
-        fprintf(stderr, "voice library: %s (%zu voice%s found, preloading...)\n",
-                sp.voices_dir.c_str(), discovered.size(),
-                discovered.size() == 1 ? "" : "s");
+        log_info("voice library: %s (%zu voice%s found, preloading...)",
+                 sp.voices_dir.c_str(), discovered.size(),
+                 discovered.size() == 1 ? "" : "s");
         const auto t_start = std::chrono::steady_clock::now();
         const size_t loaded = voice_store.preload_all([](const preload_progress & p) {
             if (!p.error.empty()) {
-                fprintf(stderr, "  %s: FAILED (%s)\n", p.id.c_str(), p.error.c_str());
+                log_warn("voice %s: FAILED (%s)", p.id.c_str(), p.error.c_str());
             } else if (p.from_cache) {
-                fprintf(stderr, "  %s: cached (%lldms)\n", p.id.c_str(), (long long)p.ms);
+                log_info("voice %s: cached (%lldms)", p.id.c_str(), (long long)p.ms);
             } else {
-                fprintf(stderr, "  %s: encoded in %.1fs\n",
-                        p.id.c_str(), (double)p.ms / 1000.0);
+                log_info("voice %s: encoded in %.1fs",
+                         p.id.c_str(), (double)p.ms / 1000.0);
             }
         });
         const auto t_total = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -178,27 +276,38 @@ int main(int argc, char ** argv) {
         if (loaded < discovered.size()) {
             failed_suffix = ", " + std::to_string(discovered.size() - loaded) + " failed";
         }
-        fprintf(stderr, "voice library: ready (%zu loaded%s, %.1fs total)\n",
-                loaded, failed_suffix.c_str(), (double)t_total / 1000.0);
+        log_info("voice library: ready (%zu loaded%s, %.1fs total)",
+                 loaded, failed_suffix.c_str(), (double)t_total / 1000.0);
     }
 
     httplib::Server svr;
 
-    // log all requests
+    // Stamp every request with a start time and clear any stale req_id from a
+    // previous request processed on this thread. The speech handler sets its
+    // own req_id; other endpoints leave it empty.
+    svr.set_pre_routing_handler([](const httplib::Request &, httplib::Response &) {
+        tls_start = std::chrono::steady_clock::now();
+        tls_req_id.clear();
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    // Access log: one line per finished request. Speech requests show their
+    // req_id (so all events for the same job correlate); the rest get the
+    // method/path inline. Level is picked from HTTP status family.
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
-        fprintf(stderr, "%s %s%s%s -> %d\n",
-                req.method.c_str(), req.path.c_str(),
-                req.params.empty() ? "" : "?",
-                req.params.empty() ? "" : [&]() {
-                    static thread_local std::string qs;
-                    qs.clear();
-                    for (auto & [k, v] : req.params) {
-                        if (!qs.empty()) qs += '&';
-                        qs += k + "=" + v;
-                    }
-                    return qs.c_str();
-                }(),
-                res.status);
+        using namespace std::chrono;
+        long long dt = duration_cast<milliseconds>(
+            steady_clock::now() - tls_start).count();
+        const char * level = (res.status >= 500) ? LVL_ERROR
+                           : (res.status >= 400) ? LVL_WARN
+                                                  : LVL_INFO;
+        if (!tls_req_id.empty()) {
+            log_at(level, tls_req_id.c_str(), "-> %d in %lldms", res.status, dt);
+            tls_req_id.clear();
+        } else {
+            log_at(level, "", "%s %s -> %d in %lldms",
+                   req.method.c_str(), req.path.c_str(), res.status, dt);
+        }
     });
 
     // --- GET /health ---
@@ -305,8 +414,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        fprintf(stderr, "created session voice '%s'%s\n", name.c_str(),
-                ref_text.empty() ? "" : " (ICL mode)");
+        log_info("created session voice '%s'%s", name.c_str(),
+                 ref_text.empty() ? "" : " (ICL mode)");
         json resp = {{"id", name}, {"name", name}, {"ephemeral", true}};
         if (!ref_text.empty()) resp["mode"] = "icl";
         res.set_content(resp.dump(), "application/json");
@@ -337,6 +446,10 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/audio/speech",
         [&ensure_loaded, &cached_speaker_names, &last_used,
          &synth_mutex, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
+
+        // Assign a per-request id so all events for this synth (entry,
+        // synthesized/aborted, access log) share a tag.
+        tls_req_id = make_req_id();
 
         // parse request body
         json body;
@@ -381,10 +494,13 @@ int main(int argc, char ** argv) {
         if (stream_batch_size < 0) stream_batch_size = 0;
         if (stream_batch_size > 256) stream_batch_size = 256;
 
-        fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f seed=%lld len=%zu\n",
+        log_req(tls_req_id.c_str(),
+                "POST /v1/audio/speech voice=%s lang=%s fmt=%s%s%s chars=%zu temp=%.2f seed=%lld",
                 voice.empty() ? "default" : voice.c_str(),
                 language.c_str(), response_format.c_str(),
-                temperature, (long long)seed, input.size());
+                stream_format.empty() ? "" : " stream=",
+                stream_format.empty() ? "" : stream_format.c_str(),
+                input.size(), temperature, (long long)seed);
 
         // validate language
         int language_id = language_to_id(language);
@@ -632,10 +748,45 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        // Hook the TCP connection state into the model's abort callback so a
+        // dropped client doesn't keep eating CPU/GPU. A side thread polls
+        // req.is_connection_closed() (which peeks the socket — a syscall)
+        // every 200ms and sets an atomic flag; abort_cb itself is just an
+        // atomic load, cheap enough to be called per ggml node. The watcher
+        // also covers time spent queued on synth_mutex: if we acquire the
+        // lock and the flag is already set, we skip synthesis entirely.
+        std::atomic<bool> client_gone{false};
+        std::atomic<bool> stop_watcher{false};
+        std::thread watcher([&]() {
+            while (!stop_watcher.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if (stop_watcher.load(std::memory_order_relaxed)) break;
+                if (req.is_connection_closed()) {
+                    client_gone.store(true, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        });
+        struct watcher_join {
+            std::atomic<bool> & stop;
+            std::thread & t;
+            ~watcher_join() {
+                stop.store(true, std::memory_order_relaxed);
+                if (t.joinable()) t.join();
+            }
+        } watcher_guard{stop_watcher, watcher};
+
         // synthesize (serialized), using voice embedding if provided
         tts_result result;
+        bool client_was_gone = false;
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
+            if (client_gone.load(std::memory_order_relaxed)) {
+                log_req_warn(tls_req_id.c_str(),
+                             "aborted (client gave up while queued)");
+                res.status = 499;
+                return;
+            }
             Qwen3TTS * t = ensure_loaded();
             if (!t) {
                 res.status = 503;
@@ -643,6 +794,11 @@ int main(int argc, char ** argv) {
                                 "application/json");
                 return;
             }
+            auto abort_cb = +[](void * data) -> bool {
+                return static_cast<std::atomic<bool>*>(data)
+                    ->load(std::memory_order_relaxed);
+            };
+            t->set_abort_callback(abort_cb, &client_gone);
             if (!voice_ref_codes.empty()) {
                 result = t->synthesize_with_embedding(
                     input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
@@ -653,7 +809,18 @@ int main(int argc, char ** argv) {
             } else {
                 result = t->synthesize(input, params);
             }
+            // Clear the callback before releasing the mutex so the next request
+            // doesn't see a pointer into our (about-to-die) atomic.
+            t->set_abort_callback(nullptr, nullptr);
+            client_was_gone = client_gone.load(std::memory_order_relaxed);
             last_used = std::chrono::steady_clock::now();
+        }
+
+        // Abort triggered by client disconnect — no one to send a response to.
+        if (client_was_gone || result.error_msg == "Aborted") {
+            log_req_warn(tls_req_id.c_str(), "aborted (client disconnect)");
+            res.status = 499;
+            return;
         }
 
         if (!result.success) {
@@ -673,9 +840,12 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        fprintf(stderr, "synthesized %.2fs audio (%zu samples) in %lldms\n",
+        log_req(tls_req_id.c_str(),
+                "ok %.2fs audio (%zu samples) in %lldms (prefill=%lldms gen=%lldms decode=%lldms)",
                 (float)result.audio.size() / result.sample_rate,
-                result.audio.size(), (long long)result.t_total_ms);
+                result.audio.size(), (long long)result.t_total_ms,
+                (long long)result.t_prefill_ms, (long long)result.t_generate_ms,
+                (long long)result.t_decode_ms);
 
         // one-shot (no stream_format): preserve legacy behavior
         if (stream_format.empty()) {
@@ -778,15 +948,15 @@ int main(int argc, char ** argv) {
                 if (!lock.owns_lock() || !tts) continue;
                 auto idle = steady_clock::now() - last_used;
                 if (idle >= seconds(sp.idle_timeout_sec)) {
-                    fprintf(stderr, "idle %llds: unloading model\n",
-                            (long long)duration_cast<seconds>(idle).count());
+                    log_info("idle %llds: unloading model",
+                             (long long)duration_cast<seconds>(idle).count());
                     tts.reset();
                 }
             }
         });
     }
 
-    fprintf(stderr, "server listening on %s:%d\n", sp.host.c_str(), sp.port);
+    log_info("server listening on %s:%d", sp.host.c_str(), sp.port);
     bool listen_ok = svr.listen(sp.host, sp.port);
 
     // signal the watchdog to exit so it doesn't outlive the locals it captures.
@@ -794,7 +964,7 @@ int main(int argc, char ** argv) {
     if (watchdog_thread.joinable()) watchdog_thread.join();
 
     if (!listen_ok) {
-        fprintf(stderr, "fatal: failed to bind to %s:%d\n", sp.host.c_str(), sp.port);
+        log_error("fatal: failed to bind to %s:%d", sp.host.c_str(), sp.port);
         return 1;
     }
 
