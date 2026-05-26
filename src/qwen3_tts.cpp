@@ -1284,6 +1284,17 @@ std::string encode_mp3(const std::vector<float> & samples, int sample_rate) {
     if (!samples.empty() && !enc.write(samples.data(), samples.size())) return {};
     enc.finish();
     if (enc.failed) return {};
+
+    // Overwrite LAME's placeholder Info/Xing frame (emitted at init_params time)
+    // with the real one. Without this, players can't report duration and
+    // libmpg123 spits "part2_3_length too large" on the first frames because
+    // the placeholder's ancillary bytes corrupt the bit-reservoir state of
+    // the following frame.
+    unsigned char tag[7200];
+    size_t tag_size = lame_get_lametag_frame(enc.lame, tag, sizeof(tag));
+    if (tag_size > 0 && tag_size <= out.size()) {
+        std::memcpy(&out[0], tag, tag_size);
+    }
     return out;
 }
 
