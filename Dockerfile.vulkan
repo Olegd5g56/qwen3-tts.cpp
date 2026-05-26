@@ -61,6 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libopus0 \
         libvulkan1 \
         mesa-vulkan-drivers \
+        libegl1 \
+        libxext6 \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
