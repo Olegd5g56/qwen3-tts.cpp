@@ -88,6 +88,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // unlock the noisy debug stream once we know whether the user asked for it
+    set_verbose(sp.verbose);
+    // Funnel ggml backend chatter (ggml_vulkan: device discovery, etc.)
+    // through our formatter so the log stream stays uniform. Must run before
+    // the first model load — that's when ggml enumerates devices.
+    install_ggml_log_bridge();
+
     // resolve --hf-repo to local file paths
     if (!sp.hf_repo.empty()) {
         sp.model = hf_resolve(sp.hf_repo, sp.hf_file);
@@ -137,10 +144,13 @@ int main(int argc, char ** argv) {
         log_info("loading vocoder: %s", sp.vocoder.c_str());
     }
     tts = std::make_unique<Qwen3TTS>();
+    const auto t_load_start = std::chrono::steady_clock::now();
     if (!load_model_into(*tts)) {
         log_error("fatal: initial model load failed");
         return 1;
     }
+    const auto t_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_load_start).count();
     // reset the idle clock *after* the load so the watchdog doesn't count the
     // load itself toward the timeout (otherwise short timeouts would unload
     // immediately on startup).
@@ -152,8 +162,9 @@ int main(int argc, char ** argv) {
     const std::vector<std::string> cached_speaker_names       = tts->get_speaker_names();
     const bool                     cached_has_speaker_encoder = tts->has_speaker_encoder();
 
-    log_info("models loaded (type=%s, speakers=%zu, threads=%d)",
-             cached_model_type.c_str(), cached_speaker_names.size(), sp.n_threads);
+    log_info("models loaded in %lld ms (type=%s, speakers=%zu, threads=%d)",
+             (long long)t_load_ms, cached_model_type.c_str(),
+             cached_speaker_names.size(), sp.n_threads);
     if (sp.idle_timeout_sec > 0) {
         log_info("idle-timeout: model will unload after %d seconds idle",
                  sp.idle_timeout_sec);

@@ -1,5 +1,6 @@
 #include "qwen3_tts.h"
 #include "voice_store.h"
+#include "log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -63,6 +64,14 @@ void print_usage(const char * program) {
 }
 
 int main(int argc, char ** argv) {
+    // CLI is for interactive use — show the full debug stream by default so
+    // [mem] / backend / per-component timing lines stay visible. The server
+    // gates this behind --verbose because admins want a quiet startup log.
+    qwen3_tts::set_verbose(true);
+    // Funnel ggml backend chatter through our formatter so it sits in the
+    // same timestamped stream as everything else.
+    qwen3_tts::install_ggml_log_bridge();
+
     std::string model_path;
     std::string vocoder_path;
     std::string text;

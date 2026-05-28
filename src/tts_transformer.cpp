@@ -129,7 +129,7 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     }
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    log_info("TTSTransformer backend: %s", device_name);
+    log_debug("TTSTransformer backend: %s", device_name);
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -217,7 +217,7 @@ bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_pa
 
     use_coreml_code_predictor_ = true;
     coreml_code_predictor_path_ = coreml_path;
-    log_info("CoreML code predictor enabled: %s", coreml_code_predictor_path_.c_str());
+    log_debug("CoreML code predictor enabled: %s", coreml_code_predictor_path_.c_str());
     return true;
 #endif
 }

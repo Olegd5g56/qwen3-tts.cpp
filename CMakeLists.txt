@@ -63,9 +63,12 @@ add_subdirectory(${GGML_DIR})
 
 # Shared stderr logger — tiny library that every other lib pulls in, so
 # log_info/log_warn/log_error resolve no matter which combination of libraries
-# a binary (CLI, server, individual test) links against.
+# a binary (CLI, server, individual test) links against. Depends on ggml for
+# the install_ggml_log_bridge() routine that funnels ggml_vulkan: / ggml_metal:
+# chatter through the same formatter.
 add_library(qwen3_log STATIC src/log.cpp)
 target_include_directories(qwen3_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(qwen3_log PUBLIC ggml)
 
 # Text tokenizer library
 add_library(text_tokenizer STATIC

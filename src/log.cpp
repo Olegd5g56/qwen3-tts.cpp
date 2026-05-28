@@ -1,5 +1,8 @@
 #include "log.h"
 
+#include "ggml.h"
+
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -14,6 +17,16 @@ namespace qwen3_tts {
 const char * const LVL_INFO  = "INFO ";
 const char * const LVL_WARN  = "WARN ";
 const char * const LVL_ERROR = "ERROR";
+const char * const LVL_DEBUG = "DEBUG";
+
+namespace {
+
+std::atomic<bool> g_verbose{false};
+
+}  // namespace
+
+void set_verbose(bool v) { g_verbose.store(v, std::memory_order_relaxed); }
+bool is_verbose()        { return g_verbose.load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -73,6 +86,10 @@ void log_warn(const char * fmt, ...) {
 void log_error(const char * fmt, ...) {
     va_list a; va_start(a, fmt); log_v(LVL_ERROR, "", fmt, a); va_end(a);
 }
+void log_debug(const char * fmt, ...) {
+    if (!g_verbose.load(std::memory_order_relaxed)) return;
+    va_list a; va_start(a, fmt); log_v(LVL_DEBUG, "", fmt, a); va_end(a);
+}
 void log_req(const char * req_id, const char * fmt, ...) {
     va_list a; va_start(a, fmt); log_v(LVL_INFO, req_id, fmt, a); va_end(a);
 }
@@ -81,6 +98,39 @@ void log_req_warn(const char * req_id, const char * fmt, ...) {
 }
 void log_at(const char * level, const char * req_id, const char * fmt, ...) {
     va_list a; va_start(a, fmt); log_v(level, req_id, fmt, a); va_end(a);
+}
+
+namespace {
+
+// Cache the level of the last non-CONT ggml message so CONT continuations
+// (used by ggml when one logical line is emitted across several calls) inherit
+// the right severity instead of falling through to log_debug.
+std::atomic<int> g_ggml_last_level{GGML_LOG_LEVEL_INFO};
+
+void ggml_log_bridge(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (!text || !*text) return;
+    std::string msg(text);
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+    if (msg.empty()) return;
+
+    ggml_log_level effective = level;
+    if (effective == GGML_LOG_LEVEL_CONT) {
+        effective = (ggml_log_level) g_ggml_last_level.load(std::memory_order_relaxed);
+    } else {
+        g_ggml_last_level.store((int)effective, std::memory_order_relaxed);
+    }
+
+    switch (effective) {
+        case GGML_LOG_LEVEL_ERROR: log_error("ggml: %s", msg.c_str()); break;
+        case GGML_LOG_LEVEL_WARN:  log_warn ("ggml: %s", msg.c_str()); break;
+        default:                   log_debug("ggml: %s", msg.c_str()); break;
+    }
+}
+
+}  // namespace
+
+void install_ggml_log_bridge() {
+    ggml_log_set(ggml_log_bridge, nullptr);
 }
 
 }  // namespace qwen3_tts

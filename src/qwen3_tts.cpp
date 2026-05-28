@@ -82,12 +82,12 @@ static std::string format_bytes(uint64_t bytes) {
 static void log_memory_usage(const char * label) {
     process_memory_snapshot mem;
     if (!get_process_memory_snapshot(mem)) {
-        log_info("[mem] %-24s unavailable", label);
+        log_debug("[mem] %-24s unavailable", label);
         return;
     }
-    log_info("[mem] %-24s rss=%s  phys=%s",
-             label, format_bytes(mem.rss_bytes).c_str(),
-             format_bytes(mem.phys_footprint_bytes).c_str());
+    log_debug("[mem] %-24s rss=%s  phys=%s",
+              label, format_bytes(mem.rss_bytes).c_str(),
+              format_bytes(mem.phys_footprint_bytes).c_str());
 }
 
 static void resample_linear(const float * input, int input_len, int input_rate,
@@ -170,11 +170,11 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
     const char * low_mem_env = std::getenv("QWEN3_TTS_LOW_MEM");
     low_mem_mode_ = low_mem_env && low_mem_env[0] != '\0' && low_mem_env[0] != '0';
     if (low_mem_mode_) {
-        log_info("low-memory mode enabled (lazy decoder + component unloads)");
+        log_debug("low-memory mode enabled (lazy decoder + component unloads)");
     }
 
     // Load TTS model (contains text tokenizer + transformer for generation)
-    log_info("loading TTS model from %s", tts_model_path_.c_str());
+    log_debug("loading TTS model from %s", tts_model_path_.c_str());
 
     // Load text tokenizer from TTS model
     int64_t t_tokenizer_start = get_time_ms();
@@ -189,14 +189,14 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
             error_msg_ = "Failed to load text tokenizer: " + tokenizer_.get_error();
             return false;
         }
-        log_info("text tokenizer loaded: vocab_size=%d (%lld ms)",
-                 tokenizer_.get_config().vocab_size,
-                 (long long)(get_time_ms() - t_tokenizer_start));
+        log_debug("text tokenizer loaded: vocab_size=%d (%lld ms)",
+                  tokenizer_.get_config().vocab_size,
+                  (long long)(get_time_ms() - t_tokenizer_start));
     }
     log_memory_usage("load/after-tokenizer");
 
     // Speaker encoder is loaded lazily on first voice cloning request.
-    log_info("speaker encoder: deferred (lazy load)");
+    log_debug("speaker encoder: deferred (lazy load)");
 
     // Load TTS transformer from TTS model
     int64_t t_transformer_start = get_time_ms();
@@ -206,14 +206,14 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
         return false;
     }
     transformer_loaded_ = true;
-    log_info("TTS transformer loaded: hidden_size=%d, n_layers=%d (%lld ms)",
-             transformer_.get_config().hidden_size, transformer_.get_config().n_layers,
-             (long long)(get_time_ms() - t_transformer_start));
+    log_debug("TTS transformer loaded: hidden_size=%d, n_layers=%d (%lld ms)",
+              transformer_.get_config().hidden_size, transformer_.get_config().n_layers,
+              (long long)(get_time_ms() - t_transformer_start));
     log_memory_usage("load/after-transformer");
 
     if (!low_mem_mode_) {
         // Load vocoder (audio decoder) from tokenizer model
-        log_info("loading vocoder from %s", decoder_model_path_.c_str());
+        log_debug("loading vocoder from %s", decoder_model_path_.c_str());
         int64_t t_decoder_start = get_time_ms();
         if (!audio_decoder_.load_model(decoder_model_path_)) {
             error_msg_ = "Failed to load vocoder: " + audio_decoder_.get_error();
@@ -221,18 +221,18 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
             return false;
         }
         decoder_loaded_ = true;
-        log_info("vocoder loaded: sample_rate=%d, n_codebooks=%d (%lld ms)",
-                 audio_decoder_.get_config().sample_rate, audio_decoder_.get_config().n_codebooks,
-                 (long long)(get_time_ms() - t_decoder_start));
+        log_debug("vocoder loaded: sample_rate=%d, n_codebooks=%d (%lld ms)",
+                  audio_decoder_.get_config().sample_rate, audio_decoder_.get_config().n_codebooks,
+                  (long long)(get_time_ms() - t_decoder_start));
         log_memory_usage("load/after-vocoder");
     } else {
-        log_info("vocoder: deferred (lazy load)");
+        log_debug("vocoder: deferred (lazy load)");
     }
 
     models_loaded_ = true;
 
     int64_t t_end = get_time_ms();
-    log_info("all models loaded in %lld ms", (long long)(t_end - t_start));
+    log_debug("all models loaded in %lld ms", (long long)(t_end - t_start));
     log_memory_usage("load/end");
 
     return true;
@@ -275,7 +275,7 @@ tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
     
     const int target_rate = 24000;
     if (ref_sample_rate != target_rate) {
-        log_info("resampling audio from %d Hz to %d Hz", ref_sample_rate, target_rate);
+        log_debug("resampling audio from %d Hz to %d Hz", ref_sample_rate, target_rate);
         std::vector<float> resampled;
         resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
         ref_samples = std::move(resampled);
