@@ -51,7 +51,12 @@ void log_v(const char * level, const char * req_id, const char * fmt, va_list ap
     static std::mutex log_mu;
     std::lock_guard<std::mutex> lock(log_mu);
     fprintf(stderr, "%s%s %s%s", color(level[0]), ts().c_str(), level, reset());
-    if (req_id && req_id[0]) fprintf(stderr, " [%s]", req_id);
+    if (req_id && req_id[0]) {
+        // bright cyan on the [req_id] tag so API-request lines pop visually
+        // in the log stream — easy to track entry/progress/exit at a glance.
+        const char * c = color_enabled() ? "\033[96m" : "";
+        fprintf(stderr, " %s[%s]%s", c, req_id, reset());
+    }
     fputc(' ', stderr);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
