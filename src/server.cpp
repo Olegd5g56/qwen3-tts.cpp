@@ -425,7 +425,7 @@ int main(int argc, char ** argv) {
                 language.c_str(), response_format.c_str(),
                 stream_format.empty() ? "" : " stream=",
                 stream_format.empty() ? "" : stream_format.c_str(),
-                input.size(), temperature, (long long)seed);
+                qwen3_tts::utf8_codepoints(input), temperature, (long long)seed);
 
         // validate language
         int language_id = language_to_id(language);
@@ -550,6 +550,9 @@ int main(int argc, char ** argv) {
                                         : (is_mp3  ? "audio/mpeg" : "audio/pcm")));
 
             // capture synthesis inputs; move into provider lambda below.
+            // req_id is captured by value because the chunked provider can be
+            // invoked from a different thread than the request handler, so
+            // the thread_local tls_req_id may be empty inside the lambda.
             res.set_chunked_content_provider(ctype,
                 [ensure_loaded_p = &ensure_loaded, last_used_p = &last_used,
                  input = std::move(input), params = std::move(params),
@@ -557,13 +560,15 @@ int main(int argc, char ** argv) {
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
                  stream_batch_size, is_sse, is_wav, is_opus, is_mp3,
-                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
+                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000,
+                 req_id = tls_req_id]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
+                    const auto t_stream_start = std::chrono::steady_clock::now();
                     std::lock_guard<std::mutex> lock(*synth_mutex);
                     Qwen3TTS * this_tts = (*ensure_loaded_p)();
                     if (!this_tts) {
-                        // can't synthesize without a model; close the stream
-                        // gracefully so the client doesn't hang on partial data.
+                        log_req_warn(req_id.c_str(),
+                                     "live-stream: model unavailable, closing");
                         sink.done();
                         return false;
                     }
@@ -668,6 +673,22 @@ int main(int argc, char ** argv) {
                     // bump idle timer so the watchdog doesn't unload mid-stream
                     *last_used_p = std::chrono::steady_clock::now();
                     sink.done();
+
+                    const auto t_stream_end = std::chrono::steady_clock::now();
+                    const auto stream_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t_stream_end - t_stream_start).count();
+                    const double audio_sec = result.sample_rate > 0
+                        ? (double) result.audio.size() / (double) result.sample_rate : 0.0;
+                    if (result.success) {
+                        log_req(req_id.c_str(),
+                                "live-stream: ok %.2fs audio in %lld ms",
+                                audio_sec, (long long)stream_ms);
+                    } else {
+                        log_req_warn(req_id.c_str(),
+                                     "live-stream: aborted after %.2fs audio in %lld ms (%s)",
+                                     audio_sec, (long long)stream_ms,
+                                     result.error_msg.empty() ? "unknown" : result.error_msg.c_str());
+                    }
                     return false;
                 });
             return;

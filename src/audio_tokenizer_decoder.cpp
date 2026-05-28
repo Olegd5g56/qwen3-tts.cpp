@@ -1,6 +1,7 @@
 #include "audio_tokenizer_decoder.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
+#include "log.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -304,9 +305,9 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                 (int32_t) model_.dec_blocks[i].conv_t_w->ne[1];
         }
     }
-    fprintf(stderr, "  AudioTokenizerDecoder dec_out_channels: [%d, %d, %d, %d]\n",
-            model_.config.dec_out_channels[0], model_.config.dec_out_channels[1],
-            model_.config.dec_out_channels[2], model_.config.dec_out_channels[3]);
+    log_info("AudioTokenizerDecoder dec_out_channels: [%d, %d, %d, %d]",
+             model_.config.dec_out_channels[0], model_.config.dec_out_channels[1],
+             model_.config.dec_out_channels[2], model_.config.dec_out_channels[3]);
     
     // Normalize codebooks using GPU-safe memory access pattern.
     // Download tensor data to host, normalize on CPU, then upload back.
@@ -356,7 +357,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
 
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
+    log_info("AudioTokenizerDecoder backend: %s", device_name);
     
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

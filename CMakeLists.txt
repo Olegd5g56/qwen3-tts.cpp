@@ -61,6 +61,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
 
+# Shared stderr logger — tiny library that every other lib pulls in, so
+# log_info/log_warn/log_error resolve no matter which combination of libraries
+# a binary (CLI, server, individual test) links against.
+add_library(qwen3_log STATIC src/log.cpp)
+target_include_directories(qwen3_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Text tokenizer library
 add_library(text_tokenizer STATIC
     src/text_tokenizer.cpp
@@ -75,6 +81,7 @@ target_include_directories(text_tokenizer PUBLIC
 target_link_libraries(text_tokenizer PUBLIC
     ggml
     Threads::Threads
+    qwen3_log
 )
 
 # TTS Transformer library (GGML-based + optional CoreML bridge)
@@ -99,6 +106,7 @@ target_include_directories(tts_transformer PUBLIC
 target_link_libraries(tts_transformer PUBLIC
     ggml
     Threads::Threads
+    qwen3_log
 )
 if(APPLE AND QWEN3_TTS_COREML)
     target_link_libraries(tts_transformer PUBLIC
@@ -119,6 +127,7 @@ target_include_directories(audio_tokenizer_encoder PUBLIC
 target_link_libraries(audio_tokenizer_encoder PUBLIC
     ggml
     Threads::Threads
+    qwen3_log
 )
 
 # Audio codec encoder library (Mimi encoder for ICL voice cloning)
@@ -133,6 +142,7 @@ target_include_directories(audio_codec_encoder PUBLIC
 target_link_libraries(audio_codec_encoder PUBLIC
     ggml
     Threads::Threads
+    qwen3_log
 )
 
 # Audio tokenizer decoder library (GGML-based)
@@ -147,6 +157,7 @@ target_include_directories(audio_tokenizer_decoder PUBLIC
 target_link_libraries(audio_tokenizer_decoder PUBLIC
     ggml
     Threads::Threads
+    qwen3_log
 )
 
 # Qwen3 TTS library (full pipeline)
@@ -197,7 +208,6 @@ target_link_libraries(qwen3tts_shared PRIVATE
 add_executable(qwen3-tts-cli
     src/main.cpp
     src/voice_store.cpp
-    src/log.cpp
 )
 target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
@@ -264,7 +274,6 @@ if(QWEN3_TTS_SERVER)
         src/server_args.cpp
         src/server_audio.cpp
         src/voice_store.cpp
-        src/log.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
         qwen3_tts

@@ -1,6 +1,7 @@
 #include "audio_codec_encoder.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
+#include "log.h"
 
 #include <cmath>
 #include <cstring>
@@ -248,7 +249,7 @@ bool AudioCodecEncoder::load_model(const std::string & model_path) {
 
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * dev_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  AudioCodecEncoder backend: %s\n", dev_name);
+    log_info("AudioCodecEncoder backend: %s", dev_name);
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -774,7 +775,7 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
         const char * names[] = {"stage_input_conv","stage_cnn_0","stage_cnn_1","stage_cnn_2","stage_cnn_3","stage_final_conv","stage_transformer"};
         for (const char * n : names) {
             struct ggml_tensor * t = ggml_graph_get_tensor(gf, n);
-            if (!t) { fprintf(stderr, "  [dump] missing %s\n", n); continue; }
+            if (!t) { log_warn("[dump] missing %s", n); continue; }
             size_t n_elems = ggml_nelements(t);
             std::vector<float> buf(n_elems);
             if (t->type == GGML_TYPE_F16) {
@@ -791,8 +792,8 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
                 fwrite(hdr, sizeof(int32_t), 4, fp);
                 fwrite(buf.data(), sizeof(float), n_elems, fp);
                 fclose(fp);
-                fprintf(stderr, "  [dump] %s [%lld,%lld,%lld,%lld] → %s\n", n,
-                        (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3], path);
+                log_info("[dump] %s [%lld,%lld,%lld,%lld] → %s", n,
+                         (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3], path);
             }
         }
     }
@@ -826,8 +827,8 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
             fwrite(hdr, sizeof(int32_t), 2, fp);
             fwrite(features_row.data(), sizeof(float), features_row.size(), fp);
             fclose(fp);
-            fprintf(stderr, "dumped pre-VQ features [%d frames x %d hidden] to %s\n",
-                    n_frames, hidden, dp);
+            log_info("dumped pre-VQ features [%d frames x %d hidden] to %s",
+                     n_frames, hidden, dp);
         }
     }
 

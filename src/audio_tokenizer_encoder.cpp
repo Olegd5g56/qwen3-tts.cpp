@@ -1,6 +1,7 @@
 #include "audio_tokenizer_encoder.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
+#include "log.h"
 
 #include <cmath>
 #include <cstring>
@@ -252,7 +253,7 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
     }
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  AudioTokenizerEncoder backend: %s\n", device_name);
+    log_info("AudioTokenizerEncoder backend: %s", device_name);
     
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

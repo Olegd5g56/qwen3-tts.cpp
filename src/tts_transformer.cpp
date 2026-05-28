@@ -1,6 +1,7 @@
 #include "tts_transformer.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
+#include "log.h"
 
 #include <cmath>
 #include <cstring>
@@ -128,7 +129,7 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     }
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  TTSTransformer backend: %s\n", device_name);
+    log_info("TTSTransformer backend: %s", device_name);
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -188,7 +189,7 @@ bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_pa
 
 #if !defined(__APPLE__)
     if (use_coreml_env && use_coreml_env[0] != '\0') {
-        fprintf(stderr, "  CoreML code predictor requested but this build is not on Apple platform\n");
+        log_warn("CoreML code predictor requested but this build is not on Apple platform");
     }
     return true;
 #else
@@ -207,16 +208,16 @@ bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_pa
             error_msg_ = "CoreML code predictor load failed in strict mode: " + coreml_code_predictor_.get_error();
             return false;
         } else {
-            fprintf(stderr, "  CoreML code predictor load failed: %s\n",
-                    coreml_code_predictor_.get_error().c_str());
-            fprintf(stderr, "  Falling back to GGML code predictor\n");
+            log_warn("CoreML code predictor load failed: %s",
+                     coreml_code_predictor_.get_error().c_str());
+            log_warn("falling back to GGML code predictor");
             return true;
         }
     }
 
     use_coreml_code_predictor_ = true;
     coreml_code_predictor_path_ = coreml_path;
-    fprintf(stderr, "  CoreML code predictor enabled: %s\n", coreml_code_predictor_path_.c_str());
+    log_info("CoreML code predictor enabled: %s", coreml_code_predictor_path_.c_str());
     return true;
 #endif
 }
@@ -2585,7 +2586,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         if (skip_ggml_code_pred_layers_) {
             return false;
         }
-        fprintf(stderr, "  CoreML code predictor failed, falling back to GGML: %s\n", error_msg_.c_str());
+        log_warn("CoreML code predictor failed, falling back to GGML: %s", error_msg_.c_str());
         use_coreml_code_predictor_ = false;
     }
     
@@ -2912,14 +2913,14 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
     if (verbose_) {
-        fprintf(stderr, "  prefill build: %lld ms (prefill_len=%d, trailing_len=%d)\n",
-                (long long)(verbose_now_ms() - t_prefill_build_start), prefill_len, trailing_len);
+        log_info("prefill build: %lld ms (prefill_len=%d, trailing_len=%d)",
+                 (long long)(verbose_now_ms() - t_prefill_build_start), prefill_len, trailing_len);
     }
 
     const int32_t required_ctx = prefill_len + max_len + 8;
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
         if (verbose_) {
-            fprintf(stderr, "  init kv cache: n_ctx=%d\n", required_ctx);
+            log_info("init kv cache: n_ctx=%d", required_ctx);
         }
         if (!init_kv_cache(required_ctx)) {
             return false;
@@ -2938,8 +2939,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         return false;
     }
     if (verbose_) {
-        fprintf(stderr, "  prefill forward: %lld ms\n",
-                (long long)(verbose_now_ms() - t_prefill_fwd_start));
+        log_info("prefill forward: %lld ms",
+                 (long long)(verbose_now_ms() - t_prefill_fwd_start));
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -2969,8 +2970,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     for (int frame = 0; frame < max_len; ++frame) {
         if (verbose_ && frame > 0 && frame % 25 == 0) {
             int64_t now = verbose_now_ms();
-            fprintf(stderr, "  decode: frame %d/%d (last 25 frames in %lld ms, total %lld ms)\n",
-                    frame, max_len, (long long)(now - t_decode_last), (long long)(now - t_decode_start));
+            log_info("decode: frame %d/%d (last 25 frames in %lld ms, total %lld ms)",
+                     frame, max_len, (long long)(now - t_decode_last), (long long)(now - t_decode_start));
             t_decode_last = now;
         }
         if (is_aborted()) {
@@ -2986,11 +2987,16 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) sc[i] = {logits[i], i};
             std::partial_sort(sc.begin(), sc.begin() + 5, sc.end(),
                 [](const auto & a, const auto & b) { return a.first > b.first; });
-            fprintf(stderr, "  [diag f%d] n_past=%d hnorm=%.4f hidden[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f top5_cb0=",
-                    frame, n_past, hnorm,
-                    last_hidden_[0], last_hidden_[1], last_hidden_[2], last_hidden_[3], last_hidden_[4]);
-            for (int i = 0; i < 5; ++i) fprintf(stderr, " %d(%.3f)", sc[i].second, sc[i].first);
-            fprintf(stderr, "\n");
+            std::string top5;
+            char buf[64];
+            for (int i = 0; i < 5; ++i) {
+                snprintf(buf, sizeof(buf), " %d(%.3f)", sc[i].second, sc[i].first);
+                top5 += buf;
+            }
+            log_info("[diag f%d] n_past=%d hnorm=%.4f hidden[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f top5_cb0=%s",
+                     frame, n_past, hnorm,
+                     last_hidden_[0], last_hidden_[1], last_hidden_[2], last_hidden_[3], last_hidden_[4],
+                     top5.c_str());
         }
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
@@ -3147,42 +3153,35 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     timing_ = nullptr;
     const auto & t = timing;
     int nf = t.n_frames;
-    fprintf(stderr, "\n=== Detailed Generation Timing (%d frames) ===\n", nf);
-    fprintf(stderr, "\n  Prefill:\n");
-    fprintf(stderr, "    Build graph:      %8.1f ms\n", t.t_prefill_build_ms);
-    fprintf(stderr, "    Forward total:    %8.1f ms\n", t.t_prefill_forward_ms);
-    fprintf(stderr, "      Graph build:    %8.1f ms\n", t.t_prefill_graph_build_ms);
-    fprintf(stderr, "      Graph alloc:    %8.1f ms\n", t.t_prefill_graph_alloc_ms);
-    fprintf(stderr, "      Compute:        %8.1f ms\n", t.t_prefill_compute_ms);
-    fprintf(stderr, "      Data I/O:       %8.1f ms\n", t.t_prefill_data_ms);
-    fprintf(stderr, "\n  Talker forward_step (total / per-frame):\n");
-    fprintf(stderr, "    Total:            %8.1f ms   (%.1f ms/frame)\n", t.t_talker_forward_ms, nf > 0 ? t.t_talker_forward_ms / nf : 0.0);
-    fprintf(stderr, "      Graph build:    %8.1f ms   (%.1f ms/frame)\n", t.t_talker_graph_build_ms, nf > 0 ? t.t_talker_graph_build_ms / nf : 0.0);
-    fprintf(stderr, "      Graph alloc:    %8.1f ms   (%.1f ms/frame)\n", t.t_talker_graph_alloc_ms, nf > 0 ? t.t_talker_graph_alloc_ms / nf : 0.0);
-    fprintf(stderr, "      Compute:        %8.1f ms   (%.1f ms/frame)\n", t.t_talker_compute_ms, nf > 0 ? t.t_talker_compute_ms / nf : 0.0);
-    fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_talker_data_ms, nf > 0 ? t.t_talker_data_ms / nf : 0.0);
-    fprintf(stderr, "\n  Code predictor (total / per-frame):\n");
-    fprintf(stderr, "    Backend:          %s\n", use_coreml_code_predictor_ ? "CoreML (CPU+NE)" : "GGML");
-    if (use_coreml_code_predictor_ && !coreml_code_predictor_path_.empty()) {
-        fprintf(stderr, "    CoreML model:     %s\n", coreml_code_predictor_path_.c_str());
-    }
-    fprintf(stderr, "    Total:            %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_ms, nf > 0 ? t.t_code_pred_ms / nf : 0.0);
-    fprintf(stderr, "      Init/KV/embed:  %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_init_ms, nf > 0 ? t.t_code_pred_init_ms / nf : 0.0);
-    fprintf(stderr, "      Prefill (2tok): %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_prefill_ms, nf > 0 ? t.t_code_pred_prefill_ms / nf : 0.0);
-    fprintf(stderr, "      Steps (14):     %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_steps_ms, nf > 0 ? t.t_code_pred_steps_ms / nf : 0.0);
-    fprintf(stderr, "      Graph build:    %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_graph_build_ms, nf > 0 ? t.t_code_pred_graph_build_ms / nf : 0.0);
-    fprintf(stderr, "      Graph alloc:    %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_graph_alloc_ms, nf > 0 ? t.t_code_pred_graph_alloc_ms / nf : 0.0);
-    fprintf(stderr, "      Compute:        %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_compute_ms, nf > 0 ? t.t_code_pred_compute_ms / nf : 0.0);
-    fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_data_ms, nf > 0 ? t.t_code_pred_data_ms / nf : 0.0);
-    fprintf(stderr, "      CoreML total:   %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_coreml_ms, nf > 0 ? t.t_code_pred_coreml_ms / nf : 0.0);
-    fprintf(stderr, "\n  Embed lookups:      %8.1f ms   (%.1f ms/frame)\n", t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0);
+    log_info("=== detailed generation timing (%d frames) ===", nf);
+    log_info("prefill: build=%.1f ms  forward=%.1f ms (graph_build=%.1f, alloc=%.1f, compute=%.1f, io=%.1f)",
+             t.t_prefill_build_ms, t.t_prefill_forward_ms,
+             t.t_prefill_graph_build_ms, t.t_prefill_graph_alloc_ms,
+             t.t_prefill_compute_ms, t.t_prefill_data_ms);
+    log_info("talker forward: total=%.1f ms (%.1f/frame)  build=%.1f  alloc=%.1f  compute=%.1f  io=%.1f",
+             t.t_talker_forward_ms, nf > 0 ? t.t_talker_forward_ms / nf : 0.0,
+             t.t_talker_graph_build_ms, t.t_talker_graph_alloc_ms,
+             t.t_talker_compute_ms, t.t_talker_data_ms);
+    log_info("code predictor backend: %s%s%s",
+             use_coreml_code_predictor_ ? "CoreML (CPU+NE)" : "GGML",
+             (use_coreml_code_predictor_ && !coreml_code_predictor_path_.empty()) ? " model=" : "",
+             (use_coreml_code_predictor_ && !coreml_code_predictor_path_.empty()) ? coreml_code_predictor_path_.c_str() : "");
+    log_info("code predictor: total=%.1f ms (%.1f/frame)  init=%.1f  prefill=%.1f  steps=%.1f",
+             t.t_code_pred_ms, nf > 0 ? t.t_code_pred_ms / nf : 0.0,
+             t.t_code_pred_init_ms, t.t_code_pred_prefill_ms, t.t_code_pred_steps_ms);
+    log_info("code predictor inner: build=%.1f  alloc=%.1f  compute=%.1f  io=%.1f  coreml=%.1f",
+             t.t_code_pred_graph_build_ms, t.t_code_pred_graph_alloc_ms,
+             t.t_code_pred_compute_ms, t.t_code_pred_data_ms, t.t_code_pred_coreml_ms);
     double accounted = t.t_prefill_build_ms + t.t_prefill_forward_ms + t.t_talker_forward_ms + t.t_code_pred_ms + t.t_embed_lookup_ms;
-    fprintf(stderr, "  Other/overhead:     %8.1f ms\n", t.t_generate_total_ms - accounted);
-    fprintf(stderr, "  ─────────────────────────────────────────\n");
-    fprintf(stderr, "  Total generate:     %8.1f ms\n", t.t_generate_total_ms);
+    log_info("embed lookups=%.1f ms (%.1f/frame)  other/overhead=%.1f ms",
+             t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0,
+             t.t_generate_total_ms - accounted);
     if (nf > 0) {
-        fprintf(stderr, "  Throughput:         %8.1f ms/frame (%.1f frames/s)\n",
-                t.t_generate_total_ms / nf, 1000.0 * nf / t.t_generate_total_ms);
+        log_info("total generate=%.1f ms  throughput=%.1f ms/frame (%.1f frames/s)",
+                 t.t_generate_total_ms, t.t_generate_total_ms / nf,
+                 1000.0 * nf / t.t_generate_total_ms);
+    } else {
+        log_info("total generate=%.1f ms", t.t_generate_total_ms);
     }
 #endif
 
