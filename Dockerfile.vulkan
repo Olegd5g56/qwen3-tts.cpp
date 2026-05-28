@@ -14,7 +14,12 @@
 #     -e TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
 #     -e TTS_VOCODER=/models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
 #     -e TTS_VOICES_DIR=/voices \
+#     -e TZ=Europe/Warsaw \
 #     qwen3-tts:vulkan
+#
+# TZ defaults to UTC inside the container; set -e TZ=<IANA name> (e.g.
+# Europe/Warsaw, America/New_York) so the server's log timestamps match
+# wall-clock time on the host.
 #
 # Note: the binary is compiled with `-march=native` (from CMakeLists.txt), so
 # the image is tuned to the CPU that ran `docker build`. Fine for "build and
@@ -64,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libegl1 \
         libxext6 \
         libgomp1 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/qwen3-tts /opt/qwen3-tts
