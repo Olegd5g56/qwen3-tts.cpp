@@ -533,19 +533,12 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
     struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     struct ggml_tensor * K = ggml_permute(ctx, K_full, 0, 2, 1, 3);
     struct ggml_tensor * V = ggml_permute(ctx, V_full, 0, 2, 1, 3);
-    
-    struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
-    KQ = ggml_scale(ctx, KQ, 1.0f / sqrtf((float)head_dim));
-    // Apply causal mask. n_past is the KV-cache length; with n_past=0
-    // this reduces to the original full causal mask.
-    KQ = ggml_diag_mask_inf(ctx, KQ, n_past);
-    KQ = ggml_soft_max(ctx, KQ);
-    
-    V = ggml_cont(ctx, ggml_transpose(ctx, V));
-    
-    struct ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
-    struct ggml_tensor * attn_out = ggml_cont_2d(ctx, KQV, n_heads * head_dim, n_frames);
+
+    struct ggml_tensor * mask = ggml_get_tensor(ctx, "pre_tfm_mask");
+    struct ggml_tensor * attn_raw = ggml_flash_attn_ext(ctx, Q, K, V, mask,
+                                                       1.0f / sqrtf((float)head_dim),
+                                                       0.0f, 0.0f);
+    struct ggml_tensor * attn_out = ggml_cont_2d(ctx, attn_raw, n_heads * head_dim, n_frames);
     
     attn_out = ggml_mul_mat(ctx, layer.attn_output_w, attn_out);
     
@@ -886,7 +879,16 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_frames);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
-    
+
+    // Single causal mask reused by every pre_tfm layer. flash_attn_ext expects
+    // F16 mask [n_kv, n_q_padded]; pad n_q to 64 so backends with a stride
+    // requirement are happy.
+    const int n_kv_total = n_past + n_frames;
+    const int n_q_padded = GGML_PAD(n_frames, 64);
+    struct ggml_tensor * pre_tfm_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv_total, n_q_padded);
+    ggml_set_name(pre_tfm_mask, "pre_tfm_mask");
+    ggml_set_input(pre_tfm_mask);
+
      for (int i = 0; i < cfg.n_pre_tfm_layers; ++i) {
          cur = apply_pre_tfm_layer(ctx0, cur, model_.pre_tfm_layers[i], n_frames, n_past, i, positions);
      }
@@ -1030,6 +1032,20 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
                                 n_frames * sizeof(int32_t));
     }
 
+    struct ggml_tensor * mask_tensor_os = ggml_graph_get_tensor(gf, "pre_tfm_mask");
+    if (mask_tensor_os) {
+        const int n_kv_total = n_frames;
+        const int n_q_padded = (int) mask_tensor_os->ne[1];
+        std::vector<ggml_fp16_t> mask((size_t) n_kv_total * n_q_padded,
+                                       ggml_fp32_to_fp16(-INFINITY));
+        for (int q = 0; q < n_frames; ++q) {
+            ggml_fp16_t * row = mask.data() + (size_t) q * n_kv_total;
+            for (int k = 0; k <= q; ++k) row[k] = ggml_fp32_to_fp16(0.0f);
+        }
+        ggml_backend_tensor_set(mask_tensor_os, mask.data(), 0,
+                                ggml_nbytes(mask_tensor_os));
+    }
+
     // zero all tail inputs for one-shot mode (equivalent to the old
     // ggml_pad_ext zero-padding). streaming mode will set these from
     // ring buffers instead.
@@ -1131,6 +1147,21 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
         for (int i = 0; i < n_frames; ++i) positions[i] = n_past_ + i;
         ggml_backend_tensor_set(positions_tensor, positions.data(), 0,
                                 n_frames * sizeof(int32_t));
+    }
+
+    struct ggml_tensor * mask_tensor = ggml_graph_get_tensor(gf, "pre_tfm_mask");
+    if (mask_tensor) {
+        const int n_kv_total = n_past_ + n_frames;
+        const int n_q_padded = (int) mask_tensor->ne[1];
+        std::vector<ggml_fp16_t> mask((size_t) n_kv_total * n_q_padded,
+                                       ggml_fp32_to_fp16(-INFINITY));
+        for (int q = 0; q < n_frames; ++q) {
+            const int kmax = n_past_ + q;
+            ggml_fp16_t * row = mask.data() + (size_t) q * n_kv_total;
+            for (int k = 0; k <= kmax; ++k) row[k] = ggml_fp32_to_fp16(0.0f);
+        }
+        ggml_backend_tensor_set(mask_tensor, mask.data(), 0,
+                                ggml_nbytes(mask_tensor));
     }
 
     // fill tail inputs from persistent host rings.
