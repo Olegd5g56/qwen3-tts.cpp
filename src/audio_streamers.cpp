@@ -54,8 +54,8 @@ bool mp3_streamer::open(int sample_rate) {
     lame_set_num_channels (lame, 1);
     lame_set_mode         (lame, MONO);
     lame_set_VBR          (lame, vbr_default);
-    lame_set_VBR_quality  (lame, 2.0f);
-    lame_set_quality      (lame, 2);
+    lame_set_VBR_quality  (lame, 4.0f);
+    lame_set_quality      (lame, 5);
     if (lame_init_params(lame) < 0) {
         lame_close(lame);
         lame = nullptr;
