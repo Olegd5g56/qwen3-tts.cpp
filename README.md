@@ -156,7 +156,7 @@ All flags have matching `TTS_*` env vars (CLI > env > default).
   "voice": "default | <built-in name> | <library voice id>",
   "instructions": "(VoiceDesign only) describe the desired voice",
   "language": "en",
-  "response_format": "wav | pcm | opus | mp3",
+  "response_format": "mp3 (default, as in OpenAI) | wav | pcm | opus",
   "stream_format": "audio | sse",
   "stream_batch_size": 16,
   "temperature": 0.9,

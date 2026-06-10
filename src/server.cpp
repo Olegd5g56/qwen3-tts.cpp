@@ -218,6 +218,12 @@ int main(int argc, char ** argv) {
 
     httplib::Server svr;
 
+    // Voice uploads are the largest legitimate request body (a reference
+    // clip is seconds long, single-digit MB even as WAV). httplib's default
+    // is effectively unlimited, which lets one stray upload buffer gigabytes
+    // into RAM.
+    svr.set_payload_max_length(64 * 1024 * 1024);
+
     // Stamp every request with a start time and clear any stale req_id from a
     // previous request processed on this thread. The speech handler sets its
     // own req_id; other endpoints leave it empty.
@@ -247,13 +253,18 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /health ---
+    // try_lock, never block: a long synthesis holds synth_mutex for tens of
+    // seconds, and a health probe stuck behind it looks like a dead server
+    // to any monitor with a timeout. Busy IS healthy.
     svr.Get("/health", [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
-        bool loaded;
-        {
-            std::lock_guard<std::mutex> lock(synth_mutex);
-            loaded = (tts != nullptr);
+        std::unique_lock<std::mutex> lock(synth_mutex, std::try_to_lock);
+        json h;
+        if (lock.owns_lock()) {
+            h = {{"status", "ok"}, {"model_loaded", tts != nullptr}, {"busy", false}};
+        } else {
+            // synthesis (or a model load) in flight — the model is in use
+            h = {{"status", "ok"}, {"model_loaded", true}, {"busy", true}};
         }
-        json h = {{"status", "ok"}, {"model_loaded", loaded}};
         res.set_content(h.dump(), "application/json");
     });
 
@@ -417,7 +428,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        std::string response_format = body.value("response_format", "wav");
+        // mp3 mirrors OpenAI's documented default for response_format
+        std::string response_format = body.value("response_format", "mp3");
         std::string stream_format   = body.value("stream_format", "");
         std::string voice           = body.value("voice", "");
         std::string instructions    = body.value("instructions", "");
