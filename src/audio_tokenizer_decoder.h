@@ -198,6 +198,23 @@ public:
     // Reset streaming state. Must be called before starting a new utterance.
     void stream_reset();
 
+    // Snapshot of the host-side streaming state (KV caches, causal-conv
+    // tails, conv_transpose overlaps). Lets a caller warm the decoder up
+    // once (e.g. on ICL reference frames) and restore the result on later
+    // utterances instead of re-decoding the reference.
+    struct stream_state {
+        int32_t n_past = 0;
+        std::map<std::string, std::vector<float>> tail_rings;
+        std::map<std::string, std::vector<float>> conv_t_overlaps;
+        std::vector<std::vector<float>> past_k;
+        std::vector<std::vector<float>> past_v;
+    };
+
+    void stream_state_save(stream_state & out) const;
+
+    // Replaces the current streaming state (implies stream_reset()).
+    void stream_state_restore(const stream_state & in);
+
     const audio_decoder_config & get_config() const { return model_.config; }
 
     const std::string & get_error() const { return error_msg_; }

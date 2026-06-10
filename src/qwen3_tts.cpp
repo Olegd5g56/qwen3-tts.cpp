@@ -9,6 +9,7 @@
 #include <cmath>
 #include <fstream>
 #include <filesystem>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -471,6 +472,53 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
     return synthesize_internal(text, embedding, params, result, ref_codes, n_ref_frames, stream);
 }
 
+bool Qwen3TTS::warmup_decoder_for_icl(const int32_t * ref_codes, int32_t n_ref_frames) {
+    // Process-wide cache: the server destroys and recreates Qwen3TTS on
+    // idle unload, but the snapshots (host-side float buffers) stay valid
+    // as long as the same vocoder weights are used — so the vocoder path
+    // is mixed into the key instead of tying the cache to this instance.
+    static std::mutex cache_mutex;
+    static std::unordered_map<uint64_t, AudioTokenizerDecoder::stream_state> cache;
+
+    // FNV-1a over the raw codes + vocoder path. A handful of voices live
+    // in the cache at most, so collisions are not a realistic concern.
+    const int n_cb = audio_decoder_.get_config().n_codebooks;
+    const size_t n_bytes = (size_t) n_ref_frames * n_cb * sizeof(int32_t);
+    const uint8_t * p = (const uint8_t *) ref_codes;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n_bytes; ++i) {
+        h = (h ^ p[i]) * 1099511628211ull;
+    }
+    for (char c : decoder_model_path_) {
+        h = (h ^ (uint8_t) c) * 1099511628211ull;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(h);
+        if (it != cache.end()) {
+            audio_decoder_.stream_state_restore(it->second);
+            log_debug("[icl] decoder warm-up cache hit (%d ref frames)", n_ref_frames);
+            return true;
+        }
+    }
+
+    audio_decoder_.stream_reset();
+    std::vector<float> warmup_pcm;
+    if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    // ~10 MB of host state per voice; bound the cache crudely rather than
+    // tracking LRU order for what is normally 1-3 entries.
+    if (cache.size() >= 16) {
+        cache.clear();
+    }
+    audio_decoder_.stream_state_save(cache[h]);
+    return true;
+}
+
 tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                           const float * speaker_embedding,
                                           const tts_params & params,
@@ -604,15 +652,13 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         audio_decoder_.stream_reset();
         const int n_cb = transformer_.get_config().n_codebooks;
 
-        // ICL warm-up: feed ref_codes through the streaming decoder and
-        // discard its PCM. mirrors the non-streaming prepend+trim path.
+        // ICL warm-up: run ref_codes through the streaming decoder (cached
+        // per voice) so the live PCM stream starts in the reference timbre.
         if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
-            std::vector<float> warmup_pcm;
-            if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+            if (!warmup_decoder_for_icl(ref_codes, n_ref_frames)) {
                 result.error_msg = "Failed to warm-up vocoder with ref codes: " + audio_decoder_.get_error();
                 return result;
             }
-            // discard warmup_pcm — downstream only sees post-ref PCM
         }
 
         stream_buf.reserve((size_t) stream->batch_size * n_cb);
@@ -754,8 +800,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     audio_decoder_.stream_reset();
     const bool icl = ref_codes && n_ref_frames > 0 && !params.ref_text.empty();
     if (icl) {
-        std::vector<float> warmup_pcm;
-        if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+        if (!warmup_decoder_for_icl(ref_codes, n_ref_frames)) {
             result.error_msg = "Failed to warm-up vocoder with ref codes: "
                                + audio_decoder_.get_error();
             return result;
@@ -1269,7 +1314,7 @@ std::string encode_wav(const std::vector<float> & samples, int sample_rate) {
 }
 
 // Encode float32 mono PCM as a self-contained MP3 byte buffer.
-// VBR -V 2 (~190 kbps avg) — no client-facing knob (OpenAI spec doesn't expose one).
+// VBR -V 4 speech-tuned (~70 kbps mono) — no client-facing knob (OpenAI spec doesn't expose one).
 // Input samples are expected in IEEE float range [-1.0, +1.0].
 // Thin wrapper over mp3_streamer with a string-appending sink so the encoder
 // parameters live in one place.
@@ -1321,7 +1366,7 @@ static std::string str_tolower(std::string s) {
 
 // Save audio to disk, dispatching on file extension:
 //   .wav         -> 16-bit PCM WAV
-//   .mp3         -> LAME VBR -V 2
+//   .mp3         -> LAME VBR -V 4 (speech-tuned)
 //   .opus / .ogg -> Ogg/Opus
 // Unknown extensions are rejected loudly — the CLI is a tool, not a guesser.
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,

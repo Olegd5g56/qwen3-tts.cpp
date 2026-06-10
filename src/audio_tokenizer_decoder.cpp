@@ -1092,6 +1092,23 @@ void AudioTokenizerDecoder::stream_reset() {
     stream_conv_ts_.clear();
 }
 
+void AudioTokenizerDecoder::stream_state_save(stream_state & out) const {
+    out.n_past = n_past_;
+    out.tail_rings = tail_rings_;
+    out.conv_t_overlaps = conv_t_overlap_hosts_;
+    out.past_k = past_k_hosts_;
+    out.past_v = past_v_hosts_;
+}
+
+void AudioTokenizerDecoder::stream_state_restore(const stream_state & in) {
+    stream_reset();
+    n_past_ = in.n_past;
+    tail_rings_ = in.tail_rings;
+    conv_t_overlap_hosts_ = in.conv_t_overlaps;
+    past_k_hosts_ = in.past_k;
+    past_v_hosts_ = in.past_v;
+}
+
 bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frames,
                                            std::vector<float> & samples) {
     if (!model_.ctx) {

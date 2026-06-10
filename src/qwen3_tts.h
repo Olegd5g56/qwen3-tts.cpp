@@ -244,7 +244,13 @@ private:
                                    const streaming_opts * stream = nullptr);
 
     bool is_aborted() const { return abort_cb_ && abort_cb_(abort_data_); }
-    
+
+    // Prepare the streaming decoder for an ICL request: restore a cached
+    // warm-up state for these ref_codes, or decode them once and cache the
+    // resulting state. On failure audio_decoder_.get_error() is set.
+    bool warmup_decoder_for_icl(const int32_t * ref_codes, int32_t n_ref_frames);
+
+
     TextTokenizer tokenizer_;
     TTSTransformer transformer_;
     AudioTokenizerEncoder audio_encoder_;
@@ -276,7 +282,7 @@ bool load_audio_bytes(const void * data, size_t len,
 
 // Utility: Save audio file. Dispatches on path extension:
 //   .wav         -> 16-bit PCM WAV
-//   .mp3         -> LAME VBR -V 2 (~190 kbps avg)
+//   .mp3         -> LAME VBR -V 4 (speech-tuned, ~70 kbps mono)
 //   .opus / .ogg -> Ogg/Opus
 // Unknown extensions are rejected with an error message.
 bool save_audio_file(const std::string & path, const std::vector<float> & samples,
