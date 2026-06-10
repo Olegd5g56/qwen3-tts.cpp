@@ -3,12 +3,31 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+// repo specs and GGUF filenames are plain identifier-ish strings; anything
+// else would end up inside a shell command line below.
+static bool hf_safe_arg(const std::string & s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                        c == '.' || c == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
 
 // Download a file from a HuggingFace repo via the `hf` CLI. Returns the
 // local cache path the CLI prints on stdout, or "" on failure.
 static std::string hf_download(const std::string & repo, const std::string & filename) {
+    if (!hf_safe_arg(repo) || !hf_safe_arg(filename)) {
+        fprintf(stderr, "error: invalid characters in repo/file spec '%s' / '%s'\n",
+                repo.c_str(), filename.c_str());
+        return "";
+    }
     std::string cmd = "hf download \"" + repo + "\" \"" + filename + "\" --quiet";
     FILE * fp = popen(cmd.c_str(), "r");
     if (!fp) return "";
@@ -161,6 +180,45 @@ bool load_env(server_params & sp) {
     return true;
 }
 
+// Strict numeric parsers for CLI flags: a typo like `--port 80a80` must
+// produce an error message, not an uncaught std::invalid_argument abort.
+static bool arg_to_int(const char * flag, const char * s, int & out) {
+    try {
+        size_t pos = 0;
+        const int v = std::stoi(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "error: %s expects an integer (got '%s')\n", flag, s);
+        return false;
+    }
+}
+static bool arg_to_i64(const char * flag, const char * s, int64_t & out) {
+    try {
+        size_t pos = 0;
+        const long long v = std::stoll(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "error: %s expects an integer (got '%s')\n", flag, s);
+        return false;
+    }
+}
+static bool arg_to_float(const char * flag, const char * s, float & out) {
+    try {
+        size_t pos = 0;
+        const float v = std::stof(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "error: %s expects a number (got '%s')\n", flag, s);
+        return false;
+    }
+}
+
 bool parse_args(int argc, char ** argv, server_params & sp) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -178,16 +236,16 @@ bool parse_args(int argc, char ** argv, server_params & sp) {
             sp.host = argv[i];
         } else if (arg == "-p" || arg == "--port") {
             if (++i >= argc) { fprintf(stderr, "error: missing port\n"); return false; }
-            sp.port = std::stoi(argv[i]);
+            if (!arg_to_int("--port", argv[i], sp.port)) return false;
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) { fprintf(stderr, "error: missing threads\n"); return false; }
-            sp.n_threads = std::stoi(argv[i]);
+            if (!arg_to_int("--threads", argv[i], sp.n_threads)) return false;
         } else if (arg == "--voices-dir") {
             if (++i >= argc) { fprintf(stderr, "error: missing voices-dir\n"); return false; }
             sp.voices_dir = argv[i];
         } else if (arg == "--idle-timeout") {
             if (++i >= argc) { fprintf(stderr, "error: missing idle-timeout\n"); return false; }
-            sp.idle_timeout_sec = std::stoi(argv[i]);
+            if (!arg_to_int("--idle-timeout", argv[i], sp.idle_timeout_sec)) return false;
         } else if (arg == "-V" || arg == "--verbose") {
             sp.verbose = true;
         } else if (arg == "-hf" || arg == "--hf-repo") {
@@ -204,16 +262,16 @@ bool parse_args(int argc, char ** argv, server_params & sp) {
             sp.hf_file_v = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) { fprintf(stderr, "error: missing temperature\n"); return false; }
-            sp.temperature = std::stof(argv[i]);
+            if (!arg_to_float("--temperature", argv[i], sp.temperature)) return false;
         } else if (arg == "--top-k") {
             if (++i >= argc) { fprintf(stderr, "error: missing top-k\n"); return false; }
-            sp.top_k = std::stoi(argv[i]);
+            if (!arg_to_int("--top-k", argv[i], sp.top_k)) return false;
         } else if (arg == "--repetition-penalty") {
             if (++i >= argc) { fprintf(stderr, "error: missing repetition-penalty\n"); return false; }
-            sp.repetition_penalty = std::stof(argv[i]);
+            if (!arg_to_float("--repetition-penalty", argv[i], sp.repetition_penalty)) return false;
         } else if (arg == "--seed") {
             if (++i >= argc) { fprintf(stderr, "error: missing seed\n"); return false; }
-            sp.seed = std::stoll(argv[i]);
+            if (!arg_to_i64("--seed", argv[i], sp.seed)) return false;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return false;

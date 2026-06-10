@@ -33,7 +33,7 @@ static void drain_autorelease_pool(void * pool) {
 struct Qwen3TtsParams {
     int32_t max_audio_tokens;
     float   temperature;
-    float   top_p;
+    float   top_p;               // kept for ABI layout; sampling ignores it
     int32_t top_k;
     int32_t n_threads;
     float   repetition_penalty;
@@ -58,7 +58,8 @@ static qwen3_tts::tts_params to_cpp_params(const Qwen3TtsParams * p) {
     if (p) {
         params.max_audio_tokens  = p->max_audio_tokens;
         params.temperature       = p->temperature;
-        params.top_p             = p->top_p;
+        // p->top_p intentionally unused: the sampler is temperature/top-k/
+        // repetition-penalty only; the field stays in the struct for ABI.
         params.top_k             = p->top_k;
         params.n_threads         = p->n_threads;
         params.repetition_penalty = p->repetition_penalty;

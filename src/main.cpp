@@ -10,8 +10,48 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
+
+// Strict numeric parsers: a typo in a flag or env var must print an error,
+// not abort with an uncaught std::invalid_argument.
+static bool parse_int_val(const char * what, const char * s, int32_t & out) {
+    try {
+        size_t pos = 0;
+        const int v = std::stoi(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "Error: %s expects an integer (got '%s')\n", what, s);
+        return false;
+    }
+}
+static bool parse_i64_val(const char * what, const char * s, int64_t & out) {
+    try {
+        size_t pos = 0;
+        const long long v = std::stoll(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "Error: %s expects an integer (got '%s')\n", what, s);
+        return false;
+    }
+}
+static bool parse_float_val(const char * what, const char * s, float & out) {
+    try {
+        size_t pos = 0;
+        const float v = std::stof(s, &pos);
+        if (pos != std::string(s).size()) throw std::invalid_argument(s);
+        out = v;
+        return true;
+    } catch (...) {
+        fprintf(stderr, "Error: %s expects a number (got '%s')\n", what, s);
+        return false;
+    }
+}
 
 static bool parse_language(const std::string & lang, int32_t & out_id) {
     if      (lang == "en" || lang == "english")    out_id = 2050;
@@ -38,12 +78,13 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -o, --output <file>    Output file (default: output.wav). Format picked by extension:\n");
     fprintf(stderr, "                           .wav (PCM s16), .mp3 (LAME VBR -V 4), .opus / .ogg\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "      --ref-text <text>  Transcript of the reference audio (enables ICL cloning)\n");
     fprintf(stderr, "  -v, --voice <name>     Built-in speaker or a voice from --voices-dir\n");
     fprintf(stderr, "      --voices-dir <d>   Voice library directory (same layout as the server)\n");
     fprintf(stderr, "      --list-voices      List available voices (built-in + library) and exit\n");
+    fprintf(stderr, "  --streaming-batch-size <n> Decode in n-frame batches while generating (default: 0 = off)\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
-    fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  --seed <n>             Sampling seed (default: -1 = random)\n");
     fprintf(stderr, "  -i, --instructions <s> Voice steering instructions\n");
@@ -98,11 +139,16 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (const char * v = std::getenv("TTS_THREADS"))            params.n_threads          = std::stoi(v);
-    if (const char * v = std::getenv("TTS_TEMPERATURE"))        params.temperature        = std::stof(v);
-    if (const char * v = std::getenv("TTS_TOP_K"))              params.top_k              = std::stoi(v);
-    if (const char * v = std::getenv("TTS_REPETITION_PENALTY")) params.repetition_penalty = std::stof(v);
-    if (const char * v = std::getenv("TTS_SEED"))               params.seed               = std::stoll(v);
+    if (const char * v = std::getenv("TTS_THREADS"))
+        if (!parse_int_val("TTS_THREADS", v, params.n_threads)) return 1;
+    if (const char * v = std::getenv("TTS_TEMPERATURE"))
+        if (!parse_float_val("TTS_TEMPERATURE", v, params.temperature)) return 1;
+    if (const char * v = std::getenv("TTS_TOP_K"))
+        if (!parse_int_val("TTS_TOP_K", v, params.top_k)) return 1;
+    if (const char * v = std::getenv("TTS_REPETITION_PENALTY"))
+        if (!parse_float_val("TTS_REPETITION_PENALTY", v, params.repetition_penalty)) return 1;
+    if (const char * v = std::getenv("TTS_SEED"))
+        if (!parse_i64_val("TTS_SEED", v, params.seed)) return 1;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -157,31 +203,25 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "Error: missing temperature value\n");
                 return 1;
             }
-            params.temperature = std::stof(argv[i]);
+            if (!parse_float_val("--temperature", argv[i], params.temperature)) return 1;
         } else if (arg == "--top-k") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing top-k value\n");
                 return 1;
             }
-            params.top_k = std::stoi(argv[i]);
-        } else if (arg == "--top-p") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing top-p value\n");
-                return 1;
-            }
-            params.top_p = std::stof(argv[i]);
+            if (!parse_int_val("--top-k", argv[i], params.top_k)) return 1;
         } else if (arg == "--repetition-penalty") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing repetition-penalty value\n");
                 return 1;
             }
-            params.repetition_penalty = std::stof(argv[i]);
+            if (!parse_float_val("--repetition-penalty", argv[i], params.repetition_penalty)) return 1;
         } else if (arg == "--seed") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing seed value\n");
                 return 1;
             }
-            params.seed = std::stoll(argv[i]);
+            if (!parse_i64_val("--seed", argv[i], params.seed)) return 1;
         } else if (arg == "-l" || arg == "--language") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing language value\n");
@@ -199,13 +239,13 @@ int main(int argc, char ** argv) {
             params.instructions = argv[i];
         } else if (arg == "--streaming-batch-size") {
             if (++i >= argc) { fprintf(stderr, "Error: missing streaming-batch-size value\n"); return 1; }
-            streaming_batch_size = std::stoi(argv[i]);
+            if (!parse_int_val("--streaming-batch-size", argv[i], streaming_batch_size)) return 1;
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing threads value\n");
                 return 1;
             }
-            params.n_threads = std::stoi(argv[i]);
+            if (!parse_int_val("--threads", argv[i], params.n_threads)) return 1;
         } else {
             fprintf(stderr, "Error: unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -262,6 +302,7 @@ int main(int argc, char ** argv) {
     qwen3_tts::Qwen3TTS tts;
     
     bool loaded;
+    const auto t_load_start = std::chrono::steady_clock::now();
     bool is_file = std::filesystem::is_regular_file(model_path);
     if (is_file) {
         if (vocoder_path.empty()) {
@@ -279,6 +320,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }
+    const int64_t model_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_load_start).count();
     tts.set_n_threads(params.n_threads);
 
     // Cloned voices only make sense on Base — they're encoded by the Base
@@ -406,6 +449,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\nError: %s\n", result.error_msg.c_str());
         return 1;
     }
+    // synthesize() doesn't know about model loading — fill it in here so the
+    // timing block below stops printing a hardcoded 0.
+    result.t_load_ms = model_load_ms;
     
     fprintf(stderr, "\n");
     

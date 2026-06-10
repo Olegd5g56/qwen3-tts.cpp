@@ -238,14 +238,13 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out,
             return false;
         }
 
+        // No embedding-less fallback: every downstream synthesis path
+        // requires a speaker embedding (synthesize_with_embedding rejects an
+        // empty one), so a voice that can't produce one is broken — fail
+        // loudly here instead of 500ing on every later request.
         if (!tts->extract_speaker_embedding(wav, v.embedding)) {
-            // ICL with ref_text alone can still work without an embedding,
-            // so only fail outright when there's nothing left to fall back on.
-            if (v.ref_text.empty()) {
-                error = "extract_speaker_embedding failed: " + tts->get_error();
-                return false;
-            }
-            v.embedding.clear();
+            error = "extract_speaker_embedding failed: " + tts->get_error();
+            return false;
         }
 
         if (!v.ref_text.empty()) {
@@ -286,6 +285,20 @@ bool VoiceStore::read_cache(const std::string & dir, voice_entry & out,
     if (hdr.version != CACHE_VERSION) { error = "incompatible cache version"; return false; }
     if (hdr.wav_mtime_ns != expected_wav_mtime) { error = "stale (sample.wav mtime mismatch)"; return false; }
     if (hdr.txt_mtime_ns != expected_txt_mtime) { error = "stale (sample.txt mtime mismatch)"; return false; }
+
+    // Sanity-check the counts before allocating: a corrupted header could
+    // claim billions of elements and the resulting allocation would take the
+    // whole process down during startup preload. Real values: embedding is
+    // the model hidden size (1-4k floats), ref codes are n_frames x 16 for
+    // clips seconds-to-minutes long.
+    if (hdr.embedding_n == 0 || hdr.embedding_n > 16384) {
+        error = "corrupt cache (embedding size " + std::to_string(hdr.embedding_n) + ")";
+        return false;
+    }
+    if (hdr.ref_codes_n > 16u * 1000000u || hdr.n_ref_frames > 1000000u) {
+        error = "corrupt cache (ref codes " + std::to_string(hdr.ref_codes_n) + ")";
+        return false;
+    }
 
     out.embedding.assign(hdr.embedding_n, 0.0f);
     if (hdr.embedding_n) {
@@ -429,13 +442,12 @@ bool VoiceStore::create(const std::string & id, const std::string & audio_bytes,
             return false;
         }
 
+        // Same as load_voice_locked: no embedding-less voices, downstream
+        // synthesis can't use them.
         if (!tts->extract_speaker_embedding(samples.data(), (int32_t)samples.size(),
                                              sample_rate, v.embedding)) {
-            if (v.ref_text.empty()) {
-                error = "extract_speaker_embedding failed: " + tts->get_error();
-                return false;
-            }
-            v.embedding.clear();
+            error = "extract_speaker_embedding failed: " + tts->get_error();
+            return false;
         }
 
         if (!v.ref_text.empty()) {

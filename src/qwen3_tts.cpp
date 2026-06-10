@@ -23,6 +23,7 @@
 #include <mach/mach.h>
 #else
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 namespace qwen3_tts {
@@ -57,6 +58,20 @@ static bool get_process_memory_snapshot(process_memory_snapshot & out) {
     }
     return true;
 #else
+    // /proc/self/statm gives the CURRENT resident set; ru_maxrss only reports
+    // the lifetime peak, which made the start/end/peak log lines all show the
+    // same number.
+    if (FILE * f = fopen("/proc/self/statm", "r")) {
+        long pages_total = 0, pages_rss = 0;
+        const int n = fscanf(f, "%ld %ld", &pages_total, &pages_rss);
+        fclose(f);
+        if (n == 2 && pages_rss > 0) {
+            out.rss_bytes = (uint64_t) pages_rss * (uint64_t) sysconf(_SC_PAGESIZE);
+            out.phys_footprint_bytes = out.rss_bytes;
+            return true;
+        }
+    }
+    // fallback (non-procfs systems): peak RSS is better than nothing
     struct rusage usage = {};
     if (getrusage(RUSAGE_SELF, &usage) != 0) {
         return false;
@@ -1033,8 +1048,23 @@ static bool load_wav_stream(FILE * f, std::vector<float> & samples,
             else if (chunk_size > 16) {
                 fseek(f, chunk_size - 16, SEEK_CUR);
             }
+            // RIFF chunks are word-aligned: odd-sized chunks carry a pad byte
+            if (chunk_size & 1) fseek(f, 1, SEEK_CUR);
         }
         else if (strncmp(chunk_id, "data", 4) == 0) {
+            // A zero channel count would divide by zero below (SIGFPE — not
+            // an exception, the whole process dies). Covers both a malformed
+            // fmt chunk and a data chunk that precedes fmt entirely.
+            if (num_channels == 0) {
+                log_error("invalid WAV: zero channels (or data chunk before fmt)");
+                return false;
+            }
+            // Reference audio is seconds long; a multi-GB data chunk is a
+            // corrupt header, not a real request — refuse before allocating.
+            if (chunk_size > (1u << 30)) {
+                log_error("invalid WAV: data chunk claims %u bytes", chunk_size);
+                return false;
+            }
             sample_rate = sr;
 
             if (audio_format == 1) {  // PCM
@@ -1075,8 +1105,8 @@ static bool load_wav_stream(FILE * f, std::vector<float> & samples,
             return true;
         }
         else {
-            // Skip unknown chunk
-            fseek(f, chunk_size, SEEK_CUR);
+            // Skip unknown chunk (+ pad byte: RIFF chunks are word-aligned)
+            fseek(f, chunk_size + (chunk_size & 1), SEEK_CUR);
         }
     }
 

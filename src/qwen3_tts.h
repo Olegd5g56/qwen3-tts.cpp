@@ -42,10 +42,7 @@ struct tts_params {
     
     // Temperature for sampling (0 = greedy)
     float temperature = 0.9f;
-    
-    // Top-p sampling
-    float top_p = 1.0f;
-    
+
     // Top-k sampling (0 = disabled)
     int32_t top_k = 50;
     
