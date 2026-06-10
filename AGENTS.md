@@ -103,7 +103,7 @@ ggml_backend_tensor_get(out, output_data, 0, size);
 ggml_backend_sched_reset(state_.sched);
 ```
 
-Important: `ggml_cast` to F32 is needed before `ggml_mul_mat` when weight tensors are F16 (specifically `ffn_down` in both talker and code predictor layers).
+Important: `ggml_mul_mat` consumes F16/quantized weights directly — do NOT insert a `ggml_cast` to F32 in front of it. An old `ffn_down` cast workaround forced a full dequant of the largest FFN matrix on every step and cost ~6x in generation time (removed in d544a6f).
 
 Backend initialization and scheduling notes:
 
@@ -161,7 +161,7 @@ english_language_id = 2050
 
 ### Compressed-audio encoder invariants
 
-- MP3: LAME VBR -V 2 (`~190 kbps avg`), mono, no client-facing knob — OpenAI's TTS API doesn't expose one. Both one-shot `encode_mp3` and server's `mp3_streamer` go through the same setup in `audio_streamers.cpp::mp3_streamer::open`.
+- MP3: LAME VBR -V 4 with `lame_set_quality(5)` (speech-tuned, ~70 kbps mono at 24 kHz), no client-facing knob — OpenAI's TTS API doesn't expose one. Both one-shot `encode_mp3` and server's `mp3_streamer` go through the same setup in `audio_streamers.cpp::mp3_streamer::open`.
 - Opus: Ogg/Opus via libopusenc, mono, sample rate must be `8/12/16/24/48 kHz` (libopusenc constraint). Vocoder output is 24 kHz, so no resampling needed.
 - WAV: 16-bit PCM, mono, sample rate from the result.
 
@@ -200,4 +200,10 @@ bash scripts/run_all_tests.sh           # Full suite
 
 ## Performance Profile
 
-The code predictor is the primary bottleneck (~71% of generation time) because it runs 15 sequential forward passes per frame (1 prefill + 14 autoregressive steps). The talker accounts for ~27%. Graph build/alloc and data I/O are negligible (<1%).
+Measured June 2026 on Vulkan (RX 6800 XT, Q8_0 1.7B, ~500-frame clip), after the `d544a6f`..`b031dd7` perf sweep:
+
+- Vocoder decode is ~64% of total time, code generation ~36%. Overall ~1.4x realtime.
+- Within generation, the code predictor dominates (~57%) because it runs 15 sequential graph dispatches per frame (1 prefill + 14 codebook steps); the talker is ~35%.
+- ICL (cloned-voice) requests must run the reference frames through the streaming vocoder before synthesis so the output starts in the reference timbre. This warm-up (~5 s for 150 frames) is cached process-wide per voice (`Qwen3TTS::warmup_decoder_for_icl`, keyed by ref-codes + vocoder path); only the first request per voice pays it. The cache intentionally lives in a function-local static because the server destroys the whole `Qwen3TTS` object on idle unload.
+
+See `docs/optimization.md` for the full breakdown and the list of approaches that were tried and ruled out.

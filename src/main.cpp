@@ -36,7 +36,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (or piped via stdin)\n");
     fprintf(stderr, "  -o, --output <file>    Output file (default: output.wav). Format picked by extension:\n");
-    fprintf(stderr, "                           .wav (PCM s16), .mp3 (LAME VBR -V 2), .opus / .ogg\n");
+    fprintf(stderr, "                           .wav (PCM s16), .mp3 (LAME VBR -V 4), .opus / .ogg\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
     fprintf(stderr, "  -v, --voice <name>     Built-in speaker or a voice from --voices-dir\n");
     fprintf(stderr, "      --voices-dir <d>   Voice library directory (same layout as the server)\n");

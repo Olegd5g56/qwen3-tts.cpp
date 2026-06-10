@@ -7,7 +7,7 @@
 //
 // One-shot encode_mp3/encode_opus in qwen3_tts.cpp use these too — they just
 // install an on_page that appends to a std::string. That way the encoder
-// parameters (VBR -V 2, mono, sample-rate constraints) live in exactly one
+// parameters (VBR -V 4 speech-tuned, mono, sample-rate constraints) live in exactly one
 // place and CLI/server can't drift.
 
 #include <opusenc.h>
@@ -37,7 +37,7 @@ private:
     static int close_cb(void *);
 };
 
-// LAME MP3 encoder. VBR -V 2 (~190 kbps avg), mono, no client-facing knob.
+// LAME MP3 encoder. VBR -V 4 speech-tuned (~70 kbps mono), no client-facing knob.
 // write() may produce 0 bytes when LAME is buffering for its next frame;
 // finish() emits the residual frames.
 struct mp3_streamer {

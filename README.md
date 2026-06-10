@@ -174,8 +174,9 @@ All flags have matching `TTS_*` env vars (CLI > env > default).
   frames (base64 audio) and a final `speech.audio.done` event.
 
 For *live* streaming you need **both** `stream_format` **and** a non-zero
-`stream_batch_size`. PCM is always 24 kHz mono S16LE. MP3 is LAME VBR `-V 2`
-(~190 kbps avg, fixed — OpenAI's spec has no bitrate knob and we mirror it).
+`stream_batch_size`. PCM is always 24 kHz mono S16LE. MP3 is LAME VBR `-V 4`
+speech-tuned (~70 kbps mono, fixed — OpenAI's spec has no bitrate knob and we
+mirror it).
 
 ### Streaming example
 
@@ -214,6 +215,12 @@ The server pre-warms the whole library at startup. Cache invalidation is by
 file mtime, so editing the sample re-encodes on next use.
 `DELETE /v1/audio/voices/:id` returns **409** on a disk-backed id — delete
 the directory instead.
+
+For ICL voices the vocoder warm-up (decoding the reference frames so output
+starts in the reference timbre, ~5 s) runs once per voice and is then cached
+in-process. Repeat requests with the same voice skip it entirely — streaming
+time-to-first-audio drops from ~7 s to ~1.5 s. The cache survives idle
+unload; it resets on process restart.
 
 **2. Session (ephemeral).** `POST /v1/audio/voices` decodes the upload and
 holds it in RAM. Survives idle-unload, dies on process restart. Name

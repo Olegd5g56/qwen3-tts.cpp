@@ -775,3 +775,21 @@ mark these in the PR description when landing phase C and E:
   ttfa metrics because `prompt_ms` / `predicted_ms` in
   `speech.audio.done` don't change, but the first delta arrives much
   sooner.
+
+---
+
+## addendum — ICL warm-up snapshot cache (2026-06) ✅ landed
+
+cloned-voice (ICL) requests feed the ~150 reference frames through
+`stream_decode` before synthesis so the PCM starts in the reference
+timbre. all streaming state is host-side (`n_past_`, `tail_rings_`,
+`conv_t_overlap_hosts_`, `past_k_hosts_`/`past_v_hosts_`), so the
+post-warm-up state is snapshot-able: `stream_state_save/restore` on
+`AudioTokenizerDecoder` copy those five fields (~10 MB per voice).
+
+`Qwen3TTS::warmup_decoder_for_icl` keeps a process-wide static cache of
+snapshots keyed by FNV-1a(ref_codes + vocoder path); a function-local
+static (not a member) because the server destroys the `Qwen3TTS` object
+on idle unload. restore is bit-identical to re-decoding the reference
+(deterministic graph, same inputs), so audio is unaffected. measured:
+streaming TTFA 7.1 s → 1.4 s, non-streaming cloned request −4.5 s.
