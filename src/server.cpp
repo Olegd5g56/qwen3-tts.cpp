@@ -702,7 +702,16 @@ int main(int argc, char ** argv) {
                         t_stream_end - t_stream_start).count();
                     const double audio_sec = result.sample_rate > 0
                         ? (double) result.audio.size() / (double) result.sample_rate : 0.0;
-                    if (result.success) {
+                    if (result.hit_token_budget) {
+                        // Bytes already went out, so there is nothing to retry
+                        // into — the client keeps a truncated line with a noise
+                        // tail. Callers that cannot tolerate that should use the
+                        // non-streaming endpoint, which retries.
+                        log_req_warn(req_id.c_str(),
+                                     "live-stream: runaway generation (no end-of-speech token) "
+                                     "after %.2fs audio in %lld ms - delivered as-is",
+                                     audio_sec, (long long)stream_ms);
+                    } else if (result.success) {
                         log_req(req_id.c_str(),
                                 "live-stream: ok %.2fs audio in %lld ms",
                                 audio_sec, (long long)stream_ms);
@@ -768,15 +777,40 @@ int main(int argc, char ** argv) {
                     ->load(std::memory_order_relaxed);
             };
             t->set_abort_callback(abort_cb, &client_gone);
-            if (!voice_ref_codes.empty()) {
-                result = t->synthesize_with_embedding(
-                    input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
-                    voice_ref_codes.data(), voice_n_ref_frames);
-            } else if (!voice_embedding.empty()) {
-                result = t->synthesize_with_embedding(
-                    input, voice_embedding.data(), (int32_t)voice_embedding.size(), params);
-            } else {
-                result = t->synthesize(input, params);
+            auto synth_once = [&](const tts_params & p) {
+                if (!voice_ref_codes.empty()) {
+                    return t->synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t)voice_embedding.size(), p,
+                        voice_ref_codes.data(), voice_n_ref_frames);
+                }
+                if (!voice_embedding.empty()) {
+                    return t->synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t)voice_embedding.size(), p);
+                }
+                return t->synthesize(input, p);
+            };
+            // The model occasionally never emits an end-of-speech token and
+            // generates until the frame budget, producing audio whose tail is
+            // noise and whose last sentences are missing (docs/known-issues.md
+            // #11; upstream QwenLM/Qwen3-TTS#118, closed as "not planned").
+            // It is not reproducible across sampling streams, so a retry with a
+            // different seed is the whole fix. Two attempts: a third buys
+            // little and the client is waiting.
+            constexpr int max_attempts = 2;
+            tts_params attempt_params = params;
+            for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+                result = synth_once(attempt_params);
+                if (!result.hit_token_budget) break;
+                if (client_gone.load(std::memory_order_relaxed)) break;
+                if (attempt < max_attempts) {
+                    log_req_warn(tls_req_id.c_str(),
+                                 "runaway generation (no end-of-speech token), retrying %d/%d",
+                                 attempt + 1, max_attempts);
+                    // A fixed seed would reproduce the runaway exactly; nudge it.
+                    // A negative seed already means "keep the RNG running", which
+                    // gives the retry a fresh stream for free.
+                    if (attempt_params.seed >= 0) attempt_params.seed += 1;
+                }
             }
             // Clear the callback before releasing the mutex so the next request
             // doesn't see a pointer into our (about-to-die) atomic.
@@ -789,6 +823,21 @@ int main(int argc, char ** argv) {
         if (client_was_gone || result.error_msg == "Aborted") {
             log_req_warn(tls_req_id.c_str(), "aborted (client disconnect)");
             res.status = 499;
+            return;
+        }
+
+        // Out of attempts: the audio we have is unusable, so report a failure
+        // rather than shipping a truncated line with a noise tail.
+        if (result.hit_token_budget) {
+            log_req_warn(tls_req_id.c_str(),
+                         "runaway generation on every attempt, giving up");
+            res.status = 500;
+            json err = {{"error", {
+                {"message", "synthesis failed: the model did not finish the input "
+                            "(no end-of-speech token after retries)"},
+                {"type", "server_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
             return;
         }
 

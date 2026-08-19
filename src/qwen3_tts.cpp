@@ -916,9 +916,23 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             });
     }
 
+    // Runaway guard: the model occasionally never emits EOS and generates until
+    // whatever cap it is given (docs/known-issues.md #11). Budget the frame
+    // count from the input length so that costs seconds on a short line rather
+    // than the full 491 s the global cap allows. QWEN3_TTS_FRAME_BUDGET=0
+    // disables it if a legitimate synthesis ever trips the guard.
+    int32_t frame_budget = params.max_audio_tokens;
+    {
+        const char * env = std::getenv("QWEN3_TTS_FRAME_BUDGET");
+        if (!(env && env[0] == '0')) {
+            const int32_t b = audio_token_budget(text, params.max_audio_tokens);
+            if (b < frame_budget) frame_budget = b;
+        }
+    }
+
     std::vector<int32_t> speech_codes;
     if (!transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
-                               speaker_embedding, params.max_audio_tokens, speech_codes,
+                               speaker_embedding, frame_budget, speech_codes,
                                params.language_id, params.repetition_penalty,
                                params.temperature, params.top_k,
                                instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
@@ -946,6 +960,17 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     int n_codebooks = transformer_.get_config().n_codebooks;
     int n_frames = (int)speech_codes.size() / n_codebooks;
     result.n_audio_tokens = n_frames;
+
+    // Stopping exactly on the budget means no EOS was drawn. The audio is not
+    // salvageable — the tail is noise and the end of the text never got said —
+    // so say so and let the caller decide whether to retry.
+    if (n_frames >= frame_budget) {
+        result.hit_token_budget = true;
+        result.error_msg = "the model did not signal end of speech and ran to the "
+                           + std::to_string(frame_budget) + "-frame budget";
+        log_warn("generation hit the %d-frame budget without an end-of-speech token "
+                 "- the model ran away (see docs/known-issues.md #11)", frame_budget);
+    }
 
     if (params.print_progress) {
         log_info("speech codes generated: %d frames x %d codebooks", n_frames, n_codebooks);
@@ -995,7 +1020,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                      stream_cb_count, result.audio.size());
         }
         result.sample_rate = audio_decoder_.get_config().sample_rate;
-        result.success = !stream_cb_aborted;
+        result.success = !stream_cb_aborted && !result.hit_token_budget;
         if (stream_cb_aborted && result.error_msg.empty()) {
             result.error_msg = "Streaming consumer aborted";
         }
@@ -1094,7 +1119,11 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
     
     result.sample_rate = audio_decoder_.get_config().sample_rate;
-    result.success = true;
+    // A runaway is a failure even though every stage "worked": the caller would
+    // otherwise get audio whose tail is noise and whose last sentences are
+    // missing, with no way to tell. Callers that want to retry look at
+    // hit_token_budget; everyone else just sees a failed synthesis.
+    result.success = !result.hit_token_budget;
     result.t_total_ms = get_time_ms() - t_total_start;
     sample_memory("synth/end");
     

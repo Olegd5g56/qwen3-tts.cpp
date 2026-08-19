@@ -35,6 +35,55 @@ inline size_t utf8_codepoints(const std::string & s) {
     return n;
 }
 
+// Runaway guard. Qwen3-TTS base models sometimes never emit EOS and keep
+// generating until the caller's cap: upstream QwenLM/Qwen3-TTS#118 reports
+// ~0.5% of calls and was closed as "not planned", and #211 notes it gets more
+// likely on long input. Measured here at 1 in 15 on a 4067-char Russian text
+// and 0 in 140 on a 727-char one. See docs/known-issues.md #11.
+//
+// A per-request budget derived from the input keeps a runaway from costing
+// minutes: on a short line the guard fires in about a second, which is what
+// makes an automatic retry cheap enough to be worth doing.
+//
+// Constants: measured 0.70 codec frames per character of Russian on this fork
+// (727 chars -> 508 frames; 4067 chars -> 2830 frames), worst case 0.76. Han,
+// kana and hangul pack a whole syllable into one codepoint, so they need
+// several frames each. Both constants sit ~1.8x above the worst case observed
+// for that script — this is a guard against a broken generation, not a length
+// predictor, and firing it on a legitimately slow voice would be far worse
+// than letting a rare runaway run a little longer.
+inline int32_t audio_token_budget(const std::string & text, int32_t hard_cap) {
+    size_t chars = 0;
+    size_t dense = 0;  // codepoints that carry a full syllable
+    for (size_t i = 0; i < text.size(); ) {
+        const unsigned char c = text[i];
+        uint32_t cp = c;
+        size_t len = 1;
+        if      ((c & 0x80) == 0x00) { cp = c;        len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        for (size_t k = 1; k < len && i + k < text.size(); ++k) {
+            cp = (cp << 6) | (text[i + k] & 0x3F);
+        }
+        i += len;
+        ++chars;
+        if ((cp >= 0x3040 && cp <= 0x30FF) ||   // kana
+            (cp >= 0x3400 && cp <= 0x9FFF) ||   // han
+            (cp >= 0xAC00 && cp <= 0xD7AF) ||   // hangul
+            (cp >= 0xF900 && cp <= 0xFAFF)) {   // han compatibility
+            ++dense;
+        }
+    }
+    // One dense codepoint is worth far more audio than one letter, so mixed
+    // text is budgeted per script rather than by picking a single constant.
+    const double frames = (double) (chars - dense) * 1.4 + (double) dense * 8.0;
+    // Floor: very short inputs still need room for lead-in silence and a tail.
+    int32_t budget = (int32_t) frames + 128;
+    if (budget > hard_cap) budget = hard_cap;
+    return budget;
+}
+
 // TTS generation parameters
 struct tts_params {
     // Maximum number of audio tokens to generate
@@ -88,6 +137,12 @@ struct tts_result {
     
     // Success flag
     bool success = false;
+
+    // Generation stopped because it hit the per-request frame budget instead
+    // of emitting EOS — i.e. the model ran away (docs/known-issues.md #11).
+    // The audio that came back is unusable: the tail is noise and the end of
+    // the text is missing. Callers that can afford it should retry.
+    bool hit_token_budget = false;
     
     // Error message if failed
     std::string error_msg;
