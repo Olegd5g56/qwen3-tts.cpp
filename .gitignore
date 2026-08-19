@@ -54,3 +54,6 @@ Thumbs.db
 debug_*.bin
 reference/decoder_debug/
 reference/debug/
+
+# out-of-tree build dirs (build-cuda, build-hip, build-vk2, ...)
+build-*/
