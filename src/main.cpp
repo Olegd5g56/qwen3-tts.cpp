@@ -307,6 +307,10 @@ int main(int argc, char ** argv) {
     // Mirror the server's contract: any input that passed the char limit must
     // be fully synthesized — the library's 2048-token default would clip.
     params.max_audio_tokens = qwen3_tts::MAX_AUDIO_TOKENS;
+    // The CLI is the interactive front end and shows the full debug stream
+    // (see set_verbose above); without this the per-frame decode progress and
+    // the token counts never print, which hides a runaway while it happens.
+    params.print_progress = true;
 
     if (!voice_name.empty() && !reference_audio.empty()) {
         fprintf(stderr, "Error: --voice and --reference are mutually exclusive\n");
@@ -464,6 +468,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\nError: %s\n", result.error_msg.c_str());
         return 1;
     }
+    // The generic failure path above already reports the runaway; the CLI
+    // deliberately does not retry the way the server does, so that how often
+    // this happens stays visible to whoever is watching.
     // synthesize() doesn't know about model loading — fill it in here so the
     // timing block below stops printing a hardcoded 0.
     result.t_load_ms = model_load_ms;
