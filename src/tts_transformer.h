@@ -55,6 +55,11 @@ struct tts_timing {
 
 #define QWEN3_TTS_MAX_NODES 16384
 
+// KV window granularity: per-step attention views are padded up to a multiple
+// of this, so the step graph keeps one shape across many consecutive steps
+// instead of growing by one row every frame.
+#define QWEN3_TTS_KV_STEP 64
+
 // TTS Transformer configuration (Qwen2-based Talker)
 struct tts_transformer_config {
     // Model variant: "base", "custom_voice", or "voice_design"
@@ -272,6 +277,13 @@ public:
     // hidden: hidden states from talker [hidden_size]
     // codebook_0_token: the codebook 0 token (used to create 2-token prefill input)
     // output: generated codes for codebooks 1-15 [15]
+    // Number of codebooks to predict per frame (1..n_codebooks); <= 0 means all.
+    // Each codebook past the first costs one full code-predictor pass, and the
+    // chain is residual, so cutting it short is the one lever that reduces
+    // per-frame cost without changing the model.
+    void set_active_codebooks(int32_t n) { active_codebooks_ = n; }
+    int32_t get_active_codebooks() const { return active_codebooks_; }
+
     bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token, 
                                        std::vector<int32_t> & output,
                                        float temperature = 0.9f,
@@ -388,6 +400,7 @@ private:
     // Build computation graph for 2-token prefill of code predictor
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
     struct ggml_cgraph * build_code_pred_prefill_graph();
+
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -415,6 +428,7 @@ private:
     std::vector<float> last_hidden_;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch_;
     std::mt19937 rng_{std::random_device{}()};
+    int32_t      active_codebooks_ = 0;  // 0 = all
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
