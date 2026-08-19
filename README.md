@@ -136,6 +136,7 @@ Environment knobs, all optional:
 | `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/Metal, off for Vulkan (where two backend instances serialise). `1`/`0` forces it. |
 | `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch when the caller is not streaming. Smaller starts the overlap earlier; larger amortises per-batch cost. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table for the generation and vocoder graphs. Diagnostic only — it disables kernel fusion and syncs per node. |
+| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from the input length, because the model occasionally never emits an end-of-speech token and would otherwise run to 491 s of audio. Set to `0` to disable if a legitimate synthesis ever trips it. See `docs/known-issues.md` #11. |
 
 **Keep cloned-voice reference samples short — 3–5 seconds.** The reference is
 prepended to every prompt, so its length is paid in prefill *and* in each

@@ -251,3 +251,128 @@ Vulkan's. Fixing the window reversed the ranking. The backend was never broken
 or unexercised — it was doing 25x the necessary attention work and handling
 that waste worse than the other backend did.
 
+
+---
+
+## 11. Generation does not stop — runs to the 6144-frame cap on long text
+
+**Status:** mitigated (guard + retry); root cause is upstream and unfixed
+**Found:** 2026-08-19
+**Severity:** availability (a request occupies the model for ~5 minutes)
+
+The decode loop has exactly one stop condition (`tts_transformer.cpp:3083`):
+
+```cpp
+if (next_token == cfg.codec_eos_id) break;
+```
+
+There is no fallback. If the sampler never draws EOS, the loop runs to
+`max_len` = `MAX_AUDIO_TOKENS` = 6144 frames = **491 s of audio**, which is
+~5 min of GPU time on the 1660 SUPER and ~8 min on slower paths.
+
+**Reproducer** (deterministic): `ward_max.txt` (4067 chars) + 1.7B Base +
+voice `ostro`, `--seed 6`. Rate over a seed sweep:
+
+| text | chars | seeds | runaways |
+|---|---|---|---|
+| `ward.txt` | 727 | 40 | **0** |
+| `ward_max.txt` | 4067 | 15 | **1** (seed 6) |
+
+Length is the trigger, not the wording — the failure needs a long generation
+to occur at all.
+
+**What the failure actually looks like** (not what was first assumed):
+
+- The model reads the whole text correctly. ASR at 200 s is clean and matches
+  the script; normal runs for this text end at 2701–3088 frames (216–247 s),
+  and the runaway's speech ends in the same place.
+- After that, output drops ~6 dB and stays there for the remaining 260 s.
+  ASR returns Whisper's silence hallucination ("Субтитры создавал ..."), i.e.
+  it is not speech.
+- It is **not** a repeating loop. Autocorrelation of the 100 ms RMS envelope
+  over 300–480 s peaks at 0.09 — noise. A phrase-repetition detector would
+  not catch this.
+- Character of the garbage vs. real speech: RMS -25.9 vs -19.6 dB, crest
+  22.1 vs 15.2 dB, zero crossings 3776 vs 2810 /s. Sparse clicks and hiss,
+  same peak level, much lower energy.
+
+**Useful empirical constant:** frame count scales tightly with input length,
+~**0.70 frames per character** of Russian text (727 chars → 508 frames;
+4067 chars → ~2890 frames average). Good enough to derive a per-request
+budget instead of the global 6144.
+
+**Ruled out:** the repetition penalty is not the cause. Re-running the same 15
+seeds with `--repetition-penalty 1.0` gave the same 1-in-15 rate (a different
+seed failed, as expected from a different sampling stream). The observation
+below still stands as a correctness nit, but it does not drive this bug.
+
+**Divergence from HuggingFace:** the repetition penalty at
+`tts_transformer.cpp:3033` is applied over *every* CB0 token generated so far
+(`generated_cb0_tokens` grows monotonically for the whole utterance), where
+HuggingFace applies it over a sliding window. On a 3000-frame generation this
+penalises a large fraction of the codec vocabulary and flattens the
+distribution. Worth an A/B at `--repetition-penalty 1.0` on the same seeds.
+
+**Upstream:** this is a known defect of the model, not of this fork.
+[QwenLM/Qwen3-TTS#118](https://github.com/QwenLM/Qwen3-TTS/issues/118) reports
+the same symptom on 1.7B-Base and 0.6B-Base at default sampling, estimates
+~0.5% of calls (1 in 200), finds no pattern in the triggering inputs, and was
+closed as "not planned".
+[Discussion #211](https://github.com/QwenLM/Qwen3-TTS/discussions/211) adds the
+conditions that make it more likely — long input, reference audio over 20–30 s,
+no explicit token cap — and describes the same truncated-ending symptom.
+[#318](https://github.com/QwenLM/Qwen3-TTS/issues/318) is the extreme case:
+mixed-script input (Thai with stray Latin/Cyrillic) hung 27 of 30 samples. The
+recommendation everywhere is the same: cap the token count from a plausible
+speech duration. So a guard on our side is the only available fix.
+
+**What was done:**
+
+1. `audio_token_budget()` (`qwen3_tts.h`) derives a per-request frame budget
+   from the input: 1.4 frames per character, 8 per Han/kana/hangul codepoint,
+   plus 128 frames of slack, clamped to `MAX_AUDIO_TOKENS`. Roughly 1.8x the
+   worst case measured, because a false positive on a legitimately slow voice
+   would be worse than a rare runaway running longer.
+   `QWEN3_TTS_FRAME_BUDGET=0` disables it.
+2. `tts_result::hit_token_budget` reports a generation that stopped on the
+   budget rather than on EOS. That audio is not usable — the tail is noise and
+   the end of the text is missing — so it is never reported as success.
+3. The server retries once with a fresh sampling stream, then returns 500 with
+   an explicit message. Live streaming cannot retry (bytes are already on the
+   wire) and only logs a warning.
+4. The CLI reports and exits non-zero; it deliberately does not retry, so the
+   failure rate stays visible.
+
+Measured effect on a 70-char line: budget 226 frames instead of 6144, so a
+runaway costs ~9 s instead of ~5 min. On a 4067-char line the budget is 5821
+frames — barely under the global cap, so there the retry is the whole fix.
+
+**Side benefit:** the KV cache is sized from the budget
+(`n_ctx = prefill + budget + 8`), so a short request now allocates n_ctx 494
+instead of 6412 — most of a gigabyte of VRAM that a co-resident game gets to
+keep.
+
+**Still open:** the guard is length-based, so it fires late on long input. A
+level-based detector would catch the collapse ~250 s in instead of ~466 s (the
+runaway drops ~6 dB and stays there), but it only works where the vocoder runs
+concurrently with generation — CUDA and ROCm, not Vulkan. Not implemented.
+
+**Candidate fixes**, best first:
+
+1. **Split long input into sentences** and generate per chunk. The failure
+   needs length; `ward.txt` at 43 s never failed in 40 tries. Also caps the
+   blast radius — a bad chunk costs seconds, not minutes.
+2. **Per-request frame budget** from input length (~1.4x of 0.70/char) instead
+   of the global cap. Blunt but always applies; would have cut seed 6 at
+   ~4000 frames instead of 6144.
+3. **Level-based stop.** The pipeline already decodes audio in chunks while
+   generating. Track the utterance's running level; stop after several
+   consecutive seconds far below it. Would have cut seed 6 at ~250 s.
+4. **Server-side retry** with a different seed when a guard fires — for
+   interactive use (game dialogue) this is the difference between a missing
+   line and a slightly late one.
+
+**Also found:** the CLI never sets `params.print_progress`, so the
+`decode: frame N/6144` progress lines are dead there. The server prints them
+under `TTS_VERBOSE=1`. Nothing else uses the flag, so CLI users have no way to
+see a runaway in progress.
