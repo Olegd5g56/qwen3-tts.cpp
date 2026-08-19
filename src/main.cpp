@@ -86,6 +86,9 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
+    fprintf(stderr, "  --codebooks <n>        RVQ codebooks to use, 1-16 (default: 16 = all).\n");
+    fprintf(stderr, "                         Fewer is faster and coarser; 8 roughly halves\n");
+    fprintf(stderr, "                         the code-predictor cost per frame\n");
     fprintf(stderr, "  --seed <n>             Sampling seed (default: -1 = random)\n");
     fprintf(stderr, "  -i, --instructions <s> Voice steering instructions\n");
     fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
@@ -149,6 +152,8 @@ int main(int argc, char ** argv) {
         if (!parse_float_val("TTS_REPETITION_PENALTY", v, params.repetition_penalty)) return 1;
     if (const char * v = std::getenv("TTS_SEED"))
         if (!parse_i64_val("TTS_SEED", v, params.seed)) return 1;
+    if (const char * v = std::getenv("TTS_CODEBOOKS"))
+        if (!parse_int_val("TTS_CODEBOOKS", v, params.n_codebooks)) return 1;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -216,6 +221,16 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             if (!parse_float_val("--repetition-penalty", argv[i], params.repetition_penalty)) return 1;
+        } else if (arg == "--codebooks") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing codebooks value\n");
+                return 1;
+            }
+            if (!parse_int_val("--codebooks", argv[i], params.n_codebooks)) return 1;
+            if (params.n_codebooks < 1 || params.n_codebooks > 16) {
+                fprintf(stderr, "Error: --codebooks must be between 1 and 16\n");
+                return 1;
+            }
         } else if (arg == "--seed") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing seed value\n");
