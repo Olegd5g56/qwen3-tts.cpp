@@ -66,7 +66,7 @@ add_subdirectory(${GGML_DIR})
 # a binary (CLI, server, individual test) links against. Depends on ggml for
 # the install_ggml_log_bridge() routine that funnels ggml_vulkan: / ggml_metal:
 # chatter through the same formatter.
-add_library(qwen3_log STATIC src/log.cpp)
+add_library(qwen3_log STATIC src/log.cpp src/op_profiler.cpp)
 target_include_directories(qwen3_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qwen3_log PUBLIC ggml)
 
