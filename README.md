@@ -57,10 +57,41 @@ if you enable `-DGGML_VULKAN=ON`.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release                  # CPU
 cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release # Vulkan
 cmake -S . -B build -DGGML_HIP=ON    -DCMAKE_BUILD_TYPE=Release # AMD ROCm
-cmake -S . -B build -DGGML_CUDA=ON   -DCMAKE_BUILD_TYPE=Release # NVIDIA
+cmake -S . -B build -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release      # NVIDIA
 ```
 
 Outputs: `build/qwen3-tts-server` and `build/qwen3-tts-cli`.
+**Pick the vendor backend, not Vulkan.** CUDA and ROCm/HIP both let the vocoder
+overlap with generation, which Vulkan cannot do; that overlap is worth ~25-40%
+end to end. Measured on a long clip:
+
+| GPU | backend | RTF |
+|---|---|---|
+| RX 6800 XT | ROCm/HIP | **0.530** |
+| RX 6800 XT | Vulkan | 0.649 |
+| GTX 1660 SUPER | CUDA | **0.530** |
+| GTX 1660 SUPER | Vulkan | 0.793 |
+
+For CUDA, set `CMAKE_CUDA_ARCHITECTURES` to your card (75 = Turing/GTX 16xx,
+86 = Ampere, 89 = Ada); CUDA 13 needs a host compiler no newer than GCC 15
+(`-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15`).
+
+For ROCm on an RDNA2 card (gfx1030 is no longer officially supported by AMD but
+works fine — Arch's rocBLAS still ships tuned kernels for it):
+
+```bash
+cmake -S . -B build-hip -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release \
+      -DAMDGPU_TARGETS=gfx1030 -DCMAKE_HIP_ARCHITECTURES=gfx1030 \
+      -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+      -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+      -DCMAKE_PREFIX_PATH=/opt/rocm
+```
+
+If you do run Vulkan on an AMD card, set `GGML_VK_DISABLE_MULTI_ADD=1` — without
+it ggml's multi-add fusion makes RADV about 3x slower (see
+`docs/known-issues.md` #8). The provided `Dockerfile.vulkan` sets it already.
+
 Toggles: `QWEN3_TTS_SERVER=OFF` skips the server,
 `QWEN3_TTS_TIMING=ON` compiles in per-stage timing.
 
@@ -95,6 +126,38 @@ docker run --rm -it \
 CPU image: drop `--device /dev/dri --group-add video`. Container time
 defaults to UTC; set `-e TZ=...` if you want logs in local time. Any local
 `docker-compose.yml` can reference the tag — no `build:` section needed.
+
+## Performance tuning
+
+Environment knobs, all optional:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/Metal, off for Vulkan (where two backend instances serialise). `1`/`0` forces it. |
+| `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch when the caller is not streaming. Smaller starts the overlap earlier; larger amortises per-batch cost. |
+| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table for the generation and vocoder graphs. Diagnostic only — it disables kernel fusion and syncs per node. |
+
+**Keep cloned-voice reference samples short — 3–5 seconds.** The reference is
+prepended to every prompt, so its length is paid in prefill *and* in each
+generation step's attention window, plus once more in the vocoder warm-up the
+first time a voice is used. Trimming a 12-second sample to 3 seconds took RTF
+from 0.665 to 0.518 and halved the first call for that voice, with no loss of
+intelligibility. Cut `sample.txt` at the same point as the audio — the
+transcript has to match what is actually in the file.
+
+`--codebooks N` (or `TTS_CODEBOOKS`) truncates the RVQ chain to N of 16.
+It does cut the code predictor proportionally, but **the codebooks feed back
+into the talker**, so dropping them degrades the spoken text, not just the
+timbre: clean down to 12 (~3% faster), incoherent at 8, unusable at 4. Left in
+as a research knob — see `docs/known-issues.md` #7 before reaching for it.
+
+Speed/quality trade-off: the 0.6B Base talker is roughly 15% faster end to end
+than the 1.7B and about 3x cheaper on prefill, at some cost in voice fidelity.
+Speaker embeddings are as wide as the talker's hidden size, so **each model
+variant needs its own voices directory** (0.6B and 1.7B caches are not
+interchangeable).
+
+See `docs/optimization.md` for the measured breakdown.
 
 ## Models
 

@@ -31,6 +31,8 @@ qwen3-tts.cpp/
     audio_tokenizer_decoder.{h,cpp}  # WavTokenizer vocoder (streaming-capable)
     qwen3tts_c_api.{h,cpp}      # C ABI shared lib (for Nim/other FFI)
     gguf_loader.{h,cpp}         # GGUF model loading
+    op_profiler.{h,cpp}         # opt-in per-op GPU profiler
+                                #   (QWEN3_TTS_PROFILE_OPS=1)
     coreml_code_predictor.{h,mm} # macOS-only Core ML bridge (stub on Linux)
   tests/                        # Component tests
     test_tokenizer.cpp
@@ -44,6 +46,8 @@ qwen3-tts.cpp/
   voices/                       # Default --voices-dir, per-id sample.{wav,mp3,txt}
                                 # + cache.bin (encoded embedding + ref codes)
   docs/                         # Design notes (streaming, optimization, tensors)
+                                # + known-issues.md: running bug log, append to it
+                                # + ggml-notes.md: upstream ggml bugs/gaps
   CMakeLists.txt
 ```
 
@@ -200,10 +204,30 @@ bash scripts/run_all_tests.sh           # Full suite
 
 ## Performance Profile
 
-Measured June 2026 on Vulkan (RX 6800 XT, Q8_0 1.7B, ~500-frame clip), after the `d544a6f`..`b031dd7` perf sweep:
+Measured August 2026 on CUDA (GTX 1660 SUPER, Q8_0 1.7B, ~42 s clip), after the
+August sweep (ggml 0.20.2, KV windowing, generate/decode overlap):
 
-- Vocoder decode is ~64% of total time, code generation ~36%. Overall ~1.4x realtime.
-- Within generation, the code predictor dominates (~57%) because it runs 15 sequential graph dispatches per frame (1 prefill + 14 codebook steps); the talker is ~35%.
-- ICL (cloned-voice) requests must run the reference frames through the streaming vocoder before synthesis so the output starts in the reference timbre. This warm-up (~5 s for 150 frames) is cached process-wide per voice (`Qwen3TTS::warmup_decoder_for_icl`, keyed by ref-codes + vocoder path); only the first request per voice pays it. The cache intentionally lives in a function-local static because the server destroys the whole `Qwen3TTS` object on idle unload.
+- RTF 0.53 on a long clip (1.9x realtime), 0.60 on a short line via a warm
+  server. CUDA is the fastest backend on NVIDIA by a wide margin.
+- Vocoder decode runs on a worker thread concurrently with generation
+  (`decode_pipeline` in `qwen3_tts.cpp`). This is gated per backend: on CUDA and
+  Metal it is the biggest single win; on Vulkan two backend instances serialise
+  and it must stay off. `QWEN3_TTS_PIPELINE=1/0` overrides.
+- Attention graphs view only the populated part of the KV cache
+  (`QWEN3_TTS_KV_STEP` granularity). Viewing the full `MAX_AUDIO_TOKENS`-sized
+  cache used to make flash-attn 31% of generation.
+- Within generation the code predictor now dominates (~13 ms/frame) and costs
+  the same on the 0.6B and 1.7B talkers — it is 15 sequential 5-layer passes,
+  bound by per-kernel latency rather than arithmetic.
+- Speaker embeddings are hidden-size wide, so a voices directory is tied to one
+  model variant.
 
-See `docs/optimization.md` for the full breakdown and the list of approaches that were tried and ruled out.
+See `docs/optimization.md` for the full breakdown, the list of approaches that
+were tried and ruled out, and the measurement pitfalls (compare ms/frame, not
+wall time; `--temperature 0` is unstable on this model).
+
+## Historical Performance Profile
+
+Superseded numbers (June 2026 Vulkan/RX 6800 XT sweep, and the CPU-only era
+before it) live in `docs/optimization.md`, which also records why each old
+conclusion changed. Do not re-derive backend advice from those figures.

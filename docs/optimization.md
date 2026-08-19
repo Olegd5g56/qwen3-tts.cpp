@@ -1,87 +1,171 @@
 # Qwen3-TTS GGML Optimization Report
 
-Performance characterization of this fork. Last updated **2026-06-10** after the
-June perf sweep (`d544a6f`..`b031dd7` + ICL warm-up cache).
+Performance characterization of this fork. Last updated **2026-08-19** after the
+August sweep (CUDA backend, KV windowing, generate/decode overlap).
 
-Historical note: the original upstream version of this document described a
-CPU-only baseline (RTF 1.94x, speaker encoder as the main bottleneck, one-shot
-vocoder). All of that is obsolete — the speaker encode result is cached by the
-voice store, the vocoder streams in chunks, and Vulkan is the primary backend.
+Historical note: earlier revisions of this document described a CPU-only
+baseline and then a Vulkan-on-RX-6800-XT baseline. Both are superseded — the
+numbers below were measured on the card this fork now targets.
 
 ## Summary
 
-**Test configuration:** AMD RX 6800 XT (Vulkan, RADV), Ryzen 7 5700X,
-Q8_0 1.7B Base talker + F16 vocoder, ~500-frame (~40 s) Russian clip,
-ICL cloned voice.
+**Test configuration:** NVIDIA GTX 1660 SUPER (Turing TU116, 6 GB, **no tensor
+cores**), Ryzen 7 5700X, Q8_0 1.7B Base talker + F16 vocoder, ~42 s Russian
+clip, ICL cloned voice, default sampling (`temperature 0.9`, `top_k 50`).
 
-| Metric | Before sweep | After sweep |
-|--------|--------------|-------------|
-| End-to-end (CLI, long clip) | 85.5 s | 28.5 s |
-| RTF (lower is better) | 1.96 | **0.70** (1.4x realtime) |
-| Streaming TTFA, cloned voice (cold) | ~7 s | ~7 s |
-| Streaming TTFA, cloned voice (warm cache) | ~7 s | **~1.5 s** |
-| MP3 size (speech-tuned VBR) | — | ~15% smaller |
+| Metric | Before | After |
+|--------|--------|-------|
+| End-to-end, long clip | 33.7 s | **22.9 s** |
+| RTF, long clip (lower is better) | 0.815 | **0.53** (1.9x realtime) |
+| RTF, short line, warm server, 1.7B | 0.70 | **0.60** |
+| RTF, short line, warm server, 0.6B | — | **0.52** |
+| Talker step, 500-frame context | 29.5 ms | **18.0 ms** |
+| Prefill (210 tokens) | 1450 ms | **415 ms** |
 
-## What was done (June 2026)
+Backend guidance changed on **both** cards. The vendor backends (CUDA, ROCm)
+win, because they are the ones that can overlap the vocoder with generation:
 
-1. **`d544a6f` — removed `ffn_down` F32 cast** in all five hot transformer
-   graphs. The cast forced a full dequant of the largest FFN matrix on every
-   step; `ggml_mul_mat` handles quantized weights natively. ~5.9x on generate.
-2. **`79defa7` — LAME speech settings** (VBR -V 4, `quality=5` instead of
-   music-grade -V 2 / `quality=2`). Faster encode, ~15% smaller files, no
-   audible difference for 24 kHz mono speech.
-3. **`d8b49be` — broadcast `ggml_mul` instead of `ggml_repeat`** in snake
-   activation and upsample gamma. Kills large scratch tensors in the vocoder
-   tower. ~14% on decode.
-4. **`b031dd7` — `ggml_flash_attn_ext`** in the vocoder pre-transformer
-   attention (F16 mask, padded to 64). ~3% on decode.
-5. **ICL warm-up cache** (`Qwen3TTS::warmup_decoder_for_icl`). Cloned-voice
-   requests must run the ~150 reference frames through the streaming vocoder
-   before synthesis. The decoder's streaming state is entirely host-side
-   (per-layer KV vectors, causal-conv tail rings, conv_transpose overlap
-   buffers — see `AudioTokenizerDecoder::stream_state`), so after the first
-   request the snapshot (~10 MB) is cached process-wide, keyed by FNV-1a over
-   ref-codes + vocoder path. Restore is a memcpy. The cache is a function-local
-   static because the server destroys the `Qwen3TTS` object on idle unload;
-   capped at 16 entries.
+| GPU | backend | RTF |
+|---|---|---|
+| RX 6800 XT | ROCm/HIP + overlap | **0.530** |
+| RX 6800 XT | Vulkan (needs `GGML_VK_DISABLE_MULTI_ADD=1`) | 0.649 |
+| RX 6800 XT | Vulkan, ggml 0.9.11 — what the fork shipped | 0.672 |
+| GTX 1660 SUPER | CUDA + overlap | **0.530** |
+| GTX 1660 SUPER | Vulkan | 0.793 |
+
+Both old impressions were real measurements with since-removed causes. CUDA
+measured slower (45.6 vs 38.3 ms/frame generate) because the KV-window bug hit
+its flash-attention path harder than Vulkan's; fixing the window took CUDA to
+31.5 ms/frame and reversed the ranking. HIP measured slower on a ROCm/ggml pair
+that is now years out of date — with ROCm 7.2.4 and ggml 0.20.2, gfx1030 is a
+perfectly good target, and Arch's rocBLAS still ships Tensile kernels for it.
+(Separately, the April ggml no longer builds against CUDA 13.3, so the old
+revision cannot be re-measured without downgrading the toolkit.)
+
+## What was done (August 2026)
+
+1. **ggml 0.9.11 → 0.20.2.** The April revision does not compile against
+   CUDA 13.3 (`cuda::make_strided_iterator` in `argsort.cu`), which is what
+   blocked the CUDA backend in the first place.
+
+2. **KV windowing in the talker** (`build_step_graph`, `build_prefill_forward_graph`).
+   Both graphs previously viewed the *entire* KV cache — 6413 rows, sized from
+   `MAX_AUDIO_TOKENS` — so every step ran attention over 6413 positions when
+   only ~260 were populated, and flash-attn alone was 31% of generation. Step
+   graphs now view `GGML_PAD(n_past + 1, QWEN3_TTS_KV_STEP)` rows (64-row
+   granularity keeps the graph shape stable for long stretches), prefill views
+   `n_past + n_tokens`. Talker step time fell 29.5 → 18.0 ms/frame, prefill
+   1450 → 415 ms. Output is unchanged in content — the discarded tail was
+   zeroed cache masked to `-inf` — though flash-attn's reduction order differs,
+   so greedy decoding can pick a different (equally valid) path.
+
+3. **Generate/decode overlap** (`decode_pipeline` in `qwen3_tts.cpp`). The
+   vocoder now runs on a worker thread while the talker keeps generating,
+   instead of being called synchronously from the frame callback. The talker's
+   per-step graphs are tiny and leave most of the GPU idle; the vocoder's conv
+   tower saturates it. This is the single largest win: 31.5 s → 22.4 s on the
+   long clip. PCM is still delivered to the caller from the calling thread, in
+   order, so the `on_pcm` contract is unchanged. Verified against the
+   sequential path at corr 0.9999999, identical RMS.
+
+   **Backend-gated**: enabled on CUDA and Metal, disabled on Vulkan. Two ggml
+   Vulkan backend instances on one device do not make progress concurrently —
+   they serialise so badly that a 4-second line did not finish in 10 minutes.
+   Override with `QWEN3_TTS_PIPELINE=1/0`.
+
+4. **Snake activation ordering** (`apply_snake`). The alpha/beta `exp`/`scale`
+   nodes were emitted between `sqr` and `mul`, breaking the consecutive
+   `mul→sin→sqr→mul→add` run that backends fuse into one kernel. They are now
+   materialised before the chain. No measurable win on this card (the fusion
+   still does not trigger), but the graph is no longer structurally hostile.
+
+5. **Shorter ICL reference audio** — a configuration change, not a code change,
+   and the largest remaining win. The reference sample is prepended to the
+   prompt, so its length is paid twice: once in prefill, and once per step in
+   the attention window. Trimming `ostro` from 11.9 s to 3.2 s (cutting the
+   transcript at the same sentence boundary):
+
+   | reference | prefill | RTF, warm | first call for that voice |
+   |---|---|---|---|
+   | 11.9 s (as shipped) | 413 ms | 0.665 | 7118 ms |
+   | 10.6 s | 408 ms | 0.654 | 6247 ms |
+   | 6.8 s | 264 ms | 0.582 | 5072 ms |
+   | 3.2 s | 160 ms | **0.518** | **3639 ms** |
+
+   22% off steady-state RTF and roughly half off the first call for a voice
+   (the ICL vocoder warm-up decodes the reference frames, so it scales with
+   the sample too). Intelligibility unaffected — ASR is clean at every length.
+   The transcript in `sample.txt` must be cut to match the audio, so this is
+   not safe to automate from the audio alone.
+
+   Listening note: quality across these is **not monotonic in length**. The
+   3.2 s and the full 11.9 s reference both sound better than the 6.8 s and
+   10.6 s ones. The short cut happens to contain two questions with rising
+   intonation, matching the (interrogative) target line; the mid-length cuts
+   add flat narrative speech and blur the delivery, while the full sample is
+   long enough to cover the whole voice again. So the practical rule for
+   picking a reference is **match the prosody of the lines you will generate**,
+   not maximise duration — a short, on-register sample beats a long mixed one
+   and costs a quarter as much.
+
+6. **Opt-in per-op profiler** (`src/op_profiler.{h,cpp}`, `QWEN3_TTS_PROFILE_OPS=1`).
+   Hooks the scheduler's eval callback and reports per (op, shape) totals for
+   `generate` and `vocoder`. This is what located the KV-window problem. Note
+   that it disables kernel fusion and adds sync per node, so treat its absolute
+   numbers as upper bounds and its proportions as the signal.
 
 ## Current profile (where the time goes)
 
-Per `QWEN3_TTS_TIMING` instrumentation on the 506-frame clip:
+Short line (~4 s audio, 54 frames), warm server, 1.7B, CUDA:
 
-- **Vocoder decode: ~64% of total.** Honest GPU compute in the conv upsampling
-  tower (12.5 Hz latent → 24 kHz PCM, 480x). Runs as chunked `stream_decode`
-  (100-frame batches) — larger batches were tested and are *slower* with much
-  higher RSS.
-- **Generation: ~36% of total.** Breakdown:
-  - Code predictor ~57% of generate — 15 sequential graph dispatches per frame
-    (1 prefill + 14 codebook steps); ~73% of it is real compute.
-  - Talker forward ~35%, embed lookups ~4%, prefill ~3.5%.
+- **prefill ~415 ms** — 210 tokens (150 of them ICL reference frames) through
+  28 layers. Close to this card's GEMM throughput; the way to shrink it is a
+  shorter reference sample, not a faster kernel.
+- **talker ~9 ms/frame**, **code predictor ~13 ms/frame**, embed lookups ~0.2.
+- **vocoder ~26 ms/frame**, now largely hidden behind generation.
+
+The code predictor is the standout: it costs the **same 13 ms/frame on the
+0.6B and the 1.7B model**, because it is 15 sequential 5-layer passes per frame
+— ~1100 small kernels whose launch/teardown latency dominates the arithmetic.
 
 ## Tried and ruled out — do not redo
 
-- **Persistent attention mask** (incremental upload instead of full re-upload
-  per step): no measurable win. PCIe latency dominates bandwidth at these
-  sizes; small `ggml_backend_tensor_set` calls cost the same as big ones.
-- **Decode batch 100 → 200/400/800**: slower, RSS ballooned (2.2 → 6.7 GB at
-  800). Per-chunk overhead is not the decode bottleneck.
-- **Embedding lookup via host scratch**: embed lookups are only 4% of
-  generate; codec/code-pred embeddings are F16 so the read is already direct.
-- **One-shot vocoder `decode()` for long clips**: activation memory balloons
-  past 13 GB for ~3k frames. Chunked streaming decode is the only sane path.
+- **Fused code predictor** (one graph for all 15 codebooks, `argmax` +
+  `get_rows` kept on device, zero logits readbacks). Worth only ~3% on CUDA —
+  proving the cost is per-kernel latency inside the chain, not per-dispatch
+  overhead — and catastrophic on Vulkan (a 4 s line did not finish in 10 min).
+  Removed. Revisit only together with a way to cut the *number* of sequential
+  kernels, e.g. truncating the codebook chain.
+- **Truncating the RVQ codebook chain** (`--codebooks N`, kept as a flag). Cost
+  scales exactly as hoped — code predictor 14.6 → 7.1 ms/frame at 8 codebooks —
+  but the codebook embeddings are summed back into the talker's step embedding,
+  so zeroing the tail pushes the talker out of distribution and the *text*
+  degrades: at 8 codebooks the ASR reads "беседно исчез 3-звучая иностранный
+  пацан ик", and the 0.6B model ran to the frame cap (491 s of audio for a 43 s
+  script). Clean down to 12, where the saving is only ~3% RTF. See
+  `docs/known-issues.md` #7.
+- **F32 vocoder weights** (hypothesis: TU116 lacks tensor cores, so F16 GEMM
+  might lose to SGEMM). Converted the tokenizer GGUF to F32: 11% *slower*
+  (24.8 s vs 22.4 s). The doubled weight traffic costs more than the compute
+  path saves. F16 stays.
+- **CUDA graphs** are enabled (`GGML_CUDA_GRAPHS=ON`, off by default in ggml)
+  and do capture, but the generation loop is not launch-bound once the KV
+  window is fixed, so they are not where the remaining time is.
+- Everything in the June list still holds: persistent attention mask, decode
+  batch 200/400/800, embedding lookup via host scratch, one-shot vocoder
+  `decode()` for long clips.
 
-## Remaining ideas (architectural, descending value)
+## Remaining ideas (descending value)
 
-1. **Persistent GPU-side KV in vocoder pre-tfm layers** — currently each
-   streaming chunk round-trips the full accumulated KV host↔GPU
-   (`stream_decode` driver). Estimated total cost is small (tens of ms);
-   invasive change, likely not worth it.
-2. **Code predictor graph caching across steps** — ~12% of code-pred time is
-   build+alloc; the talker step graph (`build_step_graph`) shows the
-   n_past-as-input pattern to copy. Saves well under 1 s per long clip.
-3. **Code predictor codebook batching** — would attack the 15-dispatch-per-
-   frame structure itself, but changes autoregressive semantics; research
-   project, not a tweak.
+1. **Vocoder convolutions.** ~26 ms/frame, and `im2col`+`mul_mat` reaches only
+   ~12% of this card's FP32 peak. No cheap fix found; a direct conv1d kernel
+   would be a ggml-side project.
 
-Current state is in the "good enough for live use" zone: 1.4x realtime
-end-to-end and ~1.5 s TTFA on warm cloned voices.
+## Measurement notes
+
+- Compare **ms/frame**, not wall time. Frame count varies run to run with
+  sampling, and greedy (`--temperature 0`) is unstable on this model — it can
+  run to the 6144-frame cap and produce near-silence. Two of this sweep's
+  early "regressions" were that, not code.
+- Verify intelligibility, not just timing: transcribing the output with an ASR
+  model catches degradations that RMS and duration checks miss.
