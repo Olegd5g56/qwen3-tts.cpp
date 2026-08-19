@@ -2,6 +2,7 @@
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 #include "log.h"
+#include "op_profiler.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -358,6 +359,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
     log_debug("AudioTokenizerDecoder backend: %s", device_name);
+    backend_name_ = device_name;
     
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -380,10 +382,18 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
     }
+    op_profiler_attach(state_.sched, "vocoder");
     
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
     
     return true;
+}
+
+// How many codebooks the decode graph actually consumes. Codebooks past this
+// are not looked up, so their input tensors do not exist in the graph and must
+// not be filled.
+int AudioTokenizerDecoder::active_codebook_count() const {
+    return (active_codebooks_ > 0 && active_codebooks_ < 16) ? active_codebooks_ : 16;
 }
 
 struct ggml_tensor * AudioTokenizerDecoder::apply_snake(struct ggml_context * ctx,
@@ -392,17 +402,21 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_snake(struct ggml_context * ct
                                                          struct ggml_tensor * beta) {
     int64_t channels = x->ne[1];
 
+    // Both per-channel scales are materialised *before* the activation chain.
+    // Backends fuse mul -> sin -> sqr -> mul -> add into a single kernel only
+    // when those five nodes are consecutive in the graph; emitting the beta
+    // exp/scale in the middle used to break the run and cost five full passes
+    // over the (very large) activation tensor instead of one.
     struct ggml_tensor * alpha_exp = ggml_exp(ctx, alpha);
     struct ggml_tensor * alpha_3d = ggml_reshape_3d(ctx, alpha_exp, 1, channels, 1);
-
-    struct ggml_tensor * ax = ggml_mul(ctx, x, alpha_3d);
-    struct ggml_tensor * sin_ax = ggml_sin(ctx, ax);
-    struct ggml_tensor * sin_sq = ggml_sqr(ctx, sin_ax);
 
     struct ggml_tensor * neg_beta = ggml_scale(ctx, beta, -1.0f);
     struct ggml_tensor * inv_beta_exp = ggml_exp(ctx, neg_beta);
     struct ggml_tensor * inv_beta_3d = ggml_reshape_3d(ctx, inv_beta_exp, 1, channels, 1);
 
+    struct ggml_tensor * ax = ggml_mul(ctx, x, alpha_3d);
+    struct ggml_tensor * sin_ax = ggml_sin(ctx, ax);
+    struct ggml_tensor * sin_sq = ggml_sqr(ctx, sin_ax);
     struct ggml_tensor * scaled_sin = ggml_mul(ctx, sin_sq, inv_beta_3d);
 
     return ggml_add(ctx, x, scaled_sin);
@@ -801,8 +815,14 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      struct ggml_tensor * first_emb = ggml_get_rows(ctx0, model_.vq_first_codebook, first_codes);
      ggml_set_name(first_emb, "first_emb_raw");
      
+     // Residual codebooks past n_rest_active are dropped entirely: their
+     // embeddings are never looked up and never added below, which is exactly
+     // what truncating an RVQ chain means.
+     const int n_rest_active = (active_codebooks_ > 0 && active_codebooks_ < 16)
+                             ? active_codebooks_ - 1 : 15;
+
      struct ggml_tensor * rest_emb[15];
-     for (int cb = 0; cb < 15; ++cb) {
+     for (int cb = 0; cb < n_rest_active; ++cb) {
          struct ggml_tensor * cb_codes = cb_codes_tensors[cb + 1];
          rest_emb[cb] = ggml_get_rows(ctx0, model_.vq_rest_codebook[cb], cb_codes);
          
@@ -823,7 +843,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
                                                                  cfg.codebook_dim, cfg.hidden_dim);
     
      struct ggml_tensor * rest_proj_2d = nullptr;
-     for (int cb = 0; cb < 15; ++cb) {
+     for (int cb = 0; cb < n_rest_active; ++cb) {
          struct ggml_tensor * cb_emb_2d = ggml_reshape_2d(ctx0, rest_emb[cb], cfg.codebook_dim, n_frames);
          
          if (cb == 0) {
@@ -838,9 +858,11 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
              rest_proj_2d = ggml_add(ctx0, rest_proj_2d, cb_proj_2d);
          }
      }
-     ggml_set_name(rest_proj_2d, "rest_proj_2d");
-    
-     struct ggml_tensor * latent_2d = ggml_add(ctx0, first_proj_2d, rest_proj_2d);
+     struct ggml_tensor * latent_2d = first_proj_2d;
+     if (rest_proj_2d) {
+         ggml_set_name(rest_proj_2d, "rest_proj_2d");
+         latent_2d = ggml_add(ctx0, first_proj_2d, rest_proj_2d);
+     }
      ggml_set_name(latent_2d, "latent_2d");
      
      struct ggml_tensor * latent_t = ggml_transpose(ctx0, latent_2d);
@@ -1003,7 +1025,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     }
     
     std::vector<int32_t> cb_codes(n_frames);
-    for (int cb = 0; cb < 16; ++cb) {
+    for (int cb = 0; cb < active_codebook_count(); ++cb) {
         char name[32];
         snprintf(name, sizeof(name), "codes_cb%d", cb);
         struct ggml_tensor * cb_tensor = ggml_graph_get_tensor(gf, name);
@@ -1142,7 +1164,7 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
     }
 
     std::vector<int32_t> cb_codes(n_frames);
-    for (int cb = 0; cb < 16; ++cb) {
+    for (int cb = 0; cb < active_codebook_count(); ++cb) {
         char name[32];
         snprintf(name, sizeof(name), "codes_cb%d", cb);
         struct ggml_tensor * cb_tensor = ggml_graph_get_tensor(gf, name);

@@ -2,6 +2,7 @@
 #include "gguf_loader.h"
 #include "audio_streamers.h"
 #include "log.h"
+#include "op_profiler.h"
 
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,9 @@
 #include <atomic>
 #include <cctype>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 
 #include <mpg123.h>
 
@@ -27,6 +31,175 @@
 #endif
 
 namespace qwen3_tts {
+
+namespace {
+
+// Frames per vocoder batch when the caller is not streaming. Small enough that
+// the decoder starts working early in the utterance (that overlap is the whole
+// point), large enough that per-batch overhead stays negligible. Short lines
+// are the common case in interactive use, so this favours starting early.
+// Override with QWEN3_TTS_DECODE_BATCH.
+// Overlapping the vocoder with generation needs two backend instances to make
+// progress on the device at the same time. That holds for CUDA, ROCm/HIP (the
+// same code path, hipified) and Metal, where each instance owns its own
+// stream/queue. The Vulkan backend serialises the two instances instead and
+// ends up slower than running them one after the other, so it stays on the
+// sequential path. Force either way with QWEN3_TTS_PIPELINE=1/0.
+bool pipeline_supported(const std::string & backend_name) {
+    const char * env = std::getenv("QWEN3_TTS_PIPELINE");
+    if (env && env[0]) {
+        return env[0] != '0';
+    }
+    static const char * const overlapping[] = { "CUDA", "ROCm", "HIP", "Metal" };
+    for (const char * prefix : overlapping) {
+        if (backend_name.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int decode_batch_frames() {
+    static const int frames = [] {
+        const char * env = std::getenv("QWEN3_TTS_DECODE_BATCH");
+        const int    n   = env ? atoi(env) : 0;
+        return n > 0 ? n : 16;
+    }();
+    return frames;
+}
+
+// Runs the vocoder on a worker thread so it overlaps with code generation.
+//
+// The talker's per-step graphs are tiny and leave most of the GPU idle, while
+// the vocoder's convolution tower saturates it. Decoding a finished batch
+// while the next one is still being generated collapses two serial phases into
+// one overlapped phase. The transformer and the decoder own separate ggml
+// backends (hence separate device streams), so both can be in flight at once;
+// nothing else touches the decoder while the worker runs.
+//
+// Decoded PCM is handed back through poll_ready() and delivered by the calling
+// thread, so consumers still see on_pcm invoked from a single thread, in order.
+class decode_pipeline {
+public:
+    explicit decode_pipeline(AudioTokenizerDecoder & decoder) : decoder_(decoder) {}
+
+    ~decode_pipeline() { shutdown(); }
+
+    void start() {
+        worker_ = std::thread([this] { run(); });
+    }
+
+    // Blocks only when the decoder has fallen far enough behind that queued
+    // batches would otherwise pile up in memory.
+    void submit(const int32_t * codes, size_t n_values, int n_frames) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_space_.wait(lk, [this] { return in_.size() < max_queued || failed_; });
+        if (failed_) {
+            return;
+        }
+        in_.push_back({std::vector<int32_t>(codes, codes + n_values), n_frames});
+        lk.unlock();
+        cv_in_.notify_one();
+    }
+
+    // Non-blocking: moves one decoded batch into `pcm` if one is ready.
+    bool poll_ready(std::vector<float> & pcm) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (out_.empty()) {
+            return false;
+        }
+        pcm = std::move(out_.front());
+        out_.pop_front();
+        return true;
+    }
+
+    // Waits until every submitted batch has been decoded.
+    void drain() {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_done_.wait(lk, [this] { return (in_.empty() && !busy_) || failed_; });
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+        }
+        cv_in_.notify_all();
+        cv_space_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    bool failed() {
+        std::lock_guard<std::mutex> lk(m_);
+        return failed_;
+    }
+
+    std::string error() {
+        std::lock_guard<std::mutex> lk(m_);
+        return error_;
+    }
+
+private:
+    struct batch {
+        std::vector<int32_t> codes;
+        int                  n_frames = 0;
+    };
+
+    static constexpr size_t max_queued = 4;
+
+    void run() {
+        for (;;) {
+            batch b;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_in_.wait(lk, [this] { return stop_ || !in_.empty(); });
+                if (in_.empty()) {
+                    if (stop_) {
+                        return;
+                    }
+                    continue;
+                }
+                b = std::move(in_.front());
+                in_.pop_front();
+                busy_ = true;
+            }
+            cv_space_.notify_one();
+
+            std::vector<float> pcm;
+            const bool ok = decoder_.stream_decode(b.codes.data(), b.n_frames, pcm);
+
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                busy_ = false;
+                if (ok) {
+                    out_.push_back(std::move(pcm));
+                } else {
+                    failed_ = true;
+                    error_  = decoder_.get_error();
+                }
+            }
+            cv_done_.notify_all();
+            cv_space_.notify_all();
+        }
+    }
+
+    AudioTokenizerDecoder &        decoder_;
+    std::thread                    worker_;
+    std::mutex                     m_;
+    std::condition_variable        cv_in_;
+    std::condition_variable        cv_done_;
+    std::condition_variable        cv_space_;
+    std::deque<batch>              in_;
+    std::deque<std::vector<float>> out_;
+    bool                           busy_   = false;
+    bool                           stop_   = false;
+    bool                           failed_ = false;
+    std::string                    error_;
+};
+
+}  // namespace
 
 static int64_t get_time_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -479,8 +652,15 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
 
     const int32_t expected_size = transformer_.get_config().hidden_size;
     if (embedding_size != expected_size) {
-        result.error_msg = "Invalid embedding size: expected " + std::to_string(expected_size)
-                         + ", got " + std::to_string(embedding_size);
+        // Speaker embeddings are as wide as the talker's hidden size, so a
+        // voice library encoded against one model variant cannot be reused by
+        // another (0.6B is 1024 wide, 1.7B is 2048). Point at the fix instead
+        // of just reporting the mismatch.
+        result.error_msg = "Speaker embedding is " + std::to_string(embedding_size)
+                         + " wide but this model expects " + std::to_string(expected_size)
+                         + " — the voice was encoded with a different model variant."
+                           " Use a separate voices directory per variant, or delete"
+                           " cache.bin in the voice folder to re-encode it.";
         return result;
     }
 
@@ -506,6 +686,16 @@ bool Qwen3TTS::warmup_decoder_for_icl(const int32_t * ref_codes, int32_t n_ref_f
     }
     for (char c : decoder_model_path_) {
         h = (h ^ (uint8_t) c) * 1099511628211ull;
+    }
+    // The snapshot is produced by a decode that sums only the active
+    // codebooks, so two requests differing only in that setting must not
+    // share a warm-up state.
+    {
+        const int32_t active = audio_decoder_.get_active_codebooks();
+        const uint8_t * ap = (const uint8_t *) &active;
+        for (size_t i = 0; i < sizeof(active); ++i) {
+            h = (h ^ ap[i]) * 1099511628211ull;
+        }
     }
 
     {
@@ -615,6 +805,11 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     if (params.seed >= 0) {
         transformer_.set_seed((uint64_t)params.seed);
     }
+    // Both stages have to agree on how much of the RVQ chain is in play: the
+    // talker must not predict codebooks the vocoder will ignore, and the
+    // vocoder must not sum codebooks the talker left at zero.
+    transformer_.set_active_codebooks(params.n_codebooks);
+    audio_decoder_.set_active_codebooks(params.n_codebooks);
 
     // tokenize ref_text for ICL mode
     std::vector<int32_t> ref_text_tokens;
@@ -637,33 +832,47 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
 
-    // streaming: install per-frame callback that batches codes and live-decodes
-    // via the vocoder's streaming path. we must also ensure the decoder is
-    // loaded before generate() so its stream_decode can be called from within
-    // the callback. ICL warm-up (ref_codes) is fed as a discarded chunk below.
-    const bool streaming = stream && stream->batch_size > 0 && stream->on_pcm;
+    // Every request decodes incrementally: the frame callback batches codes and
+    // hands them to the vocoder thread, which runs while generation continues.
+    // `deliver_live` only decides whether finished PCM is also pushed to the
+    // caller as it appears (SSE / chunked responses) or just accumulated.
+    // The decoder must therefore be loaded before generate(), and ICL warm-up
+    // (ref_codes) is fed as a discarded chunk below.
+    const bool deliver_live = stream && stream->batch_size > 0 && stream->on_pcm;
+    const int  batch_frames = deliver_live ? stream->batch_size : decode_batch_frames();
+
+    // Loading the decoder up front is what lets us ask which backend it runs
+    // on; the incremental path needs it live before generate() anyway. In
+    // low-memory mode the decoder is deliberately kept out of the way until
+    // generation has finished, so only an explicit live stream forces it here.
+    if (!decoder_loaded_ && (!low_mem_mode_ || deliver_live)) {
+        int64_t t_decoder_load_start = get_time_ms();
+        if (decoder_model_path_.empty()) {
+            result.error_msg = "Internal error: missing vocoder model path";
+            return result;
+        }
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            result.error_msg = "Failed to load vocoder: " + audio_decoder_.get_error();
+            return result;
+        }
+        audio_decoder_.set_abort_callback(abort_cb_, abort_data_);
+        decoder_loaded_ = true;
+        if (params.print_timing) {
+            log_info("vocoder lazy-loaded in %lld ms",
+                     (long long)(get_time_ms() - t_decoder_load_start));
+            sample_memory("synth/after-vocoder-load-stream");
+        }
+    }
+
+    // Callers that asked for live PCM always get the incremental path; everyone
+    // else only takes it where overlapping actually pays off.
+    const bool streaming    = deliver_live ||
+                              (decoder_loaded_ && pipeline_supported(audio_decoder_.get_backend_name()));
+    decode_pipeline pipeline(audio_decoder_);
     std::vector<int32_t> stream_buf;
     size_t stream_cb_count = 0;
     bool stream_cb_aborted = false;
     if (streaming) {
-        if (!decoder_loaded_) {
-            int64_t t_decoder_load_start = get_time_ms();
-            if (decoder_model_path_.empty()) {
-                result.error_msg = "Internal error: missing vocoder model path";
-                return result;
-            }
-            if (!audio_decoder_.load_model(decoder_model_path_)) {
-                result.error_msg = "Failed to load vocoder: " + audio_decoder_.get_error();
-                return result;
-            }
-            audio_decoder_.set_abort_callback(abort_cb_, abort_data_);
-            decoder_loaded_ = true;
-            if (params.print_timing) {
-                log_info("vocoder lazy-loaded in %lld ms",
-                         (long long)(get_time_ms() - t_decoder_load_start));
-                sample_memory("synth/after-vocoder-load-stream");
-            }
-        }
         audio_decoder_.stream_reset();
         const int n_cb = transformer_.get_config().n_codebooks;
 
@@ -676,25 +885,32 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             }
         }
 
-        stream_buf.reserve((size_t) stream->batch_size * n_cb);
+        stream_buf.reserve((size_t) batch_frames * n_cb);
+        pipeline.start();
         transformer_.set_frame_callback(
-            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb, &result]
+            [this, stream, deliver_live, batch_frames, &stream_buf, &stream_cb_count,
+             &stream_cb_aborted, n_cb, &result, &pipeline]
             (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
                 for (int c = 0; c < n_cb; ++c) stream_buf.push_back(frame_codes[c]);
                 const int frames_buffered = (int) (stream_buf.size() / n_cb);
-                if (frames_buffered >= stream->batch_size) {
-                    std::vector<float> pcm;
-                    if (!audio_decoder_.stream_decode(stream_buf.data(), frames_buffered, pcm)) {
-                        stream_cb_aborted = true;
-                        return false;
-                    }
+                if (frames_buffered >= batch_frames) {
+                    // hand the batch to the vocoder thread and keep generating
+                    pipeline.submit(stream_buf.data(), stream_buf.size(), frames_buffered);
                     stream_buf.clear();
+                }
+                // deliver whatever the vocoder has finished in the meantime
+                std::vector<float> pcm;
+                while (pipeline.poll_ready(pcm)) {
                     result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
                     stream_cb_count++;
-                    if (!stream->on_pcm(pcm.data(), pcm.size())) {
+                    if (deliver_live && !stream->on_pcm(pcm.data(), pcm.size())) {
                         stream_cb_aborted = true;
                         return false;
                     }
+                }
+                if (pipeline.failed()) {
+                    stream_cb_aborted = true;
+                    return false;
                 }
                 return true;
             });
@@ -756,14 +972,19 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         const int n_cb = transformer_.get_config().n_codebooks;
         const int leftover = (int) (stream_buf.size() / n_cb);
         if (leftover > 0 && !stream_cb_aborted) {
-            std::vector<float> pcm;
-            if (!audio_decoder_.stream_decode(stream_buf.data(), leftover, pcm)) {
-                result.error_msg = "Failed to flush streaming vocoder: " + audio_decoder_.get_error();
-                return result;
-            }
+            pipeline.submit(stream_buf.data(), stream_buf.size(), leftover);
             stream_buf.clear();
+        }
+        pipeline.drain();
+        if (pipeline.failed()) {
+            result.error_msg = "Failed to flush streaming vocoder: " + pipeline.error();
+            return result;
+        }
+        std::vector<float> pcm;
+        while (pipeline.poll_ready(pcm)) {
             result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
-            if (!stream->on_pcm(pcm.data(), pcm.size())) {
+            stream_cb_count++;
+            if (deliver_live && !stream_cb_aborted && !stream->on_pcm(pcm.data(), pcm.size())) {
                 stream_cb_aborted = true;
             }
         }
@@ -864,6 +1085,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
     sample_memory("synth/after-decode");
+    op_profiler_report("vocoder");
 
     if (low_mem_mode_) {
         audio_decoder_.unload_model();

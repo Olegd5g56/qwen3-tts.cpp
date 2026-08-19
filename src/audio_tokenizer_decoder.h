@@ -162,6 +162,18 @@ struct audio_decoder_state {
 // Decodes discrete audio codes to waveform
 class AudioTokenizerDecoder {
 public:
+    // Number of RVQ codebooks to actually sum when reconstructing the latent.
+    // The codebooks form a residual chain, so dropping the tail is a plain
+    // fidelity/speed trade rather than a corruption: the reconstruction is
+    // simply coarser. <= 0 or >= n_codebooks means "use all of them".
+    void set_active_codebooks(int32_t n) { active_codebooks_ = n; }
+    int32_t get_active_codebooks() const { return active_codebooks_; }
+
+    // Name of the device this decoder runs on ("CUDA0", "Vulkan0", "CPU", ...).
+    // Empty until load_model() succeeds. Used to decide whether decoding can
+    // safely overlap with generation on this backend.
+    const std::string & get_backend_name() const { return backend_name_; }
+
     AudioTokenizerDecoder();
     ~AudioTokenizerDecoder();
 
@@ -273,6 +285,10 @@ private:
     audio_decoder_model model_;
     audio_decoder_state state_;
     std::string error_msg_;
+    std::string backend_name_;
+    int32_t     active_codebooks_ = 0;  // 0 = all
+
+    int active_codebook_count() const;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
     

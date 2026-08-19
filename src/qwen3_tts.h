@@ -58,6 +58,12 @@ struct tts_params {
     // Repetition penalty for CB0 token generation (HuggingFace style)
     float repetition_penalty = 1.05f;
 
+    // Number of RVQ codebooks to predict and decode per frame (1..16).
+    // 0 = all. Each dropped codebook removes one code-predictor pass per
+    // frame — the main speed/fidelity dial that does not require a different
+    // model. Below ~8 the voice audibly coarsens.
+    int32_t n_codebooks = 0;
+
     // Language ID for codec (2050=en, 2069=ru, 2055=zh, 2058=ja, 2064=ko, 2053=de, 2061=fr, 2054=es)
     int32_t language_id = 2050;
 
