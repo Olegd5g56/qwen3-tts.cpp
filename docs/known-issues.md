@@ -11,65 +11,38 @@ root cause still there) / **wontfix**.
 
 ## 1. Streaming decoder is not fully causal — `test_streaming_parity` fails
 
-**Status:** closed 2026-08-20 — not a bug; the test was asking the wrong question
-**Found:** 2026-08-19
+**Status:** closed 2026-08-20 — not a bug; the test asked the wrong question
 **Severity:** none (was: correctness)
 
-The original complaint: `decode(32)` did not reproduce the first 32 frames of
-`decode(64)` — max-abs 6.096e-03 against a 1e-4 tolerance, first deviation at
-sample 4396 — which looked like the decoder's tail/overlap state depending on
-future frames.
+`decode(32)` did not reproduce the first 32 frames of `decode(64)` — max-abs
+6.096e-03 against a 1e-4 tolerance — which looked like tail/overlap state
+depending on future frames. It is not.
 
-**It does not.** Four measurements, all on the vocoder alone:
+- **Repeatability**: same input twice, `0.000e+00`. Nothing is jitter.
+- **Decisive**: decode 64 frames, then 64 again with only `codes[32:]` changed
+  — the prefix is **bit-identical**, at every length from 64 to 512.
+- **Length sweep**: `decode(N/2)` vs `decode(N)` is zero everywhere *except*
+  `N/2` in [32, 64]. The step is between 63 and 64 frames exactly.
+- **Kernel swap**: replacing `ggml_flash_attn_ext` with explicit
+  mul_mat/soft_max/mul_mat moves the failing lengths to 8/32/66/96 and changes
+  the magnitudes. A structural leak would not care which kernel runs.
 
-1. **Repeatability.** Same input twice → `0.000e+00`. The backend is
-   deterministic, so nothing here is run-to-run jitter.
-2. **The decisive one — change the future, hold the length.** Decode 64 frames,
-   then decode 64 frames again with only `codes[32:]` replaced. The samples the
-   first 32 frames are responsible for come back **bit-identical**
-   (`0.000e+00`). The future cannot reach the past. That is causality, tested
-   directly, and it is clean at every length from 64 to 512 frames.
-3. **Sweep over lengths.** Comparing `decode(N/2)` against `decode(N)`, every
-   pair is exactly zero *except* when `N/2` falls in [32, 64]. The step sits
-   precisely between 63 and 64 frames — `decode(N)[4396]` is `0.05063223` for
-   N ≤ 63 and `0.05052793` for N ≥ 64, with nothing in between.
-4. **Swap the attention implementation.** Replacing `ggml_flash_attn_ext` with
-   the explicit mul_mat/soft_max/mul_mat path moves the failing lengths
-   somewhere else entirely (8, 32, 66, 96 instead of 32–64) and changes the
-   magnitudes. A structural leak would not care which kernel computes it.
+**Cause:** attention sums over the keys in an order set by how the kernel
+blocks the row, so the sequence length changes the last bits; four
+transposed-conv stages with snake activations amplify that to ~1e-3.
 
-**What it actually is.** Attention sums over the keys, and the order it sums
-them in depends on how the kernel blocks a row — which depends on the number of
-keys, i.e. the sequence length. Different order, different last bits. The conv
-tower downstream then amplifies that: four transposed-conv stages with snake
-activations turn a 1e-7 perturbation into ~1e-3 at the output.
+**The tell, reusable as a diagnostic:** the difference always starts at sample
+1365 — exactly one frame. Frame 0 is bit-exact because its softmax has a single
+term, and one term sums the same way in any order. Frame 1 is the first with
+two. No state leak produces that boundary.
 
-The giveaway is *where* the difference starts: sample 1365, which is exactly
-one frame. **Frame 0 is always bit-exact** because its softmax has a single
-term — one term sums the same way in any order. Frame 1 is the first with two
-terms, and it is the first to differ. Nothing about a state leak would produce
-that boundary.
+**Magnitude:** chunked vs one-shot is a steady **-55 dB** below the signal on
+random codes (off-distribution, amplifies more); real speech is ~-67 dB. A
+floor, not a drift.
 
-**Magnitude.** Chunked decode sits a steady **-55 dB** below the signal across
-64–512 frames, on random codes — which drive the vocoder far off-distribution.
-Real utterances measure about -67 dB (correlation 0.9999999, identical RMS).
-Inaudible either way, and it is a floor, not a drift: it does not grow with
-length.
-
-**What changed.** `test_streaming_parity` now:
-- makes the future-change comparison the strict causality gate (must be
-  bit-exact);
-- keeps the different-length comparison but labels it informational, because
-  two decodes of different lengths can never be bit-identical for the reason
-  above;
-- judges streaming against one-shot on error energy relative to the signal
-  (-45 dB limit, ~10 dB of headroom over the measured floor) plus a
-  peak-relative click gate, instead of an absolute per-sample tolerance that
-  means nothing on a nonlinear generator;
-- reports repeatability, so a non-deterministic backend cannot masquerade as a
-  correctness failure.
-
-Reproduce:
+The test now gates on the future-change comparison (must be bit-exact), judges
+streaming against one-shot on error energy relative to the signal (-45 dB) plus
+a peak-relative click gate, and reports repeatability. Reproduce:
 
 ```bash
 QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build -R streaming
@@ -80,71 +53,51 @@ QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build -R streami
 ## 2. Voice cache is not invalidated across model variants
 
 **Status:** fixed 2026-08-20
-**Found:** 2026-08-19
 **Severity:** usability
 
-Speaker embeddings are as wide as the talker's `hidden_size` (0.6B → 1024,
-1.7B → 2048), but `cache.bin` was only validated against the sample's mtime and
-the cache format version — not against the model it was encoded with. Pointing
-a 0.6B model at a voices directory populated by the 1.7B one failed the
-synthesis outright, with no way out except deleting `cache.bin` in every voice
-folder by hand — and again on the way back.
+Speaker embeddings are as wide as the talker's `hidden_size` (0.6B 1024, 1.7B
+2048), but `cache.bin` was validated only against mtimes and the format
+version — not the model that wrote it. Pointing the other variant at the
+library failed every synth, with no way out but deleting every `cache.bin` by
+hand.
 
-`hdr.embedding_n` was already written into the header; nothing read it. The
-original note said the check was impossible because it needs the model loaded,
-which would force a lazy load in a path meant to be cheap. That was wrong: the
-server already snapshots `has_speaker_encoder` at load time for exactly this
-reason, so `VoiceStore` now takes the width the same way and `read_cache`
-compares against a plain integer, no model involved.
+`hdr.embedding_n` was already in the header; nothing read it. The old note
+claimed the check needed the model loaded — wrong: the server already
+snapshots `has_speaker_encoder` at load, so `VoiceStore` takes the width the
+same way and `read_cache` compares a plain integer.
 
-A mismatch is reported as staleness, not as an error, so it falls into the
-existing re-encode path and the fresh cache overwrites the old one. Every cache
-rejection now logs its reason — otherwise a variant switch just looks like a
-mysteriously slow startup.
+A mismatch is reported as *staleness*, so it falls into the existing re-encode
+path. Every cache rejection now logs its reason.
 
-**Cost of a switch:** the whole library re-encodes, ~10 s per voice (measured
-2026-08-20, CUDA, 14 voices, references 5–15 s long — 150 s total). That is the
-audio tokenizer's conv encoder, the same conv1d wall as the vocoder (see
-`ggml-notes.md`), so it will not get cheaper on its own.
+**Cost of a switch:** the whole library re-encodes, ~10 s per voice (14 voices,
+CUDA: 150 s). That is the audio tokenizer's conv encoder — the same conv1d wall
+as the vocoder.
 
-Naming the cache per width instead (`cache-1024.bin` / `cache-2048.bin`) would
-make switching free because both variants' caches would coexist. Not done:
-switching variants is rare, and one file per voice is simpler to reason about
-than two. Worth revisiting only if variant A/B testing becomes routine.
+Per-width filenames (`cache-1024.bin` / `cache-2048.bin`) would make switching
+free. Not done: switching is rare and one file per voice is simpler.
+
+---
 
 ## 3. `--temperature 0` degenerates
 
 **Status:** fixed 2026-08-20 (budget catches it, both front ends warn)
-**Found:** 2026-08-19
 **Severity:** usability / trap
 
-Greedy decoding is unstable on this model: it frequently runs to the 6144-frame
-cap and emits near-silence. Confirmed independent of backend and of the August
-changes (reproduced on the unmodified pre-sweep Vulkan binary, same input).
+Greedy decoding is unstable on this model: it frequently runs to the cap and
+emits near-silence. Independent of backend, reproduced on the pre-sweep binary.
 
-The option is documented and accepted, so a user reaching for "deterministic
-output" gets garbage plus a ~490-second wav. It also makes greedy useless as a
-benchmarking mode, which cost real debugging time — two apparent regressions
-during the sweep were this.
+Why it is worse than on a text LLM: the chosen codebook embeddings are summed
+back into the talker's next step embedding, so the model listens to itself.
+Without sampling noise, a state whose best continuation is "what I just did"
+is mathematically inescapable — and near-silence is exactly such a state,
+because the most predictable continuation of silence is more silence. Combined
+with a weak EOS (#11), it never stops.
 
-**Options:** detect codebook-0 repetition and break, warn when `temperature 0`
-is combined with a long input, or document it loudly.
-
-**Fixed 2026-08-20**, in two halves — as a trap, not as a mode.
-
-The per-request frame budget added for issue 11 bounds the damage: *when*
-greedy degenerates it now stops at the budget and returns an error, instead of
-quietly handing back ~490 seconds of near-silence. It does not fail every
-greedy run — a short line often completes normally (verified: "Проверка жадного
-декодирования." at `temperature: 0` returned 200 in 36 frames). The failure is
-input- and seed-dependent, which is exactly what made it confusing.
-
-So both front ends also warn whenever `temperature 0` is selected — the CLI on
-stderr before loading, the server per request — pointing at a low temperature
-with a fixed seed as the way to get repeatable output. The `--temperature` help
-text says the same.
-
-Greedy remains a bad mode on this model. It is no longer a silent one.
+**Fixed as a trap, not as a mode.** The frame budget bounds the damage when it
+degenerates, and both front ends warn on `temperature 0`, pointing at a low
+temperature with a fixed seed for repeatable output. It does not fail every
+greedy run — a short line often completes normally (verified: 36 frames, 200).
+The failure is input- and seed-dependent, which is what made it confusing.
 
 ---
 
@@ -217,58 +170,40 @@ and the missing language ids.
 ## 7. Codebook truncation breaks generation, not just fidelity
 
 **Status:** wontfix 2026-08-20 — the dial works, the payoff does not justify it
-**Found:** 2026-08-19
 **Severity:** design finding
 
-Truncating the RVQ chain was supposed to be the tunable speed/quality dial.
-It is implemented (`--codebooks N` / `TTS_CODEBOOKS`) and the cost scales
-exactly as predicted — code predictor 14.6 → 11.0 → 7.1 → 3.2 ms/frame at
-16/12/8/4 codebooks. The problem is what it does to the *text*:
+`--codebooks N` truncates the RVQ chain and does cut the code predictor
+proportionally (14.6 → 11.0 → 7.1 → 3.2 ms/frame at 16/12/8/4). The problem is
+what it does to the *text*:
 
 | codebooks | ASR of the output | audio length (43 s expected) |
 |---|---|---|
 | 16 | clean | 43.0 s |
 | 12 | clean | 41.5 s |
-| 8 | "беседно исчез 3-звучая иностранный пацан ик… ЧЕЛИЧМАЛЙЧНИ…" | 58.2 s |
+| 8 | "беседно исчез 3-звучая иностранный пацан ик…" | 58.2 s |
 | 4 | "из частной психиатрической клиники — personal Aloysius Sab!!!" | 48.6 s |
 
-The 0.6B model at 8 codebooks read the opening correctly and then ran to the
-6144-frame cap: **491 s of audio for a 43 s script**.
+**Why**: every predicted codebook's embedding is summed back into the talker's
+next step embedding. Zeroing the tail feeds the talker an input it never saw in
+training, it drifts out of distribution, and the *text* degrades — a language
+model failure, not a codec one.
 
-**Why**: the codebooks are not only a vocoder input. Every predicted codebook's
-embedding is summed back into the talker's next step embedding
-(`step_embd += code_pred_embd[cb][code]`). Zeroing the tail feeds the talker an
-input it never saw in training, it drifts out of distribution, and the *text*
-degrades — this is a language-model failure, not a codec one.
-
-So the dial does not trade fidelity for speed; below ~12 it trades coherence
-for speed, which is not a trade anyone wants. And at 12 the saving is ~3% RTF.
-
-**If revisited:** truncating only on the vocoder side keeps the talker sane but
-saves nothing (the VQ sum is not the expensive part — the 15 sequential
-code-predictor passes are). Making this work would need the talker fed
-something in-distribution for the dropped codebooks, e.g. a learned or averaged
-placeholder embedding rather than zero. Unvalidated idea.
-
-**Measured the ceiling 2026-08-20** (0.6B, CUDA, pipeline on, 461-char line,
-cloned voice, seed fixed). Per frame, because the two configurations produce
-different amounts of audio:
+**Measured ceiling** (0.6B, CUDA, pipeline on, 461-char line, fixed seed), per
+frame because the two produce different amounts of audio:
 
 | codebooks | code predictor | frames | total | per frame |
 |---|---|---|---|---|
 | 16 | 13.2 ms/frame | 313 | 20 459 ms | 65.4 ms |
 | 12 | 9.7 ms/frame | 338 | 21 569 ms | 63.8 ms |
 
-The code predictor really does get 3.5 ms/frame cheaper, and **2 ms of that
-never reaches the clock** — the generate/decode overlap was already hiding it.
-Net: **2.4%** at the last setting that still produces clean speech. Below 12 the
-text falls apart for the reason above, so that 2.4% is the whole prize.
+The predictor gets 3.5 ms/frame cheaper but **2 ms never reaches the clock** —
+the generate/decode overlap was already hiding it. Net **2.4%** at the last
+usable setting.
 
-Closing as wontfix. The placeholder-embedding idea might unlock 8 codebooks and
-perhaps 5%, but it is unvalidated, it risks quality on a dial nobody should be
-reaching for, and the vocoder — not the code predictor — is the wall
-(`optimization.md`). The flag stays: it is honest, documented, and useful for
-exactly this kind of measurement.
+Making it work below 12 would need the talker fed something in-distribution for
+the dropped codebooks (a learned or averaged placeholder, not zero).
+Unvalidated, worth maybe 5%, and the vocoder is the wall anyway. Flag stays as
+a research knob.
 
 ---
 
@@ -399,17 +334,18 @@ to occur at all.
 4067 chars → ~2890 frames average). Good enough to derive a per-request
 budget instead of the global 6144.
 
-**Ruled out:** the repetition penalty is not the cause. Re-running the same 15
-seeds with `--repetition-penalty 1.0` gave the same 1-in-15 rate (a different
-seed failed, as expected from a different sampling stream). The observation
-below still stands as a correctness nit, but it does not drive this bug.
+**Ruled out: the repetition penalty.** Re-running the same 15 seeds with
+`--repetition-penalty 1.0` gave the same 1-in-15 rate (a different seed failed,
+as expected from a different sampling stream). Separately worth knowing: the
+penalty at `tts_transformer.cpp:3033` is applied over *every* CB0 token
+generated so far, where HuggingFace uses a sliding window — on a 3000-frame
+generation that flattens a large part of the codec vocabulary. A correctness
+nit, not this bug.
 
-**Divergence from HuggingFace:** the repetition penalty at
-`tts_transformer.cpp:3033` is applied over *every* CB0 token generated so far
-(`generated_cb0_tokens` grows monotonically for the whole utterance), where
-HuggingFace applies it over a sliding window. On a 3000-frame generation this
-penalises a large fraction of the codec vocabulary and flattens the
-distribution. Worth an A/B at `--repetition-penalty 1.0` on the same seeds.
+**Ruled out: mixed script.** Upstream #318 blames Latin/digits inside another
+script. 60 runs here across plain Russian / Latin proper nouns / digits / all
+mixed, 12 seeds each: zero runaways. See #12 — that hunt found a bug in our
+guard instead.
 
 **Upstream:** this is a known defect of the model, not of this fork.
 [QwenLM/Qwen3-TTS#118](https://github.com/QwenLM/Qwen3-TTS/issues/118) reports
@@ -427,8 +363,9 @@ speech duration. So a guard on our side is the only available fix.
 **What was done:**
 
 1. `audio_token_budget()` (`qwen3_tts.h`) derives a per-request frame budget
-   from the input: 1.4 frames per character, 8 per Han/kana/hangul codepoint,
-   plus 128 frames of slack, clamped to `MAX_AUDIO_TOKENS`. Roughly 1.8x the
+   from the input: 1.4 frames per character, 8 per codepoint that is spoken as
+   a whole word (digits, Han, kana, hangul — see #12), plus 128 frames of
+   slack, clamped to `MAX_AUDIO_TOKENS`. Roughly 1.8x the
    worst case measured, because a false positive on a legitimately slow voice
    would be worse than a rare runaway running longer.
    `QWEN3_TTS_FRAME_BUDGET=0` disables it.
@@ -455,38 +392,16 @@ level-based detector would catch the collapse ~250 s in instead of ~466 s (the
 runaway drops ~6 dB and stays there), but it only works where the vocoder runs
 concurrently with generation — CUDA and ROCm, not Vulkan. Not implemented.
 
-**Candidate fixes**, best first:
-
-1. **Split long input into sentences** and generate per chunk. The failure
-   needs length; `ward.txt` at 43 s never failed in 40 tries. Also caps the
-   blast radius — a bad chunk costs seconds, not minutes.
-2. **Per-request frame budget** from input length (~1.4x of 0.70/char) instead
-   of the global cap. Blunt but always applies; would have cut seed 6 at
-   ~4000 frames instead of 6144.
-3. **Level-based stop.** The pipeline already decodes audio in chunks while
-   generating. Track the utterance's running level; stop after several
-   consecutive seconds far below it. Would have cut seed 6 at ~250 s.
-4. **Server-side retry** with a different seed when a guard fires — for
-   interactive use (game dialogue) this is the difference between a missing
-   line and a slightly late one.
-
-**Also found:** the CLI never sets `params.print_progress`, so the
-`decode: frame N/6144` progress lines are dead there. The server prints them
-under `TTS_VERBOSE=1`. Nothing else uses the flag, so CLI users have no way to
-see a runaway in progress.
-
 ---
 
 ## 12. Frame budget counted a digit as a letter
 
 **Status:** fixed 2026-08-20
-**Found:** 2026-08-20
 **Severity:** correctness (rejected valid input)
 
-The runaway guard from #11 budgets frames from the input length: 1.4 frames per
-letter, 8 per CJK codepoint, plus 128. Digits fell in the letter bucket. They
-should not: `25` is two characters but is spoken "двадцать пять", the same way
-one han character is spoken as a whole word.
+The #11 guard budgeted 1.4 frames per letter, 8 per CJK codepoint. Digits fell
+in the letter bucket. They should not: `25` is two characters spoken "двадцать
+пять", the same way one han character is spoken as a whole word.
 
 Measured on Russian NPC lines, 1.7B, cloned voice, 12 seeds each:
 
@@ -498,22 +413,15 @@ Measured on Russian NPC lines, 1.7B, cloned voice, 12 seeds each:
 | Latin and numbers | 163 | 6 | 136 | 38% |
 | inventory list | 159 | 27 | 224 | **64%** |
 
-A letter costs 0.71 frames; a digit costs 2.5–4.8. So the budget under-counts
-digit-dense text by roughly a factor of four, and the headroom evaporates as
-the digits pile up.
+A letter costs 0.71 frames, a digit 2.5–4.8 — under-counted about fourfold.
 
-**It was not theoretical.** A plain inventory line — `Опись склада: 12, 47, 8,
-56, ...`, 171 chars, 78 of them digits — got a 367-frame budget and needed
-370–394. Two of three seeds were cut off mid-list and returned a 500. That is
-the guard giving a wrong answer to a completely legitimate request, which is
-worse than the runaway it exists to catch.
+**Not theoretical.** `Опись склада: 12, 47, 8, 56, ...` (171 chars, 78 digits)
+got a 367-frame budget and needed 370–394: two of three seeds were cut off
+mid-list and returned a 500. Fixed by moving digits (ASCII and Arabic-Indic)
+into the CJK class; the line now budgets 882 and completes on all three seeds.
+**Text without digits is unaffected by a single frame.**
 
-Fixed by moving digits (ASCII and Arabic-Indic) into the same class as CJK. The
-stress line now budgets 882 frames and completes on all three seeds at 370–394.
-**Text without digits is unaffected — not by a single frame** — so the guard's
-behaviour on #11 is unchanged.
+Found while checking upstream #318's claim that mixed script raises the runaway
+risk. It does not — zero runaways in 60 runs. The bug was ours.
 
-Found while testing whether mixed-script input raises the runaway risk
-(upstream #318). It does not, as far as 60 runs can tell — zero runaways across
-plain / Latin / digits / mixed at 12 seeds each. The bug was ours.
-
+---

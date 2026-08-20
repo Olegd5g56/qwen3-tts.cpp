@@ -1,11 +1,6 @@
 # Qwen3-TTS GGML Optimization Report
 
-Performance characterization of this fork. Last updated **2026-08-19** after the
-August sweep (CUDA backend, KV windowing, generate/decode overlap).
-
-Historical note: earlier revisions of this document described a CPU-only
-baseline and then a Vulkan-on-RX-6800-XT baseline. Both are superseded — the
-numbers below were measured on the card this fork now targets.
+Performance characterization of this fork. Last updated **2026-08-20**.
 
 ## Summary
 
@@ -40,23 +35,13 @@ win, because they are the ones that can overlap the vocoder with generation:
 | GTX 1660 SUPER | CUDA + overlap | **0.530** |
 | GTX 1660 SUPER | Vulkan | 0.793 |
 
-Both old impressions were real measurements with since-removed causes. CUDA
-measured slower (45.6 vs 38.3 ms/frame generate) because the KV-window bug hit
-its flash-attention path harder than Vulkan's; fixing the window took CUDA to
-31.5 ms/frame and reversed the ranking. HIP measured slower on a ROCm/ggml pair
-that is now years out of date — with ROCm 7.2.4 and ggml 0.20.2, gfx1030 is a
-perfectly good target, and Arch's rocBLAS still ships Tensile kernels for it.
-(Separately, the April ggml no longer builds against CUDA 13.3, so the old
-revision cannot be re-measured without downgrading the toolkit.)
+Both cards used to rank the other way round; the causes are gone and written up
+in `known-issues.md` #9 (ROCm) and #10 (CUDA).
 
 ## 0.6B vs 1.7B — not a speed dial
 
-An earlier revision of this table listed the 0.6B at RTF 0.52 against the
-1.7B's 0.60 and implied it was the faster model. That was the same RTF mistake
-described under item 5 below: the two models do not produce the same amount of
-audio for the same text.
-
-Measured 2026-08-20 (CUDA, `ostro`, 5 runs each, means):
+The two models do not produce the same amount of audio for the same text, so
+RTF cannot compare them. Per frame, measured 2026-08-20 (CUDA, `ostro`, 5 runs each, means):
 
 | | prefill | talker | code predictor | frames | audio | VRAM |
 |---|---|---|---|---|---|---|
@@ -114,14 +99,12 @@ and not. The quality cost is audible.
    materialised before the chain. No measurable win on this card (the fusion
    still does not trigger), but the graph is no longer structurally hostile.
 
-5. **Shorter ICL reference audio** — originally reported here as the largest
-   remaining win, on the strength of an RTF comparison. **That was wrong**, and
-   the correction matters more than the original claim: RTF is time per second
-   of *produced* audio, so it silently rewards a configuration that makes the
-   model talk longer. The reference sets the speaking pace, and a shorter cut
-   changed it, so RTF was not comparing like with like.
+5. **Shorter ICL reference audio** — not the throughput win it was first
+   reported to be; the original claim came from an RTF comparison, which is
+   invalid here (see *Measurement notes*: the reference sets the speaking pace,
+   so it changes how much audio gets produced).
 
-   Re-measured 2026-08-20 (1.7B Base, CUDA, `ostro` 11.9 s vs the same voice
+   Measured 2026-08-20 (1.7B Base, CUDA, `ostro` 11.9 s vs the same voice
    cut to 3.2 s, 5 runs each, means):
 
    | | prefill | ms/frame | frames | audio | generate | RTF |
@@ -239,8 +222,8 @@ fusing the 15 passes into one graph bought only 3%.
 - **Do not compare configurations by RTF when they change how much audio the
   model produces.** RTF is time per second of output, so anything that makes
   the model speak longer for the same text looks faster. This is how the
-  reference-length recommendation above got written up backwards: RTF improved
-  by 20% while the actual request got no faster. Voice, reference sample,
+  reference-length item above got written up backwards: RTF improved by 20%
+  while the request got no faster. Voice, reference sample,
   instructions and temperature all move the produced duration — compare wall
   time per request, and report the produced duration alongside it.
 - Verify intelligibility, not just timing: transcribing the output with an ASR
