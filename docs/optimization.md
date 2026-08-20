@@ -18,7 +18,6 @@ clip, ICL cloned voice, default sampling (`temperature 0.9`, `top_k 50`).
 | End-to-end, long clip | 33.7 s | **22.9 s** |
 | RTF, long clip (lower is better) | 0.815 | **0.53** (1.9x realtime) |
 | RTF, short line, warm server, 1.7B | 0.70 | **0.60** |
-| RTF, short line, warm server, 0.6B | — | **0.52** |
 | Talker step, 500-frame context | 29.5 ms | **18.0 ms** |
 | Prefill (210 tokens) | 1450 ms | **415 ms** |
 
@@ -41,6 +40,34 @@ that is now years out of date — with ROCm 7.2.4 and ggml 0.20.2, gfx1030 is a
 perfectly good target, and Arch's rocBLAS still ships Tensile kernels for it.
 (Separately, the April ggml no longer builds against CUDA 13.3, so the old
 revision cannot be re-measured without downgrading the toolkit.)
+
+## 0.6B vs 1.7B — not a speed dial
+
+An earlier revision of this table listed the 0.6B at RTF 0.52 against the
+1.7B's 0.60 and implied it was the faster model. That was the same RTF mistake
+described under item 5 below: the two models do not produce the same amount of
+audio for the same text.
+
+Measured 2026-08-20 (CUDA, `ostro`, 5 runs each, means):
+
+| | prefill | talker | code predictor | frames | audio | VRAM |
+|---|---|---|---|---|---|---|
+| short line, 1.7B | 437 ms | 9.30 ms/frame | 13.62 ms/frame | 54 | 4.34 s | 2476 MiB |
+| short line, 0.6B | 193 ms | 5.68 ms/frame | 13.54 ms/frame | 51 | 4.05 s | 1414 MiB |
+| `ward.txt`, 1.7B | 832 ms | 10.46 ms/frame | 13.58 ms/frame | 506 | 40.45 s | 2620 MiB |
+| `ward.txt`, 0.6B | 352 ms | 6.74 ms/frame | 13.36 ms/frame | 554 | 44.35 s | 1558 MiB |
+
+The 0.6B makes the talker **36–39% cheaper** and halves prefill — but the code
+predictor is byte-for-byte the same 5-layer stack running 15 sequential passes
+per frame in both models, and the vocoder is literally the same GGUF. So
+per-frame cost falls only ~16% (22.9 → 19.2 ms), and the models differ by
+±10% in how much audio they produce for the same text, which is enough to
+swallow that. Wall-clock per request came out 5% *faster* on the short line and
+5% *slower* on `ward.txt`.
+
+**Choose the 0.6B for memory, not for speed:** ~1.06 GB less VRAM, consistently,
+which is the difference between fitting alongside something else on a 6 GB card
+and not. The quality cost is audible.
 
 ## What was done (August 2026)
 
