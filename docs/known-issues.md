@@ -89,7 +89,7 @@ than two. Worth revisiting only if variant A/B testing becomes routine.
 
 ## 3. `--temperature 0` degenerates
 
-**Status:** open
+**Status:** fixed 2026-08-20 (budget catches it, both front ends warn)
 **Found:** 2026-08-19
 **Severity:** usability / trap
 
@@ -104,6 +104,16 @@ during the sweep were this.
 
 **Options:** detect codebook-0 repetition and break, warn when `temperature 0`
 is combined with a long input, or document it loudly.
+
+**Fixed 2026-08-20**, in two halves. The per-request frame budget added for
+issue 11 catches the degenerate run: greedy now hits the budget and returns an
+error instead of quietly handing back ~490 seconds of near-silence. And both
+front ends warn when `temperature 0` is selected — the CLI on stderr before
+loading, the server per request — pointing at a low temperature with a fixed
+seed as the way to get repeatable output.
+
+Greedy is still a bad mode on this model; it is no longer a silent trap. The
+`--temperature` help text says so too.
 
 ---
 
@@ -149,14 +159,27 @@ proper multi-queue support — the AMD card would benefit most.
 
 ## 6. Stale architecture numbers in `AGENTS.md`
 
-**Status:** open
+**Status:** fixed 2026-08-20
 **Found:** 2026-08-19
 **Severity:** docs
 
-The "Model Architecture" section describes the talker as "28-layer Qwen2 (1024
-hidden ...)". The 1.7B model actually loads as `hidden_size=2048, n_layers=28`.
-The prefill-embedding and special-token sections below it were not re-checked
-against the current model.
+The "Model Architecture" section described the talker as "28-layer Qwen2 (1024
+hidden ...)" — true only for the 0.6B. The 1.7B is `hidden_size=2048`,
+`n_layers=28`, FFN 6144.
+
+Worse, the code predictor was described as "same attention config" as the
+talker. It is not: `code_predictor.embedding_length` is **1024 on both
+variants**. That is the structural reason the 0.6B is not proportionally faster
+end to end — the code predictor and the vocoder cost the same on both, only the
+talker shrinks (see `optimization.md`).
+
+Numbers now read off the ggufs directly, with the metadata keys listed so the
+next person checks rather than trusts.
+
+The prefill-embedding and special-token sections below it turned out to be
+**correct** — verified against `build_prefill_graph()` and `tts_transformer.h`.
+Added the two prefill variations they omitted (`nothink` path, ICL assembly)
+and the missing language ids.
 
 ---
 

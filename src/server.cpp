@@ -452,6 +452,16 @@ int main(int argc, char ** argv) {
                 stream_format.empty() ? "" : stream_format.c_str(),
                 qwen3_tts::utf8_codepoints(input), temperature, (long long)seed);
 
+        // Greedy decoding degenerates on this model (see known-issues 3): it
+        // loops and burns the whole frame budget on near-silence. Honour the
+        // request — it is a valid value — but say so, because the resulting
+        // 500 otherwise looks like a server fault.
+        if (temperature <= 0.0f) {
+            log_req(tls_req_id.c_str(),
+                    "warning: temperature 0 (greedy) is unreliable on this model and "
+                    "commonly hits the frame budget");
+        }
+
         // validate language
         int language_id = language_to_id(language);
         if (language_id < 0) {

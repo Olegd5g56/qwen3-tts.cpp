@@ -83,7 +83,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "      --voices-dir <d>   Voice library directory (same layout as the server)\n");
     fprintf(stderr, "      --list-voices      List available voices (built-in + library) and exit\n");
     fprintf(stderr, "  --streaming-batch-size <n> Decode in n-frame batches while generating (default: 0 = off)\n");
-    fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
+    fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9)\n"
+                    "                         0 = greedy, but greedy degenerates on this model\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  --codebooks <n>        RVQ codebooks to use, 1-16 (default: 16 = all).\n");
@@ -311,6 +312,17 @@ int main(int argc, char ** argv) {
     // (see set_verbose above); without this the per-frame decode progress and
     // the token counts never print, which hides a runaway while it happens.
     params.print_progress = true;
+
+    // Greedy decoding is unstable on this model — it frequently degenerates
+    // into a repeating loop and runs to the frame budget with near-silence.
+    // Not an error (it is occasionally useful for A/B work), but nobody should
+    // reach for it expecting "deterministic output" and get that instead.
+    if (params.temperature <= 0.0f) {
+        fprintf(stderr, "warning: temperature 0 (greedy) is unreliable on this model — "
+                        "it often degenerates into silence and runs to the frame budget. "
+                        "Use a low temperature (e.g. 0.3) with a fixed --seed for "
+                        "repeatable output instead.\n");
+    }
 
     if (!voice_name.empty() && !reference_audio.empty()) {
         fprintf(stderr, "Error: --voice and --reference are mutually exclusive\n");

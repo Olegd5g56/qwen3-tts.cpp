@@ -119,16 +119,27 @@ Backend initialization and scheduling notes:
 
 The TTS transformer has two sub-models:
 
-1. **Talker** — 28-layer Qwen2 transformer (1024 hidden, 16 heads, 8 KV heads, 128 head_dim)
-   - Input: prefill embedding or step embedding (float32, [1, 1024])
+1. **Talker** — 28-layer Qwen2 transformer, 16 heads / 8 KV heads / 128 head_dim
+   - **Hidden size differs by variant: 0.6B is 1024, 1.7B is 2048** (FFN 3072 /
+     6144). Everything downstream of the talker inherits this, including the
+     speaker embedding — which is why a voice library encoded by one variant is
+     not readable by the other (see `docs/known-issues.md` 2).
+   - Input: prefill embedding or step embedding (float32, `[1, hidden_size]`)
    - Output: hidden states + codec logits via `codec_head`
 
-2. **Code Predictor** — 5-layer transformer (same attention config)
+2. **Code Predictor** — 5-layer transformer, **1024 wide on both variants**
+   (FFN 3072, codebook vocab 2048). Not "the same config as the talker": on the
+   1.7B it is half the talker's width, which is why it costs the same on both
+   models and why the 0.6B is not proportionally faster end to end.
    - Input: talker hidden state + codebook-0 embedding (2-token prefill)
    - Output: 15 codebook predictions (autoregressive, one per step)
    - Has its own separate KV cache (max 16 tokens)
 
-### Prefill Embedding Structure (10 positions for single-word input)
+Read the real numbers off the gguf rather than trusting this list:
+`qwen3-tts.embedding_length`, `.block_count`, `.attention.head_count{,_kv}`,
+`.code_predictor.*`, `.speaker_encoder.embedding_length`.
+
+### Prefill Embedding Structure (10 positions for single-word input, thinking path)
 
 ```
 Pos 0:   text_projection(<|im_start|>)
@@ -143,16 +154,26 @@ Pos 8:   tts_bos + codec_embd(pad_id)
 Pos 9+:  text_projection(text_token[i]) + codec_embd(bos_id or pad_id)
 ```
 
-This structure must mirror the Python pipeline exactly.
+This structure must mirror the Python pipeline exactly. Verified against
+`build_prefill_graph()` on 2026-08-20 — it is accurate for the thinking path.
+Two variations it does not show: with `language_id < 0` the codec prefill is
+`[nothink, think_bos, think_eos]` instead of `[think, think_bos, language,
+think_eos]`, one position shorter; and ICL mode assembles a different prompt
+entirely (reference text and codes interleaved — see the comment on
+`icl_mode`).
 
 ### Special Token IDs
 
 ```
 tts_bos = 151672, tts_eos = 151673, tts_pad = 151671
 codec_bos = 2149, codec_eos = 2150, codec_pad = 2148
-codec_think = 2154, codec_think_bos = 2156, codec_think_eos = 2157
+codec_think = 2154, codec_nothink = 2155, codec_think_bos = 2156, codec_think_eos = 2157
 english_language_id = 2050
+russian = 2069, chinese = 2055, japanese = 2058, korean = 2064,
+german = 2053, french = 2061, spanish = 2054
 ```
+
+Verified against the ggufs and `tts_transformer.h` on 2026-08-20.
 
 ### Key Files to Understand
 
