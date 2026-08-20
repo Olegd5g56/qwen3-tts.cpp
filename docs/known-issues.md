@@ -105,15 +105,21 @@ during the sweep were this.
 **Options:** detect codebook-0 repetition and break, warn when `temperature 0`
 is combined with a long input, or document it loudly.
 
-**Fixed 2026-08-20**, in two halves. The per-request frame budget added for
-issue 11 catches the degenerate run: greedy now hits the budget and returns an
-error instead of quietly handing back ~490 seconds of near-silence. And both
-front ends warn when `temperature 0` is selected — the CLI on stderr before
-loading, the server per request — pointing at a low temperature with a fixed
-seed as the way to get repeatable output.
+**Fixed 2026-08-20**, in two halves — as a trap, not as a mode.
 
-Greedy is still a bad mode on this model; it is no longer a silent trap. The
-`--temperature` help text says so too.
+The per-request frame budget added for issue 11 bounds the damage: *when*
+greedy degenerates it now stops at the budget and returns an error, instead of
+quietly handing back ~490 seconds of near-silence. It does not fail every
+greedy run — a short line often completes normally (verified: "Проверка жадного
+декодирования." at `temperature: 0` returned 200 in 36 frames). The failure is
+input- and seed-dependent, which is exactly what made it confusing.
+
+So both front ends also warn whenever `temperature 0` is selected — the CLI on
+stderr before loading, the server per request — pointing at a low temperature
+with a fixed seed as the way to get repeatable output. The `--temperature` help
+text says the same.
+
+Greedy remains a bad mode on this model. It is no longer a silent one.
 
 ---
 
