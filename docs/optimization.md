@@ -13,6 +13,14 @@ numbers below were measured on the card this fork now targets.
 cores**), Ryzen 7 5700X, Q8_0 1.7B Base talker + F16 vocoder, ~42 s Russian
 clip, ICL cloned voice, default sampling (`temperature 0.9`, `top_k 50`).
 
+**Read the numbers in this table as warm-process numbers** — a server that has
+already answered one request for this voice. A cold process pays **~6.2 s more**
+for the ICL warm-up, where the vocoder decodes the reference frames before the
+first synthesis (measured 2026-08-20 as the gap between tokenize and prefill;
+it is cached per process, so the CLI pays it on every invocation and the server
+only once per voice). Comparing a CLI run against this table without accounting
+for that is how the 22.9 s below turns into an apparent 29.8 s.
+
 | Metric | Before | After |
 |--------|--------|-------|
 | End-to-end, long clip | 33.7 s | **22.9 s** |

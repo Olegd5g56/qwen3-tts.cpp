@@ -55,9 +55,25 @@ a 0.6B model at a voices directory populated by the 1.7B one fails the
 synthesis outright.
 
 Fixed the message to explain the cause and the workaround (separate voices dir
-per variant, or delete `cache.bin` to re-encode). The correct fix is for
-`VoiceStore::get_or_load` to treat a width mismatch as a stale cache, the same
-way an mtime mismatch is treated, and re-encode. Not done because the check
+per variant, or delete `cache.bin` to re-encode).
+
+**Confirmed in practice 2026-08-20.** Testing the 0.6B against a 1.7B-populated
+library means deleting `cache.bin` in every voice folder by hand, and going
+back means deleting them again — the whole library ends up in whichever
+variant's format was used last. `read_cache` validates the magic, the format
+version and both mtimes, but **not** `hdr.embedding_n`, which is right there in
+the header.
+
+Two ways to fix it:
+
+1. Compare `hdr.embedding_n` against the loaded model's hidden size and treat a
+   mismatch as stale, the same as an mtime mismatch. Minimal, but every model
+   switch then re-encodes the whole library.
+2. Name the cache per width — `cache-1024.bin`, `cache-2048.bin`. Both
+   variants' caches coexist, switching costs nothing, and the code is barely
+   longer. **Preferred.**
+
+The original note follows. Not done because the check
 needs the model loaded, which means taking `synth_mutex_` and forcing a lazy
 load in a path that is meant to be cheap.
 

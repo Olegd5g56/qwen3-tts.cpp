@@ -85,6 +85,11 @@ long treated as the remaining floor, is already free: making it instantaneous
 would take generation from 13.0 s to 6.2 s and change the total by nothing.
 Everything below the vocoder's 27.7 s is invisible until that number moves.
 
+The same kernel is also what makes a voice expensive to start using: the ICL
+warm-up decodes the reference frames through this convolution tower before the
+first synthesis, ~6.2 s for a 150-frame (11.9 s) reference. Shortening the
+reference or fixing the kernel are the only two ways to move it.
+
 ---
 
 ## Defaults and behaviours worth knowing
