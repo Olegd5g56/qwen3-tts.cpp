@@ -11,44 +11,69 @@ root cause still there) / **wontfix**.
 
 ## 1. Streaming decoder is not fully causal — `test_streaming_parity` fails
 
-**Status:** open
+**Status:** closed 2026-08-20 — not a bug; the test was asking the wrong question
 **Found:** 2026-08-19
-**Severity:** correctness (audio), currently inaudible
+**Severity:** none (was: correctness)
 
-`test_streaming_parity --tokenizer <vocoder.gguf>` fails, and has been failing
-since before the August sweep — verified by running the pre-change binary
-(`build-vulkan/`), which produces a bit-identical deviation:
+The original complaint: `decode(32)` did not reproduce the first 32 frames of
+`decode(64)` — max-abs 6.096e-03 against a 1e-4 tolerance, first deviation at
+sample 4396 — which looked like the decoder's tail/overlap state depending on
+future frames.
 
-```
-FAIL: max-abs-diff 6.096e-03 exceeds tol 1.000e-04
-causality: decode(32)[0:60885] vs decode(64)[0:60885] max_diff=6.096e-03
-  first deviation at 4396: half=0.050632 full=0.050528
-```
+**It does not.** Four measurements, all on the vocoder alone:
 
-The interesting half is the **causality** line, which does not involve the
-streaming driver at all: decoding 32 frames does not produce the same samples
-as the first 32 frames of a 64-frame decode. Something in the decoder's tail /
-overlap state depends on future frames, or a state ring is seeded differently
-depending on chunk length.
+1. **Repeatability.** Same input twice → `0.000e+00`. The backend is
+   deterministic, so nothing here is run-to-run jitter.
+2. **The decisive one — change the future, hold the length.** Decode 64 frames,
+   then decode 64 frames again with only `codes[32:]` replaced. The samples the
+   first 32 frames are responsible for come back **bit-identical**
+   (`0.000e+00`). The future cannot reach the past. That is causality, tested
+   directly, and it is clean at every length from 64 to 512 frames.
+3. **Sweep over lengths.** Comparing `decode(N/2)` against `decode(N)`, every
+   pair is exactly zero *except* when `N/2` falls in [32, 64]. The step sits
+   precisely between 63 and 64 frames — `decode(N)[4396]` is `0.05063223` for
+   N ≤ 63 and `0.05052793` for N ≥ 64, with nothing in between.
+4. **Swap the attention implementation.** Replacing `ggml_flash_attn_ext` with
+   the explicit mul_mat/soft_max/mul_mat path moves the failing lengths
+   somewhere else entirely (8, 32, 66, 96 instead of 32–64) and changes the
+   magnitudes. A structural leak would not care which kernel computes it.
 
-Practical impact looks nil so far — pipelined vs sequential full-utterance
-output matches at corr 0.9999999 with identical RMS, and no seam is audible.
-So either the deviation is benign numerical drift and the 1e-4 tolerance is
-unrealistic, or there is a real (small) state leak worth finding.
+**What it actually is.** Attention sums over the keys, and the order it sums
+them in depends on how the kernel blocks a row — which depends on the number of
+keys, i.e. the sequence length. Different order, different last bits. The conv
+tower downstream then amplifies that: four transposed-conv stages with snake
+activations turn a 1e-7 perturbation into ~1e-3 at the output.
 
-**To investigate:** narrow down which stage diverges — `stream_state` has
-per-layer KV vectors, causal-conv tail rings, and conv_transpose overlap
-buffers. Bisect by dumping intermediate activations at chunk boundaries.
+The giveaway is *where* the difference starts: sample 1365, which is exactly
+one frame. **Frame 0 is always bit-exact** because its softmax has a single
+term — one term sums the same way in any order. Frame 1 is the first with two
+terms, and it is the first to differ. Nothing about a state leak would produce
+that boundary.
 
-**Reproduce (2026-08-20):** the test is now registered with ctest and needs
-only a vocoder, no reference dumps:
+**Magnitude.** Chunked decode sits a steady **-55 dB** below the signal across
+64–512 frames, on random codes — which drive the vocoder far off-distribution.
+Real utterances measure about -67 dB (correlation 0.9999999, identical RMS).
+Inaudible either way, and it is a floor, not a drift: it does not grow with
+length.
+
+**What changed.** `test_streaming_parity` now:
+- makes the future-change comparison the strict causality gate (must be
+  bit-exact);
+- keeps the different-length comparison but labels it informational, because
+  two decodes of different lengths can never be bit-identical for the reason
+  above;
+- judges streaming against one-shot on error energy relative to the signal
+  (-45 dB limit, ~10 dB of headroom over the measured floor) plus a
+  peak-relative click gate, instead of an absolute per-sample tolerance that
+  means nothing on a nonlinear generator;
+- reports repeatability, so a non-deterministic backend cannot masquerade as a
+  correctness failure.
+
+Reproduce:
 
 ```bash
 QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build -R streaming
 ```
-
-It reproduces byte-for-byte the numbers above, so this is the one entry in this
-file with a standing regression test.
 
 ---
 

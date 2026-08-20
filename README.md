@@ -384,8 +384,10 @@ uv run python scripts/generate_deterministic_reference.py
 live in `build/test_*` and all take explicit paths — see the script for
 invocation.
 
-Note that `streaming_parity_test` currently **fails by design** on a real
-vocoder — see issue 1 in `docs/known-issues.md`.
+`streaming_parity_test` is the one with real coverage: it checks that the
+decoder cannot see the future, that chunked decode matches one-shot within the
+numerical floor, and that the backend is deterministic. See issue 1 in
+`docs/known-issues.md` for what its numbers mean.
 
 ## Acknowledgments
 
