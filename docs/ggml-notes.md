@@ -69,6 +69,22 @@ This is the single largest unexploited win seen in this project, and it would
 benefit every audio/TTS model on ggml, not just this one. It is a ggml-side
 project, not something that can be worked around in the caller.
 
+**It is now the *only* target left on this path** (measured 2026-08-20, one run
+of `ward.txt`, 1.7B, CUDA, `QWEN3_TTS_PIPELINE=0` so the two stages are timed
+separately):
+
+```
+generate  13 025 ms   25.1 ms/frame   (talker 10.1 + code predictor 13.1)
+decode    27 703 ms   53.4 ms/frame
+```
+
+The vocoder costs **twice the whole talker + code predictor**. With the
+pipeline on, generation hides entirely behind it — 7.5 s of the "generate"
+wall time is the talker blocked on the decode queue. So the code predictor,
+long treated as the remaining floor, is already free: making it instantaneous
+would take generation from 13.0 s to 6.2 s and change the total by nothing.
+Everything below the vocoder's 27.7 s is invisible until that number moves.
+
 ---
 
 ## Defaults and behaviours worth knowing

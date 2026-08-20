@@ -160,7 +160,8 @@ Short line (~4 s audio, 54 frames), warm server, 1.7B, CUDA:
   28 layers. Close to this card's GEMM throughput; the way to shrink it is a
   shorter reference sample, not a faster kernel.
 - **talker ~9 ms/frame**, **code predictor ~13 ms/frame**, embed lookups ~0.2.
-- **vocoder ~26 ms/frame**, now largely hidden behind generation.
+- **vocoder ~53 ms/frame** — twice the talker and code predictor combined, and
+  the thing everything else now hides behind, not the other way round.
 
 The code predictor is the standout: it costs the **same 13 ms/frame on the
 0.6B and the 1.7B model**, because it is 15 sequential 5-layer passes per frame
@@ -189,15 +190,33 @@ The code predictor is the standout: it costs the **same 13 ms/frame on the
 - **CUDA graphs** are enabled (`GGML_CUDA_GRAPHS=ON`, off by default in ggml)
   and do capture, but the generation loop is not launch-bound once the KV
   window is fixed, so they are not where the remaining time is.
+- **Vocoder decode batch size.** Swept 8→200 on `ward.txt` with a fixed seed
+  (identical 519 frames every run): 33.4 / 30.7 / 29.9 / 29.8 / 30.3 / 31.0 /
+  33.6 s for 8 / 16 / 32 / 64 / 100 / 128 / 200. A shallow optimum at 32–64
+  worth 2.6%, bounded on one side by the talker blocking on small inefficient
+  vocoder calls and on the other by the tail that has to be decoded after
+  generation ends. On a short line the ordering reverses — a batch bigger than
+  the utterance never overlaps at all (56-frame line: 9.41 s at 16, 9.64 s at
+  32, 10.28 s at 64) — so the default stays 16. Note the one-shot path uses a
+  separate hardcoded 100.
 - Everything in the June list still holds: persistent attention mask, decode
   batch 200/400/800, embedding lookup via host scratch, one-shot vocoder
   `decode()` for long clips.
 
 ## Remaining ideas (descending value)
 
-1. **Vocoder convolutions.** ~26 ms/frame, and `im2col`+`mul_mat` reaches only
-   ~12% of this card's FP32 peak. No cheap fix found; a direct conv1d kernel
-   would be a ggml-side project.
+1. **Vocoder convolutions — the only target left.** 53.4 ms/frame against
+   25.1 ms/frame for all of generation (`ward.txt`, 1.7B, CUDA, pipeline off so
+   the stages are timed apart: generate 13 025 ms, decode 27 703 ms). With the
+   pipeline on, 7.5 s of the generate wall is the talker blocked on the decode
+   queue. `im2col`+`mul_mat` reaches only ~12% of this card's FP32 peak; a
+   direct conv1d kernel would be a ggml-side project. See `docs/ggml-notes.md`.
+
+   The consequence for everything else: **the code predictor is already free.**
+   At 13.1 ms/frame it looked like the floor, but it sits inside the 25.1 ms
+   that the vocoder's 53.4 ms already covers. Making it instantaneous would
+   move generation from 13.0 s to 6.2 s and the total by nothing. Do not spend
+   effort there until the vocoder number moves.
 
 ## Measurement notes
 
