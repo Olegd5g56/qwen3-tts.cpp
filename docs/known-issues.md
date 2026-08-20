@@ -216,7 +216,7 @@ and the missing language ids.
 
 ## 7. Codebook truncation breaks generation, not just fidelity
 
-**Status:** open (feature shipped behind `--codebooks`, but its useful range is tiny)
+**Status:** wontfix 2026-08-20 — the dial works, the payoff does not justify it
 **Found:** 2026-08-19
 **Severity:** design finding
 
@@ -249,6 +249,26 @@ saves nothing (the VQ sum is not the expensive part — the 15 sequential
 code-predictor passes are). Making this work would need the talker fed
 something in-distribution for the dropped codebooks, e.g. a learned or averaged
 placeholder embedding rather than zero. Unvalidated idea.
+
+**Measured the ceiling 2026-08-20** (0.6B, CUDA, pipeline on, 461-char line,
+cloned voice, seed fixed). Per frame, because the two configurations produce
+different amounts of audio:
+
+| codebooks | code predictor | frames | total | per frame |
+|---|---|---|---|---|
+| 16 | 13.2 ms/frame | 313 | 20 459 ms | 65.4 ms |
+| 12 | 9.7 ms/frame | 338 | 21 569 ms | 63.8 ms |
+
+The code predictor really does get 3.5 ms/frame cheaper, and **2 ms of that
+never reaches the clock** — the generate/decode overlap was already hiding it.
+Net: **2.4%** at the last setting that still produces clean speech. Below 12 the
+text falls apart for the reason above, so that 2.4% is the whole prize.
+
+Closing as wontfix. The placeholder-embedding idea might unlock 8 codebooks and
+perhaps 5%, but it is unvalidated, it risks quality on a dial nobody should be
+reaching for, and the vocoder — not the code predictor — is the wall
+(`optimization.md`). The flag stays: it is honest, documented, and useful for
+exactly this kind of measurement.
 
 ---
 

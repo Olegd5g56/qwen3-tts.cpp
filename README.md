@@ -152,14 +152,19 @@ is actually in the file.
 `--codebooks N` (or `TTS_CODEBOOKS`) truncates the RVQ chain to N of 16.
 It does cut the code predictor proportionally, but **the codebooks feed back
 into the talker**, so dropping them degrades the spoken text, not just the
-timbre: clean down to 12 (~3% faster), incoherent at 8, unusable at 4. Left in
-as a research knob — see `docs/known-issues.md` #7 before reaching for it.
+timbre: clean down to 12, incoherent at 8, unusable at 4. And 12 buys only
+**2.4%** per frame, because the generate/decode overlap was already hiding half
+of what the code predictor costs. Left in as a research knob — see
+`docs/known-issues.md` #7 before reaching for it.
 
-Speed/quality trade-off: the 0.6B Base talker is roughly 15% faster end to end
-than the 1.7B and about 3x cheaper on prefill, at some cost in voice fidelity.
-Speaker embeddings are as wide as the talker's hidden size, so **each model
-variant needs its own voices directory** (0.6B and 1.7B caches are not
-interchangeable).
+Choosing a variant: the 0.6B Base is **not** a speed dial. Only the talker
+shrinks; the code predictor is 1024 wide on both and the vocoder is shared, so
+per frame it lands ~16% cheaper and the difference in how much audio it decides
+to produce eats most of that. What it does buy is about 1 GB less VRAM, at an
+audible cost in fidelity. Speaker embeddings are as wide as the talker's hidden
+size, so a voice library encoded by one variant cannot be read by the other —
+the cache notices and re-encodes itself (~10 s per voice, once per switch), so
+one voices directory is fine for both.
 
 See `docs/optimization.md` for the measured breakdown.
 
