@@ -238,6 +238,20 @@ All flags have matching `TTS_*` env vars (CLI > env > default).
 }
 ```
 
+**`language` is one token, and it applies to the whole request.** It becomes a
+single codec embedding in the prefill (position 5: `tts_pad +
+codec_embd(language_id)`), so it sets the mode for the entire utterance — there
+is no way to mark one clause as English and the next as Russian, and splitting
+the input by script is not something the server does.
+
+In practice that is fine: **set it to the carrier language and let foreign
+inclusions ride along.** Latin proper nouns and whole embedded English
+sentences come out cleanly under `"language": "ru"`, evenly and without a seam
+at the switch (listening check, 2026-08-20, cloned Russian voice). Tagging the
+same line `en` measurably changes delivery — the same sentence ran 7.76 s as
+`ru` and 8.16 s as `en` — so it is worth a listen if a line is genuinely
+half-and-half, but the carrier language is the right default.
+
 - **Default** (no `stream_format`): full audio body after generation completes.
 - **`stream_format=audio`**: HTTP chunked transfer in the chosen
   `response_format`. WAV uses a placeholder-size header so playback starts
