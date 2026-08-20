@@ -136,7 +136,7 @@ Environment knobs, all optional:
 | `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/Metal, off for Vulkan (where two backend instances serialise). `1`/`0` forces it. |
 | `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch when the caller is not streaming. Smaller starts the overlap earlier; larger amortises per-batch cost. Measured on `ward.txt` (519 frames, fixed seed): 8 → 33.4 s, 16 → 30.7 s, 32 → 29.9 s, 64 → 29.8 s, 128 → 31.0 s, 200 → 33.6 s. The 2.6% at 32–64 does not carry over to short lines — a batch larger than the whole utterance never overlaps at all, and the tail has to be decoded after generation ends, so 16 stays the default. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table for the generation and vocoder graphs. Diagnostic only — it disables kernel fusion and syncs per node. |
-| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from the input length, because the model occasionally never emits an end-of-speech token and would otherwise run to 491 s of audio. Set to `0` to disable if a legitimate synthesis ever trips it. See `docs/known-issues.md` #11. |
+| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from the input length, because the model occasionally never emits an end-of-speech token and would otherwise run to 491 s of audio. The cap is per script — a letter is budgeted at 1.4 frames, a digit or CJK codepoint at 8, since those are spoken as whole words. Set to `0` to disable if a legitimate synthesis ever trips it. See `docs/known-issues.md` #11 and #12. |
 
 **Pick cloned-voice reference samples for prosody, not for length.** The
 reference is prepended to every prompt, so trimming a 12-second sample to

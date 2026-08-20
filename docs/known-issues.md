@@ -474,3 +474,46 @@ concurrently with generation — CUDA and ROCm, not Vulkan. Not implemented.
 `decode: frame N/6144` progress lines are dead there. The server prints them
 under `TTS_VERBOSE=1`. Nothing else uses the flag, so CLI users have no way to
 see a runaway in progress.
+
+---
+
+## 12. Frame budget counted a digit as a letter
+
+**Status:** fixed 2026-08-20
+**Found:** 2026-08-20
+**Severity:** correctness (rejected valid input)
+
+The runaway guard from #11 budgets frames from the input length: 1.4 frames per
+letter, 8 per CJK codepoint, plus 128. Digits fell in the letter bucket. They
+should not: `25` is two characters but is spoken "двадцать пять", the same way
+one han character is spoken as a whole word.
+
+Measured on Russian NPC lines, 1.7B, cloned voice, 12 seeds each:
+
+| line | chars | digits | frames | budget used |
+|---|---|---|---|---|
+| plain Russian | 145 | 0 | 103 | 31% |
+| + Latin proper nouns | 161 | 0 | 114 | 32% |
+| + a few numbers | 140 | 7 | 112 | 35% |
+| Latin and numbers | 163 | 6 | 136 | 38% |
+| inventory list | 159 | 27 | 224 | **64%** |
+
+A letter costs 0.71 frames; a digit costs 2.5–4.8. So the budget under-counts
+digit-dense text by roughly a factor of four, and the headroom evaporates as
+the digits pile up.
+
+**It was not theoretical.** A plain inventory line — `Опись склада: 12, 47, 8,
+56, ...`, 171 chars, 78 of them digits — got a 367-frame budget and needed
+370–394. Two of three seeds were cut off mid-list and returned a 500. That is
+the guard giving a wrong answer to a completely legitimate request, which is
+worse than the runaway it exists to catch.
+
+Fixed by moving digits (ASCII and Arabic-Indic) into the same class as CJK. The
+stress line now budgets 882 frames and completes on all three seeds at 370–394.
+**Text without digits is unaffected — not by a single frame** — so the guard's
+behaviour on #11 is unchanged.
+
+Found while testing whether mixed-script input raises the runaway risk
+(upstream #318). It does not, as far as 60 runs can tell — zero runaways across
+plain / Latin / digits / mixed at 12 seeds each. The bug was ours.
+

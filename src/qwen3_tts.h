@@ -54,7 +54,7 @@ inline size_t utf8_codepoints(const std::string & s) {
 // than letting a rare runaway run a little longer.
 inline int32_t audio_token_budget(const std::string & text, int32_t hard_cap) {
     size_t chars = 0;
-    size_t dense = 0;  // codepoints that carry a full syllable
+    size_t dense = 0;  // codepoints spoken as a whole word, not as a letter
     for (size_t i = 0; i < text.size(); ) {
         const unsigned char c = text[i];
         uint32_t cp = c;
@@ -68,7 +68,9 @@ inline int32_t audio_token_budget(const std::string & text, int32_t hard_cap) {
         }
         i += len;
         ++chars;
-        if ((cp >= 0x3040 && cp <= 0x30FF) ||   // kana
+        if ((cp >= 0x0030 && cp <= 0x0039) ||   // ascii digits
+            (cp >= 0x0660 && cp <= 0x0669) ||   // arabic-indic digits
+            (cp >= 0x3040 && cp <= 0x30FF) ||   // kana
             (cp >= 0x3400 && cp <= 0x9FFF) ||   // han
             (cp >= 0xAC00 && cp <= 0xD7AF) ||   // hangul
             (cp >= 0xF900 && cp <= 0xFAFF)) {   // han compatibility
@@ -77,6 +79,13 @@ inline int32_t audio_token_budget(const std::string & text, int32_t hard_cap) {
     }
     // One dense codepoint is worth far more audio than one letter, so mixed
     // text is budgeted per script rather than by picking a single constant.
+    //
+    // Digits belong in that class: "25" is two characters but is spoken
+    // "twenty-five", the same way one han character is spoken as a whole word.
+    // Measured on Russian NPC lines (1.7B, 12 seeds each): a letter costs
+    // 0.71 frames, a digit 2.5-4.8. Budgeting digits as letters made a plain
+    // inventory list — "Опись склада: 12, 47, 8, 56, ..." — hit the budget and
+    // fail on 2 of 3 seeds, which is a wrong answer to a legitimate request.
     const double frames = (double) (chars - dense) * 1.4 + (double) dense * 8.0;
     // Floor: very short inputs still need room for lead-in silence and a tail.
     int32_t budget = (int32_t) frames + 128;
