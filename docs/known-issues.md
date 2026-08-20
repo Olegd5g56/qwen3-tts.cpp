@@ -44,40 +44,38 @@ buffers. Bisect by dumping intermediate activations at chunk boundaries.
 
 ## 2. Voice cache is not invalidated across model variants
 
-**Status:** mitigated (error message only)
+**Status:** fixed 2026-08-20
 **Found:** 2026-08-19
 **Severity:** usability
 
 Speaker embeddings are as wide as the talker's `hidden_size` (0.6B → 1024,
-1.7B → 2048), but `cache.bin` is only validated against the sample's mtime and
+1.7B → 2048), but `cache.bin` was only validated against the sample's mtime and
 the cache format version — not against the model it was encoded with. Pointing
-a 0.6B model at a voices directory populated by the 1.7B one fails the
-synthesis outright.
+a 0.6B model at a voices directory populated by the 1.7B one failed the
+synthesis outright, with no way out except deleting `cache.bin` in every voice
+folder by hand — and again on the way back.
 
-Fixed the message to explain the cause and the workaround (separate voices dir
-per variant, or delete `cache.bin` to re-encode).
+`hdr.embedding_n` was already written into the header; nothing read it. The
+original note said the check was impossible because it needs the model loaded,
+which would force a lazy load in a path meant to be cheap. That was wrong: the
+server already snapshots `has_speaker_encoder` at load time for exactly this
+reason, so `VoiceStore` now takes the width the same way and `read_cache`
+compares against a plain integer, no model involved.
 
-**Confirmed in practice 2026-08-20.** Testing the 0.6B against a 1.7B-populated
-library means deleting `cache.bin` in every voice folder by hand, and going
-back means deleting them again — the whole library ends up in whichever
-variant's format was used last. `read_cache` validates the magic, the format
-version and both mtimes, but **not** `hdr.embedding_n`, which is right there in
-the header.
+A mismatch is reported as staleness, not as an error, so it falls into the
+existing re-encode path and the fresh cache overwrites the old one. Every cache
+rejection now logs its reason — otherwise a variant switch just looks like a
+mysteriously slow startup.
 
-Two ways to fix it:
+**Cost of a switch:** the whole library re-encodes, ~10 s per voice (measured
+2026-08-20, CUDA, 14 voices, references 5–15 s long — 150 s total). That is the
+audio tokenizer's conv encoder, the same conv1d wall as the vocoder (see
+`ggml-notes.md`), so it will not get cheaper on its own.
 
-1. Compare `hdr.embedding_n` against the loaded model's hidden size and treat a
-   mismatch as stale, the same as an mtime mismatch. Minimal, but every model
-   switch then re-encodes the whole library.
-2. Name the cache per width — `cache-1024.bin`, `cache-2048.bin`. Both
-   variants' caches coexist, switching costs nothing, and the code is barely
-   longer. **Preferred.**
-
-The original note follows. Not done because the check
-needs the model loaded, which means taking `synth_mutex_` and forcing a lazy
-load in a path that is meant to be cheap.
-
----
+Naming the cache per width instead (`cache-1024.bin` / `cache-2048.bin`) would
+make switching free because both variants' caches would coexist. Not done:
+switching variants is rare, and one file per voice is simpler to reason about
+than two. Worth revisiting only if variant A/B testing becomes routine.
 
 ## 3. `--temperature 0` degenerates
 

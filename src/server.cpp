@@ -161,6 +161,7 @@ int main(int argc, char ** argv) {
     const std::string              cached_model_type          = tts->get_model_type();
     const std::vector<std::string> cached_speaker_names       = tts->get_speaker_names();
     const bool                     cached_has_speaker_encoder = tts->has_speaker_encoder();
+    const int32_t                  cached_embedding_width     = tts->get_hidden_size();
 
     log_info("models loaded in %lld ms (type=%s, speakers=%zu, threads=%d)",
              (long long)t_load_ms, cached_model_type.c_str(),
@@ -188,7 +189,8 @@ int main(int argc, char ** argv) {
 
     // persistent on-disk voice library; manages embeddings and ICL caches.
     VoiceStore voice_store(sp.voices_dir, ensure_loaded,
-                            cached_has_speaker_encoder, &synth_mutex);
+                            cached_has_speaker_encoder, cached_embedding_width,
+                            &synth_mutex);
     if (!sp.voices_dir.empty()) {
         voice_store.refresh();
         auto discovered = voice_store.list();

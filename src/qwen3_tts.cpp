@@ -652,15 +652,16 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
 
     const int32_t expected_size = transformer_.get_config().hidden_size;
     if (embedding_size != expected_size) {
-        // Speaker embeddings are as wide as the talker's hidden size, so a
-        // voice library encoded against one model variant cannot be reused by
-        // another (0.6B is 1024 wide, 1.7B is 2048). Point at the fix instead
-        // of just reporting the mismatch.
+        // Speaker embeddings are as wide as the talker's hidden size, so an
+        // embedding produced against one model variant cannot be reused by
+        // another (0.6B is 1024 wide, 1.7B is 2048). VoiceStore re-encodes
+        // across a variant switch on its own, so reaching this point means the
+        // embedding came from somewhere else — a caller-supplied one via the
+        // C API.
         result.error_msg = "Speaker embedding is " + std::to_string(embedding_size)
                          + " wide but this model expects " + std::to_string(expected_size)
-                         + " — the voice was encoded with a different model variant."
-                           " Use a separate voices directory per variant, or delete"
-                           " cache.bin in the voice folder to re-encode it.";
+                         + " — it was produced by a different model variant."
+                           " Re-extract it with this model.";
         return result;
     }
 

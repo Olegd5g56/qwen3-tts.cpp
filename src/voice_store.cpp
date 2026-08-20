@@ -70,10 +70,12 @@ int64_t now_ms() {
 } // namespace
 
 VoiceStore::VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
-                        bool has_speaker_encoder, std::mutex * synth_mutex)
+                        bool has_speaker_encoder, int32_t embedding_width,
+                        std::mutex * synth_mutex)
     : root_(std::move(root_dir)),
       ensure_loaded_(std::move(ensure_loaded)),
       has_speaker_encoder_(has_speaker_encoder),
+      embedding_width_(embedding_width),
       synth_mutex_(synth_mutex) {}
 
 bool VoiceStore::can_encode_new() const {
@@ -216,6 +218,12 @@ bool VoiceStore::load_voice_locked(const std::string & id, voice_entry & out,
         return true;
     }
 
+    // Say why the cache was rejected — otherwise a variant switch just looks
+    // like a mysteriously slow startup. "no cache" is the normal first run.
+    if (cerr != "no cache") {
+        log_info("voice %s: re-encoding — %s", id.c_str(), cerr.c_str());
+    }
+
     // No valid cache — must re-encode.
     if (!has_speaker_encoder_) {
         error = "no valid cache and model lacks speaker encoder";
@@ -297,6 +305,17 @@ bool VoiceStore::read_cache(const std::string & dir, voice_entry & out,
     }
     if (hdr.ref_codes_n > 16u * 1000000u || hdr.n_ref_frames > 1000000u) {
         error = "corrupt cache (ref codes " + std::to_string(hdr.ref_codes_n) + ")";
+        return false;
+    }
+
+    // Speaker embeddings are as wide as the talker hidden size, so a cache
+    // written by another model variant is unusable. Treat it as stale: the
+    // caller re-encodes and overwrites it, which costs one encode per voice
+    // on the first run after a variant switch and nothing afterwards.
+    if (embedding_width_ > 0 && hdr.embedding_n != (uint32_t)embedding_width_) {
+        error = "stale (encoded by a different model variant: " +
+                std::to_string(hdr.embedding_n) + " wide, this model is " +
+                std::to_string(embedding_width_) + ")";
         return false;
     }
 

@@ -357,7 +357,8 @@ int main(int argc, char ** argv) {
     std::mutex synth_mutex;
     std::function<qwen3_tts::Qwen3TTS*()> ensure_loaded = [&tts]() { return &tts; };
     qwen3_tts::VoiceStore voice_store(voices_dir, ensure_loaded,
-                                       tts.has_speaker_encoder(), &synth_mutex);
+                                       tts.has_speaker_encoder(),
+                                       tts.get_hidden_size(), &synth_mutex);
     if (!voices_dir.empty()) {
         voice_store.refresh();
     }

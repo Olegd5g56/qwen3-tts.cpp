@@ -57,8 +57,13 @@ struct preload_progress {
 // respect this themselves.
 class VoiceStore {
 public:
+    // embedding_width is the talker hidden size of the currently loaded
+    // model (0.6B = 1024, 1.7B = 2048). Caches written by a different variant
+    // are treated as stale and re-encoded instead of failing at synth time.
+    // Pass 0 to skip the check.
     VoiceStore(std::string root_dir, EnsureLoadedFn ensure_loaded,
-               bool has_speaker_encoder, std::mutex * synth_mutex);
+               bool has_speaker_encoder, int32_t embedding_width,
+               std::mutex * synth_mutex);
 
     // Rescan root_ and rebuild the disk index. Cheap: only directory listing
     // and a few stat() calls per voice, no audio I/O or encoding. Drops
@@ -124,6 +129,7 @@ private:
     std::string     root_;
     EnsureLoadedFn  ensure_loaded_;
     bool            has_speaker_encoder_;
+    int32_t         embedding_width_;
     std::mutex *    synth_mutex_;
     std::mutex      map_mutex_;
     std::map<std::string, disk_voice_info> disk_index_;

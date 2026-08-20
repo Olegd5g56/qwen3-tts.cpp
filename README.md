@@ -279,7 +279,10 @@ server's perspective — you manage it by editing files.
 ```
 
 The server pre-warms the whole library at startup. Cache invalidation is by
-file mtime, so editing the sample re-encodes on next use.
+file mtime, so editing the sample re-encodes on next use. The cache also
+records the model's talker width, so pointing a different variant at the same
+library (0.6B is 1024 wide, 1.7B is 2048) re-encodes it instead of failing —
+about 10 s per voice, once per switch.
 `DELETE /v1/audio/voices/:id` returns **409** on a disk-backed id — delete
 the directory instead.
 
