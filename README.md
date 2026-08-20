@@ -138,13 +138,16 @@ Environment knobs, all optional:
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table for the generation and vocoder graphs. Diagnostic only — it disables kernel fusion and syncs per node. |
 | `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from the input length, because the model occasionally never emits an end-of-speech token and would otherwise run to 491 s of audio. Set to `0` to disable if a legitimate synthesis ever trips it. See `docs/known-issues.md` #11. |
 
-**Keep cloned-voice reference samples short — 3–5 seconds.** The reference is
-prepended to every prompt, so its length is paid in prefill *and* in each
-generation step's attention window, plus once more in the vocoder warm-up the
-first time a voice is used. Trimming a 12-second sample to 3 seconds took RTF
-from 0.665 to 0.518 and halved the first call for that voice, with no loss of
-intelligibility. Cut `sample.txt` at the same point as the audio — the
-transcript has to match what is actually in the file.
+**Pick cloned-voice reference samples for prosody, not for length.** The
+reference is prepended to every prompt, so trimming a 12-second sample to
+3 seconds takes a fixed ~290 ms off prompt processing and roughly halves the
+first call for that voice. It does **not** speed up synthesis overall: the
+reference also sets the speaking pace, and the short cut made the model produce
+8–15% more audio for the same text, which cancels the saving on a short line
+and reverses it on a long one. See `docs/optimization.md` for the numbers.
+Choose a sample whose delivery matches the lines you will generate, and cut
+`sample.txt` at the same point as the audio — the transcript has to match what
+is actually in the file.
 
 `--codebooks N` (or `TTS_CODEBOOKS`) truncates the RVQ chain to N of 16.
 It does cut the code predictor proportionally, but **the codebooks feed back

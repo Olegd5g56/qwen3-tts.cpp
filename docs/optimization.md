@@ -79,34 +79,45 @@ revision cannot be re-measured without downgrading the toolkit.)
    materialised before the chain. No measurable win on this card (the fusion
    still does not trigger), but the graph is no longer structurally hostile.
 
-5. **Shorter ICL reference audio** — a configuration change, not a code change,
-   and the largest remaining win. The reference sample is prepended to the
-   prompt, so its length is paid twice: once in prefill, and once per step in
-   the attention window. Trimming `ostro` from 11.9 s to 3.2 s (cutting the
-   transcript at the same sentence boundary):
+5. **Shorter ICL reference audio** — originally reported here as the largest
+   remaining win, on the strength of an RTF comparison. **That was wrong**, and
+   the correction matters more than the original claim: RTF is time per second
+   of *produced* audio, so it silently rewards a configuration that makes the
+   model talk longer. The reference sets the speaking pace, and a shorter cut
+   changed it, so RTF was not comparing like with like.
 
-   | reference | prefill | RTF, warm | first call for that voice |
-   |---|---|---|---|
-   | 11.9 s (as shipped) | 413 ms | 0.665 | 7118 ms |
-   | 10.6 s | 408 ms | 0.654 | 6247 ms |
-   | 6.8 s | 264 ms | 0.582 | 5072 ms |
-   | 3.2 s | 160 ms | **0.518** | **3639 ms** |
+   Re-measured 2026-08-20 (1.7B Base, CUDA, `ostro` 11.9 s vs the same voice
+   cut to 3.2 s, 5 runs each, means):
 
-   22% off steady-state RTF and roughly half off the first call for a voice
-   (the ICL vocoder warm-up decodes the reference frames, so it scales with
-   the sample too). Intelligibility unaffected — ASR is clean at every length.
-   The transcript in `sample.txt` must be cut to match the audio, so this is
-   not safe to automate from the audio alone.
+   | | prefill | ms/frame | frames | audio | generate | RTF |
+   |---|---|---|---|---|---|---|
+   | short line, 11.9 s ref | 446 ms | 23.04 | 53.2 | 4.26 s | 1.67 s | 0.393 |
+   | short line, 3.2 s ref | 172 ms | 22.26 | 61.0 | 4.88 s | 1.53 s | 0.313 |
+   | `ward.txt`, 11.9 s ref | 836 ms | 23.94 | 517 | 41.4 s | 13.21 s | 0.319 |
+   | `ward.txt`, 3.2 s ref | 547 ms | 23.58 | 559 | 44.7 s | 13.73 s | 0.307 |
 
-   Listening note: quality across these is **not monotonic in length**. The
-   3.2 s and the full 11.9 s reference both sound better than the 6.8 s and
-   10.6 s ones. The short cut happens to contain two questions with rising
-   intonation, matching the (interrogative) target line; the mid-length cuts
-   add flat narrative speech and blur the delivery, while the full sample is
-   long enough to cover the whole voice again. So the practical rule for
-   picking a reference is **match the prosody of the lines you will generate**,
-   not maximise duration — a short, on-register sample beats a long mixed one
-   and costs a quarter as much.
+   What is real: the reference is prepended to the prompt, so trimming it takes
+   **a fixed ~290 ms off prompt processing** per call, and roughly halves the
+   first call for a voice (the ICL vocoder warm-up decodes the reference
+   frames). Per-frame cost barely moves — 2–3%, because the attention window
+   grows past the reference length within a few hundred frames either way.
+
+   What is not real: a throughput win. The 3.2 s cut makes the model produce
+   **more audio for the same text** — +15% on a short line, +8% on `ward.txt`.
+   Those extra frames cost more than the 290 ms saved as soon as the line is
+   long enough. End to end on a warm server, a short line came out at
+   3.001 s ±0.141 with the long reference and 2.921 s ±0.179 with the short
+   one — a 2.7% difference inside the run-to-run scatter — while `ward.txt`
+   was **3.9% slower** with the short reference.
+
+   So: pick a reference for **prosody and for cold-start cost**, not for
+   throughput. Quality across lengths is not monotonic either — the 3.2 s and
+   the full 11.9 s cut both sound better than the 6.8 s and 10.6 s ones. The
+   short cut contains two questions with rising intonation that match an
+   interrogative target line; the mid-length cuts add flat narrative speech and
+   blur the delivery. Match the register of the lines you will generate. The
+   transcript in `sample.txt` must be cut to match the audio, so none of this
+   is safe to automate from the audio alone.
 
 6. **Opt-in per-op profiler** (`src/op_profiler.{h,cpp}`, `QWEN3_TTS_PROFILE_OPS=1`).
    Hooks the scheduler's eval callback and reports per (op, shape) totals for
@@ -167,5 +178,12 @@ The code predictor is the standout: it costs the **same 13 ms/frame on the
   sampling, and greedy (`--temperature 0`) is unstable on this model — it can
   run to the 6144-frame cap and produce near-silence. Two of this sweep's
   early "regressions" were that, not code.
+- **Do not compare configurations by RTF when they change how much audio the
+  model produces.** RTF is time per second of output, so anything that makes
+  the model speak longer for the same text looks faster. This is how the
+  reference-length recommendation above got written up backwards: RTF improved
+  by 20% while the actual request got no faster. Voice, reference sample,
+  instructions and temperature all move the produced duration — compare wall
+  time per request, and report the produced duration alongside it.
 - Verify intelligibility, not just timing: transcribing the output with an ASR
   model catches degradations that RMS and duration checks miss.
