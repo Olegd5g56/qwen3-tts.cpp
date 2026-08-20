@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1.7
+#
+# qwen3-tts.cpp — CUDA build.
+#
+# Use this instead of Dockerfile.vulkan on an Nvidia card. On a GTX 1660 SUPER
+# the two backends measured the same throughput, but CUDA gets the
+# generate/decode overlap (`QWEN3_TTS_PIPELINE`), which Vulkan cannot use — two
+# ggml Vulkan instances serialise on one device, see docs/known-issues.md #5.
+# That overlap is the single largest win in the whole codebase: 31.5 s -> 22.4 s
+# on a long clip.
+#
+# Build:
+#   docker build -f Dockerfile.cuda -t qwen3-tts:cuda .
+#
+# The default CUDA_ARCH is 75 (Turing: GTX 16xx, RTX 20xx). Set it to match the
+# card or the first launch fails with "no kernel image is available":
+#   61 Pascal (GTX 10xx) · 75 Turing · 86 Ampere (RTX 30xx) · 89 Ada (RTX 40xx)
+#   90 Hopper · 120 Blackwell (RTX 50xx)
+#   docker build -f Dockerfile.cuda --build-arg CUDA_ARCH=89 -t qwen3-tts:cuda .
+#
+# Run:
+#   docker run --rm -it --gpus '"device=0"' \
+#     -p 8081:8081 \
+#     -v /path/to/models:/models:ro \
+#     -v /path/to/voices:/voices \
+#     -e TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+#     -e TTS_VOCODER=/models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
+#     -e TTS_VOICES_DIR=/voices \
+#     -e TZ=Europe/Warsaw \
+#     qwen3-tts:cuda
+#
+# The voices volume is deliberately not :ro — the server writes cache.bin next
+# to each sample, and re-encodes it when the talker width changes (see
+# known-issues #2). Mounting it read-only still works, it just re-encodes every
+# voice on every start.
+#
+# TZ defaults to UTC inside the container; set -e TZ=<IANA name> so the
+# server's log timestamps match wall-clock time on the host.
+#
+# Note: the binary is compiled with `-march=native` (from CMakeLists.txt), so
+# the image is tuned to the CPU that ran `docker build`. Fine for "build and
+# run on the same box"; not portable across machines with different CPUs.
+
+ARG CUDA_VERSION=13.3.1
+ARG UBUNTU_VERSION=26.04
+
+# ---------- builder ----------
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG CUDA_ARCH=75
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        ninja-build \
+        git \
+        pkg-config \
+        ca-certificates \
+        libmpg123-dev \
+        libopusenc-dev \
+        libmp3lame-dev \
+        libopus-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        -DCMAKE_INSTALL_PREFIX=/opt/qwen3-tts \
+    && cmake --build build -j \
+    && cmake --install build
+
+# ---------- runtime ----------
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libmpg123-0 \
+        libopusenc0 \
+        libmp3lame0 \
+        libopus0 \
+        libgomp1 \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/qwen3-tts /opt/qwen3-tts
+
+ENV PATH=/opt/qwen3-tts/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/qwen3-tts/lib \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    TTS_HOST=0.0.0.0 \
+    TTS_PORT=8081 \
+    TTS_THREADS=8
+
+EXPOSE 8081
+
+# /health answers without taking the synthesis lock, so a busy server still
+# reports healthy rather than flapping mid-request.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${TTS_PORT}/health" || exit 1
+
+ENTRYPOINT ["/opt/qwen3-tts/bin/qwen3-tts-server"]

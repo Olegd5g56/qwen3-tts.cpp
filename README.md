@@ -97,16 +97,30 @@ Toggles: `QWEN3_TTS_SERVER=OFF` skips the server,
 
 ## Docker
 
-Two backend-specific Dockerfiles. The binary is built with `-march=native`,
+Three backend-specific Dockerfiles. The binary is built with `-march=native`,
 so the image is tuned to whatever CPU ran `docker build` — rebuild if you
 move it to a different host.
 
 ```bash
 git submodule update --init --recursive
 
-docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD/Intel/NV via host Vulkan
+docker build -f Dockerfile.cuda   -t qwen3-tts:cuda   .   # Nvidia — preferred there
+docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD/Intel, or NV without CUDA
 docker build -f Dockerfile.cpu    -t qwen3-tts:cpu    .   # CPU only
 ```
+
+**On an Nvidia card use the CUDA image, not the Vulkan one.** Raw throughput is
+about the same, but only CUDA can overlap the vocoder with generation — two
+ggml Vulkan instances on one device serialise (`known-issues.md` #5) — and that
+overlap is the single biggest win in the codebase. Measured in the container on
+a GTX 1660 SUPER, 4.56 s of speech: **2.97 s with the overlap, 3.49 s without**,
+and the gap widens on longer lines (31.5 s → 22.4 s on the long clip).
+
+`Dockerfile.cuda` defaults to `CUDA_ARCH=75` (Turing). Set `--build-arg
+CUDA_ARCH=` to match the card — 61 Pascal, 86 Ampere, 89 Ada, 120 Blackwell —
+or the first launch fails with "no kernel image is available". It also carries a
+`HEALTHCHECK` against `/health`, which answers without taking the synthesis
+lock, so a busy server stays healthy instead of flapping.
 
 Models and voices are mounted, never baked in:
 
@@ -123,9 +137,15 @@ docker run --rm -it \
     qwen3-tts:vulkan
 ```
 
-CPU image: drop `--device /dev/dri --group-add video`. Container time
-defaults to UTC; set `-e TZ=...` if you want logs in local time. Any local
+CUDA image: swap `--device /dev/dri --group-add video` for `--gpus
+'"device=0"'`. CPU image: drop them entirely. Container time defaults to UTC;
+set `-e TZ=...` if you want logs in local time. Any local
 `docker-compose.yml` can reference the tag — no `build:` section needed.
+
+Mount the voices directory **writable**. The server keeps `cache.bin` beside
+each sample and rewrites it when the talker width changes (`known-issues.md`
+#2); read-only works, it just re-encodes the whole library on every start —
+about 10 s per voice.
 
 ## Performance tuning
 
