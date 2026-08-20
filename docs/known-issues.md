@@ -40,6 +40,16 @@ unrealistic, or there is a real (small) state leak worth finding.
 per-layer KV vectors, causal-conv tail rings, and conv_transpose overlap
 buffers. Bisect by dumping intermediate activations at chunk boundaries.
 
+**Reproduce (2026-08-20):** the test is now registered with ctest and needs
+only a vocoder, no reference dumps:
+
+```bash
+QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build -R streaming
+```
+
+It reproduces byte-for-byte the numbers above, so this is the one entry in this
+file with a standing regression test.
+
 ---
 
 ## 2. Voice cache is not invalidated across model variants

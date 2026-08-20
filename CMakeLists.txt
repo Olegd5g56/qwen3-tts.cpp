@@ -327,3 +327,17 @@ add_test(NAME decoder_test
     COMMAND test_decoder
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(NAME streaming_parity_test
+    COMMAND test_streaming_parity
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# The reference tests need model ggufs and binary dumps from the original
+# Python implementation, none of which are in the repo. Without them the tests
+# report themselves as skipped (exit 77) rather than failed, so a red ctest run
+# still means something. Set QWEN3_TTS_TEST_MODEL / QWEN3_TTS_TEST_VOCODER to
+# local ggufs to run the ones that need only a model.
+set_tests_properties(
+    encoder_test transformer_test decoder_test streaming_parity_test
+    PROPERTIES SKIP_RETURN_CODE 77
+)

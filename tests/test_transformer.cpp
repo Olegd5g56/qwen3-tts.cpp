@@ -1,4 +1,5 @@
 #include "tts_transformer.h"
+#include "test_fixtures.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -94,7 +95,8 @@ static void print_usage(const char * prog) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
-    std::string model_path   = "models/qwen3-tts-0.6b-f16.gguf";
+    std::string model_path   = qwen3_tts_test::model_path_from_env(
+                                   "QWEN3_TTS_TEST_MODEL", "models/qwen3-tts-0.6b-f16.gguf");
     std::string ref_dir      = "reference/";
 
     // Per-file overrides (empty = use ref_dir + default name)
@@ -145,6 +147,12 @@ int main(int argc, char ** argv) {
     const std::string ref_prefill_path = resolve(ref_prefill_path_override, "det_prefill_embedding.bin");
     const std::string ref_logits_path  = resolve(ref_logits_path_override,  "det_first_frame_logits.bin");
     const std::string ref_hidden_path  = resolve(ref_hidden_path_override,  "det_hidden_states.bin");
+
+    if (!qwen3_tts_test::fixtures_present({model_path, tokens_path, speaker_path,
+                                            ref_codes_path, ref_prefill_path,
+                                            ref_logits_path, ref_hidden_path})) {
+        return qwen3_tts_test::SKIP_EXIT_CODE;
+    }
 
     int test_num = 0;
     int pass_count = 0;

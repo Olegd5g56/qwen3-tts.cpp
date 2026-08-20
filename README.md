@@ -362,11 +362,30 @@ state, so audio flows out while the transformer is still generating.
 ## Testing
 
 ```bash
+ctest --test-dir build                     # per-stage tests
 bash scripts/run_all_tests.sh              # full suite
 uv run python scripts/compare_e2e.py       # Python ↔ C++ parity
 ```
 
-Per-stage executables live in `build/test_*` — see the script for invocation.
+Most of the per-stage tests compare against model ggufs and binary dumps of the
+original Python inference, neither of which is in the repo. Without them the
+tests report **Skipped**, not failed, so a red `ctest` run means a real
+regression. Two ways to give them something to chew on:
+
+```bash
+# needs only a vocoder — runs the streaming/causality parity check
+QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build
+
+# regenerate the reference dumps for the rest (needs the Python side)
+uv run python scripts/generate_deterministic_reference.py
+```
+
+`QWEN3_TTS_TEST_MODEL` does the same for the talker gguf. Per-stage executables
+live in `build/test_*` and all take explicit paths — see the script for
+invocation.
+
+Note that `streaming_parity_test` currently **fails by design** on a real
+vocoder — see issue 1 in `docs/known-issues.md`.
 
 ## Acknowledgments
 

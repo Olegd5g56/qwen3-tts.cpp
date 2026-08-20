@@ -1,4 +1,5 @@
 #include "audio_tokenizer_encoder.h"
+#include "test_fixtures.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +239,14 @@ int main(int argc, char ** argv) {
     if (model_path.empty() || audio_path.empty()) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    {
+        std::vector<std::string> needed = {model_path, audio_path};
+        if (!ref_path.empty()) needed.push_back(ref_path);
+        if (!qwen3_tts_test::fixtures_present(needed)) {
+            return qwen3_tts_test::SKIP_EXIT_CODE;
+        }
     }
     
     // Create encoder

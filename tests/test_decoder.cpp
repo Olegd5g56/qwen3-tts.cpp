@@ -1,4 +1,5 @@
 #include "audio_tokenizer_decoder.h"
+#include "test_fixtures.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -40,7 +41,9 @@ static void print_usage(const char * prog) {
 }
 
 int main(int argc, char ** argv) {
-    const char * tokenizer_path = "models/qwen3-tts-tokenizer-f16.gguf";
+    const std::string tokenizer_env = qwen3_tts_test::model_path_from_env(
+            "QWEN3_TTS_TEST_VOCODER", "models/qwen3-tts-tokenizer-f16.gguf");
+    const char * tokenizer_path = tokenizer_env.c_str();
     const char * codes_path = "reference/speech_codes.bin";
     const char * reference_path = "reference/decoded_audio.bin";
     const char * output_path = nullptr;
@@ -60,6 +63,10 @@ int main(int argc, char ** argv) {
         }
     }
     
+    if (!qwen3_tts_test::fixtures_present({tokenizer_path, codes_path, reference_path})) {
+        return qwen3_tts_test::SKIP_EXIT_CODE;
+    }
+
     printf("=== Audio Tokenizer Decoder Test ===\n\n");
     
     qwen3_tts::AudioTokenizerDecoder decoder;

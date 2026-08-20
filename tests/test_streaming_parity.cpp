@@ -1,4 +1,5 @@
 #include "audio_tokenizer_decoder.h"
+#include "test_fixtures.h"
 
 #include <cstdio>
 #include <cstring>
@@ -30,10 +31,22 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--tol") == 0 && i + 1 < argc) tol = (float) atof(argv[++i]);
         else { print_usage(argv[0]); return 1; }
     }
-    if (!tokenizer_path) { print_usage(argv[0]); return 1; }
+    // Falls back to the shared test env var so ctest can register this without
+    // a hardcoded path: this test needs only a vocoder, no reference dumps.
+    const std::string tokenizer = tokenizer_path
+        ? std::string(tokenizer_path)
+        : qwen3_tts_test::model_path_from_env("QWEN3_TTS_TEST_VOCODER", "");
+    if (tokenizer.empty()) {
+        printf("  SKIP: no vocoder given (--tokenizer or QWEN3_TTS_TEST_VOCODER)\n");
+        print_usage(argv[0]);
+        return qwen3_tts_test::SKIP_EXIT_CODE;
+    }
+    if (!qwen3_tts_test::fixtures_present({tokenizer})) {
+        return qwen3_tts_test::SKIP_EXIT_CODE;
+    }
 
     qwen3_tts::AudioTokenizerDecoder decoder;
-    if (!decoder.load_model(tokenizer_path)) {
+    if (!decoder.load_model(tokenizer)) {
         fprintf(stderr, "load failed: %s\n", decoder.get_error().c_str());
         return 2;
     }
