@@ -171,9 +171,13 @@ Short line (~4 s audio, 54 frames), warm server, 1.7B, CUDA:
 - **vocoder ~53 ms/frame** — twice the talker and code predictor combined, and
   the thing everything else now hides behind, not the other way round.
 
-The code predictor is the standout: it costs the **same 13 ms/frame on the
+The code predictor is the odd one out — it costs the **same 13 ms/frame on the
 0.6B and the 1.7B model**, because it is 15 sequential 5-layer passes per frame
-— ~1100 small kernels whose launch/teardown latency dominates the arithmetic.
+over the same weights regardless of talker size. That makes it look like a
+target, and it is not: it sits inside the generation stage that the vocoder
+already hides. Only ~10% of its time is framework overhead anyway (of 7272 ms
+on `ward.txt`: build 143, alloc 230, I/O 351, **compute 6490**), which is why
+fusing the 15 passes into one graph bought only 3%.
 
 ## Tried and ruled out — do not redo
 
