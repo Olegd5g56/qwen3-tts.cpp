@@ -6,6 +6,10 @@ Performance characterization of this fork. Last updated **2026-08-24**.
 > silently running on the CPU (`known-issues.md` #13). Sections are ordered so
 > current numbers come first; the August-20 sweep is kept at the end as history
 > because the relative wins it records are still real.
+>
+> The newest layer is the head-to-head against the reference PyTorch pipeline.
+> It confirms `CONV_TRANSPOSE_1D` as the one target and closes the adjacent
+> "make one-shot decode fit" idea with a negative result.
 
 ## Current profile (where the time goes)
 
@@ -43,20 +47,18 @@ Per-op, CUDA, `QWEN3_TTS_PROFILE_OPS=1`. The profiler disables fusion, but for
 this graph it costs only 3.6% (decode 2472 ms → 2561 ms), so the shares are
 trustworthy here — unlike the generate profile, which it inflates by 64%.
 
-| op | share of decode |
-|---|---|
-| `CONV_TRANSPOSE_1D` | **52%** |
-| `MUL_MAT` (the conv towers) | 11% |
-| `ADD` | 2% |
-| `IM2COL` | **1.7%** |
+Measured twice on different workloads, which is why the shares move a little:
+
+| op | 1.7B | 0.6B, `ward.txt` |
+|---|---|---|
+| `CONV_TRANSPOSE_1D` | **52%** | **44.8%** |
+| `MUL_MAT` (the conv towers) | 11% | 17.9% |
+| `ADD` | 2% | 6.7% |
+| `IM2COL` | **1.7%** | **4.1%** |
 
 Note what this kills. The whole previous roadmap was built on giving ggml a
-direct `conv_1d` kernel to avoid im2col — and im2col is now **1.7%** of decode.
-That project is not worth doing for this model.
-
-Re-measured 2026-08-24 on the 0.6B with `ward.txt` (6742 ms of decode, 782
-distinct nodes): `CONV_TRANSPOSE_1D` **44.8%**, `MUL_MAT` 17.9%, `ADD` 6.7%,
-`IM2COL` 4.1%. Same verdict from a different workload.
+direct `conv_1d` kernel to avoid im2col — and im2col is a few per cent of
+decode either way. That project is not worth doing for this model.
 
 The new target is `CONV_TRANSPOSE_1D`, and it is a far better-shaped one,
 because unlike `conv_1d` it is a real op with a real kernel to improve. The
@@ -259,12 +261,16 @@ related, not independent.
 4. **Prefill** (793 ms, 1.7B) is dominated by the 150 ICL reference frames. A
    shorter reference shrinks it — but pick a reference for prosody, not speed;
    see the ruled-out note on reference length.
-5. **Measure the streaming vocoder's host round-trip.** `stream_decode` pulls
-   the conv tails and KV device→host after every chunk and pushes them back
-   before the next. This was dismissed as noise against a 53 ms/frame vocoder.
-   That vocoder is now 12.9 ms/frame and on the GPU, so the same fixed transfer
-   is a much larger share of it — and nobody has ever timed it. One timing line
-   around the copy block in `audio_tokenizer_decoder.cpp` settles it.
+5. **The streaming vocoder's host round-trip — mostly bounded, never timed
+   directly.** `stream_decode` pulls the conv tails and KV device→host after
+   every chunk and pushes them back before the next, a fixed cost per chunk.
+   The chunk sweep caps it indirectly: halving the number of chunks at the
+   default (100 → 200 frames, 7 round-trips → 4) changes nothing measurable,
+   so whatever the copies cost, at the operating point we ship it is under the
+   noise floor. What the sweep cannot do is separate the copies from graph
+   efficiency, and the 25-frame cliff is large enough that *something* per
+   chunk is expensive. One timing line around the copy block in
+   `audio_tokenizer_decoder.cpp` still settles it, and it is cheap.
 
 ## Tried and ruled out — do not redo
 
@@ -298,8 +304,12 @@ related, not independent.
   vocoder calls and on the other by the tail that has to be decoded after
   generation ends. On a short line the ordering reverses — a batch bigger than
   the utterance never overlaps at all (56-frame line: 9.41 s at 16, 9.64 s at
-  32, 10.28 s at 64) — so the default stays 16. Note the one-shot path uses a
-  separate hardcoded 100.
+  32, 10.28 s at 64) — so the default stays 16. The *sequential* path defaults
+  to 100 instead, which is a different question, answered in *Chunk size is not
+  a speed lever*. Caveat on this entry: it is one run per configuration, and a
+  2.6% optimum is below the noise floor this box turned out to have — the
+  direction (small batches overlap sooner, big ones never overlap) is sound, the
+  2.6% is not worth quoting.
 - **Quantising the code predictor.** It is **bandwidth-bound, not compute-bound**
   — established by running it *both* directions on `ward.txt`, 1.7B, CUDA, with
   the talker as an untouched control (10.1 → 10.3 ms/frame throughout):
@@ -471,3 +481,14 @@ in `known-issues.md` #9 (ROCm) and #10 (CUDA).
   time per request, and report the produced duration alongside it.
 - Verify intelligibility, not just timing: transcribing the output with an ASR
   model catches degradations that RMS and duration checks miss.
+- **Three runs and a median, minimum.** This machine throws occasional 30%
+  outliers on an unchanged configuration — 12.3-12.9 ms/frame next to 9.1 in
+  the same group during the chunk sweep. Two apparent wins on 2026-08-24 (7% on
+  CUDA, 11% on HIP) turned out to be single-run noise. If the spread within a
+  group is comparable to the gap between groups, write "no effect", not a
+  cautious win. `scripts/bench_torch_vs_ggml.py` and `scripts/bench_ggml_cli.py`
+  default to three runs and print medians for this reason.
+- Both benchmark scripts split the same three stages — reference encode,
+  generate, vocoder decode — and print the same summary, so a PyTorch run and a
+  CLI run can go straight into one table. `bench_ggml_cli.py` re-rolls the seed
+  on a run-away rather than letting it poison the median.

@@ -25,7 +25,7 @@ root cause still there) / **wontfix**.
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
 | [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | open 2026-08-24 |
-| [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24, not upstreamed |
+| [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -682,7 +682,8 @@ precision control when attributing speed wins to quantisation (see
 <a id="17"></a>
 ## 17. A vocoder OOM segfaults instead of failing — upstream ggml
 
-**Status:** fixed locally in the ggml submodule, not upstreamed
+**Status:** fixed locally in the ggml submodule; **deliberately not reported
+upstream** — Oleg's call, 2026-08-24, revisit alongside the kernel work
 **Found:** 2026-08-24
 **Severity:** availability — an out-of-memory kills the process, server included
 
@@ -726,8 +727,12 @@ to allocate streaming graph`.
 
 **Caveat: `ggml` is a submodule pinned at v0.20.2, so this patch is not
 committed and `git submodule update` silently removes it**, restoring the
-crash. Either upstream it or carry it as a patch file. Reproduce with any
-`QWEN3_TTS_DECODE_BATCH` large enough to exhaust the card.
+crash. That is why the diff is written out in full above — it is the only copy.
+Reproduce with any `QWEN3_TTS_DECODE_BATCH` large enough to exhaust the card.
+
+Reporting it upstream was considered and deferred on 2026-08-24: worth doing
+together with the `CONV_TRANSPOSE_1D` work, which touches the same project, so
+there is one conversation rather than two.
 
 ---
 
@@ -753,11 +758,20 @@ scratch. Each was verified against the code on 2026-08-24.
   streaming, and a different `max_audio_tokens` default. `top_p` is present but
   deliberately unused (kept for ABI stability, documented at the declaration —
   that part is fine). Either catch it up or mark the target experimental.
-- **`examples/`** holds two wavs and no example source.
+- **`examples/` holds two wavs, no example source, and one of the wavs is a
+  trap.** `readme_clone_input.wav` is **60 s** long while `reference_text.txt`
+  next to it transcribes about eight seconds of speech. Nothing in the README
+  references either file any more. Feeding that pair to the reference PyTorch
+  pipeline as an ICL prompt makes generation run to the token cap (655 s of
+  audio) — it cost real time on 2026-08-24 before the mismatch was spotted.
+  Replace it with the model card's `clone.wav`, which is what the transcript
+  actually matches, or delete both and the stale transcript with them.
 - **`docs/model_inspection.txt`** is a raw metadata dump with no header saying
   which GGUF it came from or when.
-- **#8 was never reported upstream.** The RADV multi-add fusion material is
-  written up and reproducible; filing it costs nothing.
+- **Two ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
+  written up and reproducible; #17 (OOM segfault) is a one-line fix with a
+  verified repro. Both are upstream ggml, and #17 is deliberately held until
+  the `CONV_TRANSPOSE_1D` work goes the same way.
 
 ### Dismissed after checking
 
