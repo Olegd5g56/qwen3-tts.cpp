@@ -312,11 +312,16 @@ with no tiling or reuse — and `continue`-ing out of roughly `s0-1` of every
    research: tile it, stage weights in shared memory, and stop iterating over
    the stride positions that are discarded. Upstream project; benefits every
    audio decoder on ggml.
-2. **The code predictor is a target again** at 13.2 ms/frame — now the single
-   largest line, no longer hidden. Note what was already ruled out: fusing the
-   15 passes into one graph bought 3% and broke Vulkan, and only ~10% of its
-   time is framework overhead, so the win has to come from cutting the *number*
-   of sequential passes, not from dispatching them faster.
+2. **The code predictor: only one lever left, and it is not a code change.**
+   At 13.2 ms/frame it is the largest single line and no longer hidden, but it
+   is ~70% weight traffic (see the ruled-out entry). Quantising it works and is
+   worth 6.6% end-to-end, rejected on audible quality. Fusing the passes bought
+   3% and broke Vulkan. Everything that targets dispatch overhead is capped at
+   the remaining ~30% of the stage. **Cutting the number of sequential passes is
+   the only large win, and that is a model-architecture question.**
+
+   The one free scrap: `code_pred.lm_head.*` ships F16 while the rest of the
+   talker is Q8_0. Near-lossless to quantise, 30 MB of file, ~2% of the stage.
 3. **Overlap pays less than it used to.** With the vocoder on the CPU the
    pipeline overlapped two different pieces of hardware; now both stages want
    the same GPU and it recovers only part of the decode (CUDA 20 493 → 18 977
@@ -324,6 +329,12 @@ with no tiling or reuse — and `continue`-ing out of roughly `s0-1` of every
 4. **Prefill** (793 ms, 1.7B) is dominated by the 150 ICL reference frames. A
    shorter reference shrinks it — but pick a reference for prosody, not speed;
    see the ruled-out note on reference length.
+5. **Measure the streaming vocoder's host round-trip.** `stream_decode` pulls
+   the conv tails and KV device→host after every chunk and pushes them back
+   before the next. This was dismissed as noise against a 53 ms/frame vocoder.
+   That vocoder is now 12.9 ms/frame and on the GPU, so the same fixed transfer
+   is a much larger share of it — and nobody has ever timed it. One timing line
+   around the copy block in `audio_tokenizer_decoder.cpp` settles it.
 
 ## Measurement notes
 
