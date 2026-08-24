@@ -2,6 +2,7 @@
 
 #include "qwen3_tts.h"
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -75,7 +76,16 @@ public:
     // by one. on_voice fires once per voice with its load time and outcome.
     // Returns the number of voices that loaded successfully. Safe to call
     // multiple times — already-loaded voices are skipped silently.
-    size_t preload_all(std::function<void(const preload_progress &)> on_voice);
+    //
+    // The map mutex is taken and released **per voice**, not for the whole
+    // sweep, so a get() racing this waits for at most the one voice being
+    // encoded rather than the entire library. That is what makes it safe to
+    // run on a background thread while the server is already answering.
+    //
+    // If `cancel` is non-null the sweep checks it between voices and stops
+    // early, so shutdown does not have to wait out a large library.
+    size_t preload_all(std::function<void(const preload_progress &)> on_voice,
+                       const std::atomic<bool> * cancel = nullptr);
 
     // Names of all currently-known voices, sorted. Cheap — does not load.
     std::vector<std::string> list();

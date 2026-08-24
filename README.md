@@ -131,6 +131,19 @@ One request at a time: synthesis is serialized, so a second request waits for
 the first to finish (tens of seconds on long text). `/health` answers while
 busy and reports `"busy": true`.
 
+**The server starts listening before the voice library is warm.** Encoding a
+voice with no `cache.bin` costs ~1.4 s, so a few hundred voices is minutes of
+work; it runs on a background thread and nothing waits for it. Voices encode on
+demand, so a request for a voice the sweep has not reached yet just pays for
+that one voice. `/health` reports progress and stays available throughout:
+
+```json
+{"status":"ok","model_loaded":true,"busy":true,
+ "voices":{"total":312,"warmed":47,"warming":true}}
+```
+
+The `voices` object is absent when no voice library is configured.
+
 All flags have matching `TTS_*` env vars (CLI > env > default).
 
 | Flag | Env | Default | What it does |

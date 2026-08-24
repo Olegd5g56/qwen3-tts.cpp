@@ -191,31 +191,58 @@ int main(int argc, char ** argv) {
     VoiceStore voice_store(sp.voices_dir, ensure_loaded,
                             cached_has_speaker_encoder, cached_embedding_width,
                             &synth_mutex);
+    // Warm the library on a background thread and start listening immediately.
+    //
+    // Encoding a voice that has no cache.bin costs ~1.4 s, so a few hundred
+    // Skyrim voices is minutes of work. Doing it before listen() left the port
+    // closed the whole time: /health did not "hang", it refused the connection,
+    // and any container healthcheck with a start period shorter than the sweep
+    // declared the server dead.
+    //
+    // Nothing waits for this. VoiceStore::get() encodes on demand, so a request
+    // for a voice the sweep has not reached yet simply pays for that one voice.
+    std::atomic<bool> warm_cancel{false};
+    std::atomic<size_t> warm_done{0};
+    std::atomic<size_t> warm_total{0};
+    std::atomic<bool> warm_running{false};
+    std::thread warm_thread;
     if (!sp.voices_dir.empty()) {
         voice_store.refresh();
-        auto discovered = voice_store.list();
-        log_info("voice library: %s (%zu voice%s found, preloading...)",
-                 sp.voices_dir.c_str(), discovered.size(),
-                 discovered.size() == 1 ? "" : "s");
-        const auto t_start = std::chrono::steady_clock::now();
-        const size_t loaded = voice_store.preload_all([](const preload_progress & p) {
-            if (!p.error.empty()) {
-                log_warn("voice %s: FAILED (%s)", p.id.c_str(), p.error.c_str());
-            } else if (p.from_cache) {
-                log_info("voice %s: cached (%lldms)", p.id.c_str(), (long long)p.ms);
+        warm_total = voice_store.list().size();
+        log_info("voice library: %s (%zu voice%s found, warming in background)",
+                 sp.voices_dir.c_str(), warm_total.load(),
+                 warm_total.load() == 1 ? "" : "s");
+        warm_running = true;
+        warm_thread = std::thread([&voice_store, &warm_cancel, &warm_done,
+                                   &warm_total, &warm_running]() {
+            const auto t_start = std::chrono::steady_clock::now();
+            const size_t loaded = voice_store.preload_all(
+                [&warm_done](const preload_progress & p) {
+                    warm_done++;
+                    if (!p.error.empty()) {
+                        log_warn("voice %s: FAILED (%s)", p.id.c_str(), p.error.c_str());
+                    } else if (p.from_cache) {
+                        log_info("voice %s: cached (%lldms)", p.id.c_str(), (long long)p.ms);
+                    } else {
+                        log_info("voice %s: encoded in %.1fs",
+                                 p.id.c_str(), (double)p.ms / 1000.0);
+                    }
+                }, &warm_cancel);
+            const auto t_total = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_start).count();
+            if (warm_cancel.load()) {
+                log_info("voice library: warm-up cancelled (%zu of %zu done)",
+                         loaded, warm_total.load());
             } else {
-                log_info("voice %s: encoded in %.1fs",
-                         p.id.c_str(), (double)p.ms / 1000.0);
+                std::string failed_suffix;
+                if (loaded < warm_total.load()) {
+                    failed_suffix = ", " + std::to_string(warm_total.load() - loaded) + " failed";
+                }
+                log_info("voice library: warm (%zu loaded%s, %.1fs total)",
+                         loaded, failed_suffix.c_str(), (double)t_total / 1000.0);
             }
+            warm_running = false;
         });
-        const auto t_total = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t_start).count();
-        std::string failed_suffix;
-        if (loaded < discovered.size()) {
-            failed_suffix = ", " + std::to_string(discovered.size() - loaded) + " failed";
-        }
-        log_info("voice library: ready (%zu loaded%s, %.1fs total)",
-                 loaded, failed_suffix.c_str(), (double)t_total / 1000.0);
     }
 
     httplib::Server svr;
@@ -258,7 +285,8 @@ int main(int argc, char ** argv) {
     // try_lock, never block: a long synthesis holds synth_mutex for tens of
     // seconds, and a health probe stuck behind it looks like a dead server
     // to any monitor with a timeout. Busy IS healthy.
-    svr.Get("/health", [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/health", [&tts, &synth_mutex, &warm_running, &warm_done, &warm_total]
+                       (const httplib::Request &, httplib::Response & res) {
         std::unique_lock<std::mutex> lock(synth_mutex, std::try_to_lock);
         json h;
         if (lock.owns_lock()) {
@@ -266,6 +294,14 @@ int main(int argc, char ** argv) {
         } else {
             // synthesis (or a model load) in flight — the model is in use
             h = {{"status", "ok"}, {"model_loaded", true}, {"busy", true}};
+        }
+        // Warming is progress, not a readiness gate: voices encode on demand,
+        // so the server answers normally throughout. Reported so an operator
+        // can see why the first call for a cold voice is slower.
+        if (warm_total.load() > 0) {
+            h["voices"] = {{"total",   warm_total.load()},
+                           {"warmed",  warm_done.load()},
+                           {"warming", warm_running.load()}};
         }
         res.set_content(h.dump(), "application/json");
     });
@@ -988,6 +1024,12 @@ int main(int argc, char ** argv) {
 
     log_info("server listening on %s:%d", sp.host.c_str(), sp.port);
     bool listen_ok = svr.listen(sp.host, sp.port);
+
+    // Stop the warm-up before anything it references goes out of scope.
+    warm_cancel = true;
+    if (warm_thread.joinable()) {
+        warm_thread.join();
+    }
 
     // signal the watchdog to exit so it doesn't outlive the locals it captures.
     watchdog_stop.store(true, std::memory_order_relaxed);

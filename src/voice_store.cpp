@@ -159,18 +159,39 @@ bool VoiceStore::refresh() {
     return true;
 }
 
-size_t VoiceStore::preload_all(std::function<void(const preload_progress &)> on_voice) {
-    std::lock_guard<std::mutex> lock(map_mutex_);
+size_t VoiceStore::preload_all(std::function<void(const preload_progress &)> on_voice,
+                               const std::atomic<bool> * cancel) {
+    // Snapshot the ids first: holding map_mutex_ across the whole sweep would
+    // block every get() for as long as the library takes to encode, which on a
+    // few hundred voices is minutes.
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        ids.reserve(disk_index_.size());
+        for (const auto & kv : disk_index_) {
+            ids.push_back(kv.first);
+        }
+    }
+
     size_t loaded = 0;
-    for (const auto & kv : disk_index_) {
-        const std::string & id = kv.first;
-        if (voices_.find(id) != voices_.end()) {
-            loaded++;
-            continue;
+    for (const auto & id : ids) {
+        if (cancel && cancel->load()) {
+            break;
         }
         preload_progress prog;
         prog.id = id;
         const int64_t t0 = now_ms();
+
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        // Re-check under the lock: a get() may have loaded it in the meantime,
+        // and refresh() may have dropped it from the index.
+        if (voices_.find(id) != voices_.end()) {
+            loaded++;
+            continue;
+        }
+        if (disk_index_.find(id) == disk_index_.end()) {
+            continue;
+        }
         voice_entry v;
         bool from_cache = false;
         if (load_voice_locked(id, v, from_cache, prog.error)) {
