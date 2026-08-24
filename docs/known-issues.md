@@ -24,6 +24,7 @@ root cause still there) / **wontfix**.
 | [13](#13) | The vocoder never ran on the GPU | fixed 2026-08-24 |
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
+| [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
 
@@ -623,3 +624,43 @@ default for LLM-shaped matmuls, and only these deep conv towers compound it.
 
 The Mimi codec encoder is still CPU-resident, and has no trig and no deep conv
 tower — not investigated further.
+
+---
+
+<a id="rough-edges"></a>
+## Open rough edges
+
+Not bugs, and none of them bite today. Kept so they are not rediscovered from
+scratch. Each was verified against the code on 2026-08-24.
+
+- **Sampling logic exists twice.** `predict_codes_autoregressive`'s
+  `sample_or_argmax` lambda (`tts_transformer.cpp`) against the unrolled loop in
+  `generate()`. They have already diverged: the suppression window and the
+  repetition penalty are only in `generate()`. A change to sampling rules has to
+  be made in both places and can silently be made in one.
+- **17 `QWEN3_TTS_*` env vars read by `getenv()` from 8 files**, six documented.
+  Several (`DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`) are
+  diagnostics branched inline in hot loops. Tolerable; worth a config struct
+  before the next handful arrives.
+- **No fast-fail when busy.** Synthesis is serialized and a second request just
+  waits. `synth_mutex.try_lock()` → 429 with `Retry-After` would stop clients
+  queueing. `/health` already reports `busy`.
+- **The C ABI (`qwen3tts_c_api`) lags the core**: no ICL/`ref_codes`, no
+  streaming, and a different `max_audio_tokens` default. `top_p` is present but
+  deliberately unused (kept for ABI stability, documented at the declaration —
+  that part is fine). Either catch it up or mark the target experimental.
+- **`examples/`** holds two wavs and no example source.
+- **`docs/model_inspection.txt`** is a raw metadata dump with no header saying
+  which GGUF it came from or when.
+- **#8 was never reported upstream.** The RADV multi-add fusion material is
+  written up and reproducible; filing it costs nothing.
+
+### Dismissed after checking
+
+- **"Repetition penalty diverges from HuggingFace — it should use a sliding
+  window."** It should not. HF's `RepetitionPenaltyLogitsProcessor` applies to
+  the whole sequence, which is what `tts_transformer.cpp` already does; the
+  sliding window (`repeat_last_n`) is llama.cpp's. Adding one would move *away*
+  from the reference. #11 also rules the penalty out as a runaway cause by
+  measurement. Raised by an external review, recorded here because the same
+  suggestion looks plausible on a quick read.

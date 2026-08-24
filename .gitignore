@@ -57,3 +57,7 @@ reference/debug/
 
 # out-of-tree build dirs (build-cuda, build-hip, build-vk2, ...)
 build-*/
+
+# Local scratch scripts — personal launchers, not part of the project
+/test.sh
+/test_cli.sh
