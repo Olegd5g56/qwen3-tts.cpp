@@ -5,9 +5,12 @@
 # Use this instead of Dockerfile.vulkan on an Nvidia card. On a GTX 1660 SUPER
 # the two backends measured the same throughput, but CUDA gets the
 # generate/decode overlap (`QWEN3_TTS_PIPELINE`), which Vulkan cannot use — two
-# ggml Vulkan instances serialise on one device, see docs/known-issues.md #5.
-# That overlap is the single largest win in the whole codebase: 31.5 s -> 22.4 s
-# on a long clip.
+# ggml Vulkan instances cannot run *concurrently* on one device, see
+# docs/known-issues.md #5.
+#
+# The overlap is worth ~7% on a long clip (20.5 s -> 19.0 s, 1.7B). It used to
+# be worth far more, back when it overlapped a GPU talker with a CPU vocoder;
+# both stages now want the same device. See docs/optimization.md.
 #
 # Build:
 #   docker build -f Dockerfile.cuda -t qwen3-tts:cuda .

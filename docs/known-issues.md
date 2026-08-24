@@ -139,6 +139,12 @@ Worked around by enabling `decode_pipeline` only on CUDA/Metal
 (`QWEN3_TTS_PIPELINE=1/0` overrides). Worth revisiting if ggml-vulkan grows
 proper multi-queue support — the AMD card would benefit most.
 
+**Coexistence is fine; only concurrency collapses.** Since 2026-08-24 the
+decoder always takes its own backend instance (#13's follow-up), so two Vulkan
+instances now exist on every run. That is harmless because the pipeline gate
+keeps them from running at the same time — verified end to end on both RADV and
+Nvidia's Vulkan driver, plus `streaming_parity_test`, which passes at −62.4 dB.
+
 ---
 
 ## 6. Stale architecture numbers in `AGENTS.md`

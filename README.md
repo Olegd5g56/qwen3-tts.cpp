@@ -110,8 +110,16 @@ GGUFs: [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-
 | **vocoder** (Qwen3-TTS-Tokenizer-12Hz) | — | — | — |
 
 Only Base has a speaker encoder, so voice cloning works only there; loading a
-non-Base model disables the voice library at startup. The 0.6B is a memory
-choice (~1 GB less), not a speed one.
+non-Base model disables the voice library at startup. The 0.6B is mostly a
+memory choice (~1 GB less); it is 11-13% faster per frame, not proportionally
+faster, because the code predictor and the vocoder are the same size in both.
+
+**GPU memory**: measured peak on a long clip, all three models resident, is
+**~3.2 GB for the 1.7B** and **~2.1 GB for the 0.6B**. Budget for that plus
+whatever else shares the card — a CUDA out-of-memory aborts the process rather
+than falling back. `QWEN3_TTS_DECODE_BATCH=8` trims ~120 MB at ~7% throughput,
+and `QWEN3_TTS_LOW_MEM=1` trades a model load per request for a much lower
+peak.
 
 **Auto-download**: `--hf-repo <repo>[:<quant>]` and `--hf-repo-v ...` (default
 quant `Q8_0`, cached in `~/.cache/huggingface/`). **Local**: `-m talker.gguf
