@@ -523,3 +523,45 @@ Do not assume this trade costs speed without measuring it on the target card.
 **Ruled out:** the individual kernels. `test-backend-ops` passes for `IM2COL`,
 `CONV_TRANSPOSE_1D`, `SIN`, `CONCAT`, `SQR` and `EXP` on ROCm — the ops are
 correct, the accumulator type was not.
+
+---
+
+## 15. Voice cloning spent 40 s in a hand-rolled O(n²) DFT
+
+**Status:** fixed 2026-08-24
+**Severity:** performance (61x on the encode stage)
+
+`compute_mel_spectrogram` in the speaker encoder called `compute_dft`, a naive
+O(n²) transform with `cosf`/`sinf` in the inner loop, single-threaded. With
+`n_fft = 1024`, hop 256 and a 60 s reference that is ~5600 frames x ~1M
+iterations x 2 transcendentals: **~12 billion trig calls**.
+
+It was mistaken for a backend problem at first. It is not: the giveaway is that
+it did **not** scale with `TTS_THREADS` (41 s at 1 thread, 40 s at 8), which no
+ggml CPU graph does. It was plain scalar C++ that no backend would ever touch.
+
+Replaced with an iterative radix-2 Cooley-Tukey FFT (`compute_fft_radix2`);
+`compute_spectrum` still falls back to the naive path for a non-power-of-two
+`n_fft`. 60 s reference, 1660 SUPER host:
+
+| | encode |
+|---|---|
+| naive DFT | 39 913 ms |
+| radix-2 FFT | **657 ms** |
+
+**Accuracy.** The FFT is the more accurate of the two — the naive version sums
+n floats per bin and forms `k*t/n` in float. Magnitudes agree to 3.5e-5
+relative; the resulting speaker embedding agrees to 3e-6 relative in L2 norm
+and ~1.5e-5 per component. Comparing generated *audio* proves nothing here:
+generation is autoregressive, so any perturbation changes the first sampled
+token and the whole sequence diverges. Compare the embedding.
+
+**Not done: moving the speaker encoder to the GPU.** Its weights are still
+CPU-resident, and after the FFT fix the remaining ~650 ms does scale with
+threads, so it is a real ggml CPU graph and #13's ladder would move it. Measured
+anyway: 650 ms -> 480 ms. Rejected. The saving is 170 ms on a cold path that is
+cached per voice afterwards, and the GPU embedding comes back **quantised to
+F16** (`v511 = 0.233886719`, an exact F16 value; components shift ~5e-4, 30x the
+FFT's perturbation). Not worth changing every existing voice's embedding for.
+The Mimi codec encoder is CPU-resident for the same reason and has no trig at
+all — nothing to fix there.

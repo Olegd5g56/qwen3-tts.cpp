@@ -94,7 +94,9 @@ static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_
     }
 }
 
-static void compute_dft(const float * input, float * real, float * imag, int n) {
+// Reference O(n^2) transform. Kept as the fallback for an n_fft that is not a
+// power of two; compute_spectrum() below picks it only in that case.
+static void compute_dft_naive(const float * input, float * real, float * imag, int n) {
     for (int k = 0; k < n; ++k) {
         real[k] = 0.0f;
         imag[k] = 0.0f;
@@ -103,6 +105,68 @@ static void compute_dft(const float * input, float * real, float * imag, int n) 
             real[k] += input[t] * cosf(angle);
             imag[k] += input[t] * sinf(angle);
         }
+    }
+}
+
+// Iterative radix-2 Cooley-Tukey. n_fft is 1024 here, so this is ~100x less
+// arithmetic than the naive transform above -- which dominated voice cloning:
+// a 60 s reference spent ~40 s of a ~40 s encode inside compute_dft_naive,
+// single-threaded, calling cosf/sinf in the inner loop.
+//
+// The twiddle recurrence runs in double: the naive version is the less accurate
+// of the two (it sums n floats per bin and forms k*t/n in float), and magnitudes
+// agree to ~3.5e-5 relative, far below what a mel filterbank plus log
+// compression can notice.
+static void compute_fft_radix2(const float * input, float * real, float * imag, int n) {
+    for (int i = 0; i < n; ++i) {
+        real[i] = input[i];
+        imag[i] = 0.0f;
+    }
+
+    // bit-reversal permutation
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            std::swap(real[i], real[j]);
+            std::swap(imag[i], imag[j]);
+        }
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+        const double ang = -2.0 * M_PI / len;
+        const double wr = cos(ang);
+        const double wi = sin(ang);
+        for (int i = 0; i < n; i += len) {
+            double cur_r = 1.0;
+            double cur_i = 0.0;
+            for (int k = 0; k < len / 2; ++k) {
+                const int a = i + k;
+                const int b = i + k + len / 2;
+                const double ur = real[a];
+                const double ui = imag[a];
+                const double vr = real[b] * cur_r - imag[b] * cur_i;
+                const double vi = real[b] * cur_i + imag[b] * cur_r;
+                real[a] = (float) (ur + vr);
+                imag[a] = (float) (ui + vi);
+                real[b] = (float) (ur - vr);
+                imag[b] = (float) (ui - vi);
+                const double nr = cur_r * wr - cur_i * wi;
+                cur_i = cur_r * wi + cur_i * wr;
+                cur_r = nr;
+            }
+        }
+    }
+}
+
+static void compute_spectrum(const float * input, float * real, float * imag, int n) {
+    if (n > 0 && (n & (n - 1)) == 0) {
+        compute_fft_radix2(input, real, imag, n);
+    } else {
+        compute_dft_naive(input, real, imag, n);
     }
 }
 
@@ -343,7 +407,7 @@ bool AudioTokenizerEncoder::compute_mel_spectrogram(const float * samples, int32
             frame[i] = padded[start + i] * window[i];
         }
         
-        compute_dft(frame.data(), fft_real.data(), fft_imag.data(), cfg.n_fft);
+        compute_spectrum(frame.data(), fft_real.data(), fft_imag.data(), cfg.n_fft);
         
         // Compute magnitude (not power) - matches torch.stft with return_complex=True then abs()
         // spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
