@@ -14,6 +14,27 @@
 
 namespace qwen3_tts {
 
+namespace {
+
+// Every matmul in this vocoder has an F16 left-hand side: the conv towers feed
+// ggml_conv_1d, which lowers to im2col + mul_mat and keeps the im2col in F16,
+// and the pre-transformer's weights are F16 in the GGUF. The CUDA/HIP backends
+// therefore pick a half-precision cuBLAS compute type and accumulate in F16.
+// Across a 25-layer conv tower that costs ~30 dB against the CPU reference and
+// breaks streaming/one-shot parity -- invisible until the vocoder actually runs
+// on a GPU. Ask for F32 accumulation everywhere in this graph; on cards without
+// tensor cores it is also the faster path.
+void force_f32_matmuls(struct ggml_cgraph * gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        struct ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+        }
+    }
+}
+
+}  // namespace
+
 AudioTokenizerDecoder::AudioTokenizerDecoder() = default;
 
 AudioTokenizerDecoder::~AudioTokenizerDecoder() {
@@ -991,6 +1012,8 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
             if (ct.next_node) ggml_build_forward_expand(gf, ct.next_node);
         }
     }
+
+    force_f32_matmuls(gf);
 
     ggml_free(ctx0);
 

@@ -11,7 +11,7 @@
 namespace {
 
 void print_usage(const char * argv0) {
-    fprintf(stderr, "usage: %s --tokenizer <path.gguf> [--frames N] [--chunk K] [--seed S] [--tol F]\n", argv0);
+    fprintf(stderr, "usage: %s --tokenizer <path.gguf> [--frames N] [--chunk K] [--seed S] [--tol F] [--dump <raw.f32>]\n", argv0);
 }
 
 }
@@ -22,6 +22,7 @@ int main(int argc, char ** argv) {
     int chunk = 16;
     int seed = 1;
     float tol = 1e-4f;
+    const char * dump_path = nullptr;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) tokenizer_path = argv[++i];
@@ -29,6 +30,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) chunk = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
         else if (strcmp(argv[i], "--tol") == 0 && i + 1 < argc) tol = (float) atof(argv[++i]);
+        else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump_path = argv[++i];
         else { print_usage(argv[0]); return 1; }
     }
     // Falls back to the shared test env var so ctest can register this without
@@ -72,6 +74,20 @@ int main(int argc, char ** argv) {
         return 3;
     }
     printf("one-shot: %zu samples\n", pcm_oneshot.size());
+
+    // Raw f32 dump of the one-shot result. Lets the same codes be decoded on
+    // two different backends and compared outside this process, which is how
+    // you tell a backend precision problem apart from a streaming-state one.
+    if (dump_path) {
+        FILE * f = fopen(dump_path, "wb");
+        if (!f) {
+            fprintf(stderr, "cannot open dump %s\n", dump_path);
+            return 4;
+        }
+        fwrite(pcm_oneshot.data(), sizeof(float), pcm_oneshot.size(), f);
+        fclose(f);
+        printf("dumped one-shot to %s\n", dump_path);
+    }
 
     // causality check: decode(first half) should equal decode(full)[0:prefix_len]
     // if the decoder is strictly causal. this isolates streaming bugs from
