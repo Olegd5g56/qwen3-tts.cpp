@@ -271,6 +271,36 @@ with no tiling or reuse — and `continue`-ing out of roughly `s0-1` of every
   the utterance never overlaps at all (56-frame line: 9.41 s at 16, 9.64 s at
   32, 10.28 s at 64) — so the default stays 16. Note the one-shot path uses a
   separate hardcoded 100.
+- **Quantising the code predictor.** It is **bandwidth-bound, not compute-bound**
+  — established by running it *both* directions on `ward.txt`, 1.7B, CUDA, with
+  the talker as an untouched control (10.1 → 10.3 ms/frame throughout):
+
+  | code predictor stack | bytes read per pass | ms/frame |
+  |---|---|---|
+  | F16 (dequantised) | 158 MB | 21.0 |
+  | Q8_0 (shipped) | 86 MB | 13.2 |
+  | Q4_0 + Q8_0 heads | 47 MB | 10.2 |
+
+  Solving the two points: ~9.3 of the 13.2 ms/frame is weight traffic at
+  ~139 GB/s effective, and ~3.9 ms is everything else. So the stage is ~70%
+  memory.
+
+  Q4_0 works and is worth **6.6% end-to-end** (RTF 0.440 → 0.411, 2.27x → 2.43x
+  realtime, pipeline on). Rejected anyway: it coarsens by 4x exactly the part of
+  the model that produces fine acoustic detail, and Oleg could hear a difference.
+  Q5 would halve the gain for half the risk, which is not a better trade.
+
+  What this rules out for the future: chasing arithmetic or better kernels in
+  this stage is pointless — the card is idle waiting on memory. CUDA graphs,
+  fusing the passes, and dispatch overhead all address the 3.9 ms, so they are
+  capped at ~30% of the stage and part of that is already taken. **The only
+  large lever left is reducing the number of sequential passes**, which is a
+  model-architecture question, not a code one.
+
+  Noted in passing: the 15 `code_pred.lm_head.*` tensors ship as F16 while the
+  rest of the talker is Q8_0. Quantising only those is near-lossless and saves
+  30 MB of file, but it is 2% of the stage's traffic — measurable, not useful.
+
 - Everything in the June list still holds: persistent attention mask, decode
   batch 200/400/800, embedding lookup via host scratch, one-shot vocoder
   `decode()` for long clips.
