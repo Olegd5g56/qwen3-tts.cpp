@@ -64,15 +64,37 @@ RTF cannot compare them. Per frame, measured 2026-08-20 (CUDA, `ostro`, 5 runs e
 
 The 0.6B makes the talker **36–39% cheaper** and halves prefill — but the code
 predictor is byte-for-byte the same 5-layer stack running 15 sequential passes
-per frame in both models, and the vocoder is literally the same GGUF. So
-per-frame cost falls only ~16% (22.9 → 19.2 ms), and the models differ by
-±10% in how much audio they produce for the same text, which is enough to
-swallow that. Wall-clock per request came out 5% *faster* on the short line and
-5% *slower* on `ward.txt`.
+per frame in both models, and the vocoder is literally the same GGUF. Two of the
+three stages do not shrink at all.
 
-**Choose the 0.6B for memory, not for speed:** ~1.06 GB less VRAM, consistently,
-which is the difference between fitting alongside something else on a 6 GB card
-and not. The quality cost is audible.
+**Re-measured 2026-08-24**, once the vocoder stopped running on the CPU and
+stopped dwarfing everything (`ward.txt`, pipeline off for the stage numbers):
+
+| | talker | code predictor | generate | vocoder | **per frame** |
+|---|---|---|---|---|---|
+| CUDA, 1.7B | 10.1 | 13.2 | 25.1 | 12.9 | **38.0 ms** |
+| CUDA, 0.6B | 6.5 | 13.0 | 20.3 | 12.9 | **33.2 ms** |
+| ROCm, 1.7B | 7.1 | 10.9 | 18.9 | 8.9 | **27.8 ms** |
+| ROCm, 0.6B | 4.5 | 10.8 | 16.1 | 8.6 | **24.7 ms** |
+
+So the 0.6B is now worth **11–13% per frame**, up from ~6% when a 53 ms/frame
+vocoder sat on top of everything. Real, but nowhere near proportional to a model
+2.8x smaller — and the reason is arithmetic: of the 38 ms a frame costs on the
+1.7B, only the talker's 10.1 shrinks, and only by a third.
+
+**RTF still cannot compare the two.** They produce different amounts of audio
+for the same text, and `ward.txt` on ROCm shows exactly why: wall clock came out
+identical (11.85 s vs 11.84 s) while RTF read 0.300 for the 1.7B and 0.273 for
+the 0.6B — the entire difference is that the 0.6B spoke 43.4 s where the 1.7B
+spoke 39.5 s. Compare ms/frame.
+
+**Still choose the 0.6B for memory, not for speed:** ~1.06 GB less VRAM,
+consistently, which is the difference between fitting alongside something else
+on a 6 GB card and not. The quality cost is audible and has not changed.
+
+One forward-looking note: the 0.6B's advantage is capped by the size-invariant
+stages, so **it grows if the code predictor gets faster** — the two items are
+related, not independent.
 
 ## What was done (August 2026)
 
