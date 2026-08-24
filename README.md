@@ -119,6 +119,10 @@ quant `Q8_0`, cached in `~/.cache/huggingface/`). **Local**: `-m talker.gguf
 
 ## Server
 
+One request at a time: synthesis is serialized, so a second request waits for
+the first to finish (tens of seconds on long text). `/health` answers while
+busy and reports `"busy": true`.
+
 All flags have matching `TTS_*` env vars (CLI > env > default).
 
 | Flag | Env | Default | What it does |
@@ -248,6 +252,7 @@ just the timbre (`known-issues.md` #7).
 | `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch when not streaming. Tuning it is worth ~2% and only on long lines. |
 | `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard — caps generated frames from the input length, because the model sometimes never emits end-of-speech. `0` disables it. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only: disables fusion and syncs per node. |
+| `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and the vocoder resident at once — each is unloaded as soon as its stage is done. Cuts peak memory, costs a model load per request and gives up vocoder/generation overlap on the one-shot path. |
 
 ## Testing
 
