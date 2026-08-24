@@ -8,6 +8,18 @@
 
 namespace qwen3_tts {
 
+void force_f32_matmuls(struct ggml_cgraph * gf) {
+    if (!gf) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        struct ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+        }
+    }
+}
+
 void apply_n_threads_to_backend(ggml_backend_t backend, int32_t n_threads) {
     if (!backend || n_threads <= 0) return;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);

@@ -556,12 +556,31 @@ and ~1.5e-5 per component. Comparing generated *audio* proves nothing here:
 generation is autoregressive, so any perturbation changes the first sampled
 token and the whole sequence diverges. Compare the embedding.
 
-**Not done: moving the speaker encoder to the GPU.** Its weights are still
-CPU-resident, and after the FFT fix the remaining ~650 ms does scale with
-threads, so it is a real ggml CPU graph and #13's ladder would move it. Measured
-anyway: 650 ms -> 480 ms. Rejected. The saving is 170 ms on a cold path that is
-cached per voice afterwards, and the GPU embedding comes back **quantised to
-F16** (`v511 = 0.233886719`, an exact F16 value; components shift ~5e-4, 30x the
-FFT's perturbation). Not worth changing every existing voice's embedding for.
-The Mimi codec encoder is CPU-resident for the same reason and has no trig at
-all — nothing to fix there.
+**The encoder had #13 and #14 too, and was fixed the same way.** Its weights
+were CPU-resident (no device type passed, so the default won), and ECAPA-TDNN
+is a conv tower over F16 weights, so the GPU path hit the same half-precision
+accumulator. Measured against a CPU reference on a 60 s clip, embeddings of
+1024 floats:
+
+| speaker encoder | encode | cosine vs CPU | mean component error |
+|---|---|---|---|
+| CPU (weights in RAM) | 650 ms | — | — |
+| GPU, F16 accumulator | 481 ms | 0.999999046 | 2.8e-4 |
+| GPU, F32 accumulator | **478 ms** | **1.000000238** | **2.2e-5** |
+
+F32 accumulation is ~12x more accurate here and costs nothing in time. The
+weights are 16.9 MB, so the VRAM added is noise.
+
+Note what the right metric is. Comparing generated *audio* proves nothing:
+generation is autoregressive, so any perturbation changes the first sampled
+token and the sequence diverges — a correct change and a broken one both look
+like "completely different audio". For a speaker embedding the meaningful
+question is direction, so compare cosine similarity, and compare the embedding
+rather than anything downstream of it.
+
+`force_f32_matmuls` moved to `gguf_loader.{h,cpp}` so both models call the same
+helper. Talker graphs deliberately do not use it: F16 accumulation is the right
+default for LLM-shaped matmuls, and only these deep conv towers compound it.
+
+The Mimi codec encoder is still CPU-resident, and has no trig and no deep conv
+tower — not investigated further.

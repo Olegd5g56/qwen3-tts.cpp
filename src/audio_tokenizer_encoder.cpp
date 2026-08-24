@@ -307,7 +307,8 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
     }
     
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx, 
-                                     model_.tensors, model_.buffer, error_msg_)) {
+                                     model_.tensors, model_.buffer, error_msg_,
+                                     GGML_BACKEND_DEVICE_TYPE_GPU)) {
         return false;
     }
     
@@ -755,6 +756,10 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
     ggml_set_output(cur);
     
     ggml_build_forward_expand(gf, cur);
+
+    // Same F16-accumulator trap as the vocoder: this is a conv tower over F16
+    // weights, so the GPU backends would sum it in half precision.
+    force_f32_matmuls(gf);
     
     ggml_free(ctx0);
     

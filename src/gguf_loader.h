@@ -84,6 +84,19 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
                                       bool exclusive = false);
 void release_preferred_backend(ggml_backend_t backend);
 
+// Mark every matmul in `gf` as GGML_PREC_F32.
+//
+// Both audio models here store their conv weights as F16, and ggml_conv_1d
+// lowers to im2col + mul_mat keeping the im2col in F16 too. With an F16 left
+// operand the CUDA/HIP backends pick a half-precision cuBLAS compute type, so a
+// deep convolution tower accumulates thousands of products in ~3 significant
+// digits and the error compounds layer over layer. Ask for an F32 accumulator
+// instead; on hardware without tensor cores it is also the faster path.
+//
+// Call it on a finished graph, before allocating it. Talker graphs deliberately
+// do not use this: F16 accumulation is the right default for LLM-shaped matmuls.
+void force_f32_matmuls(struct ggml_cgraph * gf);
+
 // Set the thread count on `backend` if and only if it is a CPU backend.
 // No-op for GPU/accelerator backends (which ignore thread count). Safe to call
 // with a null backend or non-positive n_threads.
