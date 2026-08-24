@@ -1,17 +1,29 @@
 # Qwen3-TTS GGML Optimization Report
 
-Performance characterization of this fork. Last updated **2026-08-20**.
+Performance characterization of this fork. Last updated **2026-08-24**.
 
 ## Summary
+
+> **The tables in this section are from the August 20 sweep and describe a
+> build whose vocoder was silently running on the CPU** (`known-issues.md` #13).
+> They are kept because the *relative* wins they record — KV windowing, prefill,
+> backend ranking — are real and still hold. The absolute end-to-end and RTF
+> figures are not current. For numbers that describe today's build, go to
+> **Current profile** below.
+>
+> What moved on 2026-08-24: vocoder decode 53.4 → 12.9 ms/frame (CUDA, 1.7B),
+> ICL warm-up 6.2 s → 2.2 s, voice cloning 40 s → 0.65 s (`known-issues.md`
+> #13-#15).
 
 **Test configuration:** NVIDIA GTX 1660 SUPER (Turing TU116, 6 GB, **no tensor
 cores**), Ryzen 7 5700X, Q8_0 1.7B Base talker + F16 vocoder, ~42 s Russian
 clip, ICL cloned voice, default sampling (`temperature 0.9`, `top_k 50`).
 
 **Read the numbers in this table as warm-process numbers** — a server that has
-already answered one request for this voice. A cold process pays **~6.2 s more**
+already answered one request for this voice. A cold process pays **~2.2 s more**
 for the ICL warm-up, where the vocoder decodes the reference frames before the
-first synthesis (measured 2026-08-20 as the gap between tokenize and prefill;
+first synthesis (6.2 s before the vocoder reached the GPU; re-measured
+2026-08-24 as the gap between tokenize and prefill, 1.9 s on ROCm;
 it is cached per process, so the CLI pays it on every invocation and the server
 only once per voice). Comparing a CLI run against this table without accounting
 for that is how the 22.9 s below turns into an apparent 29.8 s.
@@ -145,22 +157,63 @@ and not. The quality cost is audible.
 
 ## Current profile (where the time goes)
 
-Short line (~4 s audio, 54 frames), warm server, 1.7B, CUDA:
+**Re-measured 2026-08-24, after the vocoder was found to have been running on
+the CPU (`known-issues.md` #13). Every profile older than that date described
+the wrong device — do not mix the two.**
 
-- **prefill ~415 ms** — 210 tokens (150 of them ICL reference frames) through
-  28 layers. Close to this card's GEMM throughput; the way to shrink it is a
-  shorter reference sample, not a faster kernel.
-- **talker ~9 ms/frame**, **code predictor ~13 ms/frame**, embed lookups ~0.2.
-- **vocoder ~53 ms/frame** — twice the talker and code predictor combined, and
-  the thing everything else now hides behind, not the other way round.
+`ward.txt`, 1.7B, `QWEN3_TTS_PIPELINE=0` so the stages time apart, warm process,
+fixed seed. Frame counts differ per backend because sampling does, so compare
+ms/frame, not wall time:
 
-The code predictor is the odd one out — it costs the **same 13 ms/frame on the
-0.6B and the 1.7B model**, because it is 15 sequential 5-layer passes per frame
-over the same weights regardless of talker size. That makes it look like a
-target, and it is not: it sits inside the generation stage that the vocoder
-already hides. Only ~10% of its time is framework overhead anyway (of 7272 ms
-on `ward.txt`: build 143, alloc 230, I/O 351, **compute 6490**), which is why
-fusing the 15 passes into one graph bought only 3%.
+Decode covers the 150-frame ICL reference warm-up as well as the generated
+frames, in these numbers and in the older ones they are compared against; per
+*decoded* frame the vocoder is 10.1 ms on CUDA.
+
+| stage | CUDA, 1660 SUPER | ROCm, RX 6800 XT |
+|---|---|---|
+| talker forward | 10.1 ms/frame | 7.1 ms/frame |
+| code predictor | **13.2 ms/frame** | **10.9 ms/frame** |
+| generate (total) | 25.1 ms/frame | 18.9 ms/frame |
+| vocoder decode | 12.9 ms/frame | 8.9 ms/frame |
+| wall, pipeline off | 20 493 ms (539 fr) | 13 715 ms (494 fr) |
+| wall, pipeline on | 18 977 ms | 11 846 ms |
+
+**The ordering has flipped.** The vocoder was 53.4 ms/frame and hid everything;
+it is now 12.9 and *generation is roughly twice it*. Prefill is 793 ms for the
+1.7B (210 tokens, 150 of them ICL reference frames).
+
+The **code predictor is now the largest single line** — 13.2 ms/frame, more than
+the talker. It costs the same on the 0.6B and the 1.7B, because it is 15
+sequential 5-layer passes per frame over weights that do not change size with
+the talker. It was retired as a target in the previous revision of this file;
+that verdict was conditional on a 53 ms/frame vocoder hiding it, and that
+condition is gone.
+
+### Inside the vocoder
+
+Per-op, CUDA, `QWEN3_TTS_PROFILE_OPS=1`. The profiler disables fusion, but for
+this graph it costs only 3.6% (decode 2472 ms → 2561 ms), so the shares are
+trustworthy here — unlike the generate profile, which it inflates by 64%.
+
+| op | share of decode |
+|---|---|
+| `CONV_TRANSPOSE_1D` | **52%** |
+| `MUL_MAT` (the conv towers) | 11% |
+| `ADD` | 2% |
+| `IM2COL` | **1.7%** |
+
+Note what this kills. The whole previous roadmap was built on giving ggml a
+direct `conv_1d` kernel to avoid im2col — and im2col is now **1.7%** of decode.
+That project is not worth doing for this model.
+
+The new target is `CONV_TRANSPOSE_1D`, and it is a far better-shaped one,
+because unlike `conv_1d` it is a real op with a real kernel to improve. The
+biggest single entry costs **71 ms per call** for a `[520, 768]` output, which
+is absurd for 400k elements. `ggml/src/ggml-cuda/conv-transpose-1d.cu` explains
+it: one thread per output element, each looping over every input channel and
+the whole kernel width, reading weights and inputs straight from global memory
+with no tiling or reuse — and `continue`-ing out of roughly `s0-1` of every
+`s0` iterations, so most of the loop is thrown away. See `ggml-notes.md`.
 
 ## Tried and ruled out — do not redo
 
@@ -181,7 +234,9 @@ fusing the 15 passes into one graph bought only 3%.
 - **F32 vocoder weights** (hypothesis: TU116 lacks tensor cores, so F16 GEMM
   might lose to SGEMM). Converted the tokenizer GGUF to F32: 11% *slower*
   (24.8 s vs 22.4 s). The doubled weight traffic costs more than the compute
-  path saves. F16 stays.
+  path saves. F16 stays. Measured with the vocoder on the CPU, and a separate
+  question from the F32 *accumulator* the vocoder graph now asks for, which is
+  both more accurate and free — see `known-issues.md` #14.
 - **CUDA graphs** are enabled (`GGML_CUDA_GRAPHS=ON`, off by default in ggml)
   and do capture, but the generation loop is not launch-bound once the KV
   window is fixed, so they are not where the remaining time is.
@@ -200,18 +255,23 @@ fusing the 15 passes into one graph bought only 3%.
 
 ## Remaining ideas (descending value)
 
-1. **Vocoder convolutions — the only target left.** 53.4 ms/frame against
-   25.1 ms/frame for all of generation (`ward.txt`, 1.7B, CUDA, pipeline off so
-   the stages are timed apart: generate 13 025 ms, decode 27 703 ms). With the
-   pipeline on, 7.5 s of the generate wall is the talker blocked on the decode
-   queue. `im2col`+`mul_mat` reaches only ~12% of this card's FP32 peak; a
-   direct conv1d kernel would be a ggml-side project. See `docs/ggml-notes.md`.
-
-   The consequence for everything else: **the code predictor is already free.**
-   At 13.1 ms/frame it looked like the floor, but it sits inside the 25.1 ms
-   that the vocoder's 53.4 ms already covers. Making it instantaneous would
-   move generation from 13.0 s to 6.2 s and the total by nothing. Do not spend
-   effort there until the vocoder number moves.
+1. **`CONV_TRANSPOSE_1D` kernel in ggml** — 52% of decode, and the current CUDA
+   kernel is naive enough that this is ordinary optimisation work rather than
+   research: tile it, stage weights in shared memory, and stop iterating over
+   the stride positions that are discarded. Upstream project; benefits every
+   audio decoder on ggml.
+2. **The code predictor is a target again** at 13.2 ms/frame — now the single
+   largest line, no longer hidden. Note what was already ruled out: fusing the
+   15 passes into one graph bought 3% and broke Vulkan, and only ~10% of its
+   time is framework overhead, so the win has to come from cutting the *number*
+   of sequential passes, not from dispatching them faster.
+3. **Overlap pays less than it used to.** With the vocoder on the CPU the
+   pipeline overlapped two different pieces of hardware; now both stages want
+   the same GPU and it recovers only part of the decode (CUDA 20 493 → 18 977
+   ms, ROCm 13 715 → 11 846). Still worth keeping on, no longer a big lever.
+4. **Prefill** (793 ms, 1.7B) is dominated by the 150 ICL reference frames. A
+   shorter reference shrinks it — but pick a reference for prosody, not speed;
+   see the ruled-out note on reference length.
 
 ## Measurement notes
 
