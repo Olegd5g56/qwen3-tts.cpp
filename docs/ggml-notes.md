@@ -86,6 +86,42 @@ that isolates it.
 
 ---
 
+## `CONV_TRANSPOSE_1D` has a naive CUDA kernel — the real target
+
+Re-profiling after the vocoder reached the GPU (`known-issues.md` #13) put
+**52% of decode in `CONV_TRANSPOSE_1D`**, against 1.7% in `IM2COL`. The biggest
+single entry costs **71 ms per call** for a `[520, 768]` output — 400k elements,
+so this is roughly three orders of magnitude off what the hardware can do.
+
+`ggml/src/ggml-cuda/conv-transpose-1d.cu` shows why. One thread per output
+element; each thread loops over every input channel and the entire kernel width,
+reading weights and inputs straight from global memory:
+
+```c
+for (int c = 0; c < src0_ne2; c++) {
+    ...
+    for (int k = 0; k < src0_ne0; k++) {
+        int input_numer = out_t + p0 - k*d0;
+        if (input_numer < 0 || input_numer % s0 != 0) {
+            continue;                      // most iterations end here
+        }
+        ...
+        accumulator += src0[kernel_offset + k] * src1[input_offset + input_t];
+    }
+}
+```
+
+No tiling, no shared memory, no reuse of the weights every thread in a block
+needs — and the `% s0` test discards roughly `s0-1` of every `s0` iterations, so
+the loop trip count is a multiple of the useful work. Neighbouring output
+elements read almost the same inputs and the exact same weights, which is what a
+tiled kernel exists to exploit.
+
+Unlike the conv1d gap below, this is ordinary optimisation of an existing kernel
+rather than adding a missing op, and it benefits every audio decoder on ggml.
+
+---
+
 ## Defaults and behaviours worth knowing
 
 - **`GGML_CUDA_GRAPHS` defaults to OFF** in standalone ggml (it is ON in
