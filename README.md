@@ -274,7 +274,7 @@ spoken text, not just the timbre.
 | Variable | Default | Effect |
 |---|---|---|
 | `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/ROCm/Metal, off for Vulkan. `1`/`0` forces it. |
-| `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch. `8` saves ~120 MB VRAM and costs ~7%. |
+| `QWEN3_TTS_DECODE_BATCH` | 16 overlapped / 100 sequential | Frames per vocoder batch; overrides both paths. `8` saves ~120 MB VRAM and costs ~7%. Above ~100 frames larger batches buy nothing. |
 | `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from input length. `0` disables it. |
 | `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
 | `QWEN3_TTS_FORCE_CPU` | off | `1` keeps everything on the CPU. |

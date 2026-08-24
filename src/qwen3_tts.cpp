@@ -59,13 +59,28 @@ bool pipeline_supported(const std::string & backend_name) {
     return false;
 }
 
-int decode_batch_frames() {
+// QWEN3_TTS_DECODE_BATCH, or 0 when unset — the two callers below have
+// different defaults and only share the override.
+int decode_batch_override() {
     static const int frames = [] {
         const char * env = std::getenv("QWEN3_TTS_DECODE_BATCH");
         const int    n   = env ? atoi(env) : 0;
-        return n > 0 ? n : 16;
+        return n > 0 ? n : 0;
     }();
     return frames;
+}
+
+// Overlapped path: small, so the vocoder starts early in the utterance.
+int decode_batch_frames() {
+    const int n = decode_batch_override();
+    return n > 0 ? n : 16;
+}
+
+// Sequential path: nothing to overlap with, so trade first-audio latency for
+// fewer per-batch graph builds.
+int sequential_decode_batch_frames() {
+    const int n = decode_batch_override();
+    return n > 0 ? n : 100;
 }
 
 // Runs the vocoder on a worker thread so it overlaps with code generation.
@@ -1102,7 +1117,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
 
-    constexpr int32_t DECODE_BATCH = 100;
+    const int32_t DECODE_BATCH = sequential_decode_batch_frames();
     for (int32_t off = 0; off < n_frames; off += DECODE_BATCH) {
         int32_t batch = std::min(DECODE_BATCH, n_frames - off);
         if (!audio_decoder_.stream_decode(

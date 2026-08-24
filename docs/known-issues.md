@@ -25,6 +25,7 @@ root cause still there) / **wontfix**.
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
 | [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | open 2026-08-24 |
+| [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24, not upstreamed |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -677,6 +678,56 @@ code-predictor path and is reached on both backends.
 moment anyone converts with `--type f16`, and it blocks using F16 as the
 precision control when attributing speed wins to quantisation (see
 `optimization.md`). F32 works and can stand in, at 2x the weight bytes.
+
+<a id="17"></a>
+## 17. A vocoder OOM segfaults instead of failing — upstream ggml
+
+**Status:** fixed locally in the ggml submodule, not upstreamed
+**Found:** 2026-08-24
+**Severity:** availability — an out-of-memory kills the process, server included
+
+`QWEN3_TTS_DECODE_BATCH=400` on the 1660 SUPER needs a 4089 MiB compute buffer,
+which does not fit. Instead of the clean error our code is ready to return, the
+process died with SIGSEGV:
+
+```
+#0  ggml_gallocr_alloc_graph ()
+#1  ggml_backend_sched_alloc_graph ()
+#2  qwen3_tts::AudioTokenizerDecoder::stream_decode(...)
+```
+
+**Root cause**, `ggml/src/ggml-backend.cpp` in
+`ggml_backend_sched_alloc_splits()`:
+
+```c
+ggml_gallocr_reserve_n(sched->galloc, &sched->graph, ...);   // result discarded
+if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+```
+
+`ggml_gallocr_reserve_n` has already rewritten `galloc->node_allocs` to point
+into buffers by the time the allocation fails, and on failure it leaves those
+buffers NULL. Discarding its return value means `ggml_gallocr_alloc_graph` then
+walks the stale assignments and dereferences NULL. Our own check on
+`ggml_backend_sched_alloc_graph` (`audio_tokenizer_decoder.cpp:1167`) is
+correct; it simply never gets to run.
+
+**Fix** — check the return value:
+
+```c
+if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph,
+                            sched->node_backend_ids, sched->leaf_backend_ids)) {
+    GGML_LOG_ERROR("%s: failed to reserve graph\n", __func__);
+    return false;
+}
+```
+
+Verified: the same run now exits 1 with `Failed to decode speech codes: Failed
+to allocate streaming graph`.
+
+**Caveat: `ggml` is a submodule pinned at v0.20.2, so this patch is not
+committed and `git submodule update` silently removes it**, restoring the
+crash. Either upstream it or carry it as a patch file. Reproduce with any
+`QWEN3_TTS_DECODE_BATCH` large enough to exhaust the card.
 
 ---
 

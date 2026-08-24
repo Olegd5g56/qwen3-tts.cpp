@@ -106,10 +106,10 @@ them. So `CONV_TRANSPOSE_1D` remains the right target, and 2.67 ms/frame is now
 a **demonstrated ceiling on a 1660 SUPER** rather than a hope — but closing the
 gap means writing a genuinely good kernel, not finding a silly mistake.
 
-**A second, independent pointer at the same op.** PyTorch decodes all 653
-frames in one shot inside 5.2 GB. We must chunk, because one-shot costs ~14 GB
-host RSS (`project_vocoder_chunked_decode`). Slow and memory-hungry most likely
-share one cause.
+**PyTorch also decodes all 653 frames in one shot inside 5.2 GB where we must
+chunk.** That looked like a second pointer at the same op — memory-hungry and
+slow sharing one cause. It is not; see *Chunk size is not a speed lever* below.
+The memory difference is real, the speed inference was wrong.
 
 **The generation win is mostly engine, not quantisation.** Controlling with an
 F32 GGUF (2x the weight bytes of PyTorch's bf16) still gives 34.1 ms/frame
@@ -143,6 +143,43 @@ the three), which is expected — the vocoder is the same F16 file in all of the
   `non_streaming_mode=True` puts the whole text in the prefill and lets the
   model stop after a few frames. Our CLI feeds text one token per frame, so
   the comparable setting is the default `False`.
+
+## Chunk size is not a speed lever — measured, negative
+
+The vocoder never decodes a whole utterance. Every production path — CLI,
+server, ICL warm-up, live streaming — goes through `stream_decode` in chunks;
+one-shot `decode()` survives only in tests. The premise worth testing was
+that chunking is a compromise costing us throughput, and that fixing the
+memory blowup would buy speed back. **It does not.**
+
+Medians of three, `ward.txt`, `QWEN3_TTS_PIPELINE=0`, otherwise-idle cards:
+
+| chunk | CUDA (1660S) | VRAM | HIP (6800 XT) |
+|---|---|---|---|
+| 25 | 13.27 ms/frame | 2254 MiB | — |
+| **100** (default) | **9.32** | 3396 MiB | **5.87 ms/frame** |
+| 200 | 9.06 | 4902 MiB | 5.93 |
+| 400 | out of memory | needs 4089 MiB for the compute buffer alone | 5.76 |
+| 713 (one-shot) | out of memory | — | 5.95 |
+
+Above ~100 frames the differences are inside the run-to-run spread — single
+runs in both groups came in at 12.3-12.9 ms/frame while their neighbours sat at
+9.1. Below it there is a real cliff: 25 frames costs 42%. **So the default of
+100 already sits on the plateau, and one-shot decode is worth nothing.** Do not
+spend effort making it fit.
+
+The memory figure is nonetheless real: VRAM grows ~15 MiB per frame, so a
+713-frame one-shot needs ~12.6 GB, confirming the ~14 GB folklore. It buys
+headroom on a small card, not throughput.
+
+Two things did come out of the measurement:
+
+- **known-issues #17** — running out of memory here segfaults rather than
+  failing, because `ggml_backend_sched_alloc_splits` discards the return value
+  of `ggml_gallocr_reserve_n`. One-line upstream fix, verified.
+- `QWEN3_TTS_DECODE_BATCH` was documented as *the* vocoder batch knob but only
+  reached the overlapped path and the ICL warm-up; the sequential path had 100
+  hardcoded. Both now honour it, keeping their different defaults (16 and 100).
 
 ## 0.6B vs 1.7B — not a speed dial
 
