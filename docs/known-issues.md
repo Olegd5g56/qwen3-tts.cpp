@@ -7,8 +7,27 @@ found in passing gets lost.
 Status: **open** (not fixed) / **fixed** / **mitigated** (symptom addressed,
 root cause still there) / **wontfix**.
 
+| # | Issue | Status |
+|---|---|---|
+| [1](#1) | Streaming decoder is not fully causal — `test_streaming_parity` fails | closed 2026-08-20 |
+| [2](#2) | Voice cache is not invalidated across model variants | fixed 2026-08-20 |
+| [3](#3) | `--temperature 0` degenerates | fixed 2026-08-20 (budget catches it, both front ends warn) |
+| [4](#4) | Vendored ggml could not build against CUDA 13 | fixed (ggml 0.9.11 → 0.20.2) |
+| [5](#5) | Two ggml Vulkan backend instances serialise on one device | worked around (pipeline gated to CUDA/Metal) |
+| [6](#6) | Stale architecture numbers in `AGENTS.md` | fixed 2026-08-20 |
+| [7](#7) | Codebook truncation breaks generation, not just fidelity | wontfix 2026-08-20 |
+| [8](#8) | ggml Vulkan multi-add fusion is pathological on RADV / RDNA2 | worked around (env var), upstream bug |
+| [9](#9) | ROCm is no longer the slow option on gfx1030 | resolved |
+| [10](#10) | Why CUDA used to measure slower than Vulkan | explained; fixed by the KV window |
+| [11](#11) | Generation does not stop — runs to the 6144-frame cap on long text | mitigated (guard + retry); root cause is upstream and unfixed |
+| [12](#12) | Frame budget counted a digit as a letter | fixed 2026-08-20 |
+| [13](#13) | The vocoder never ran on the GPU | fixed 2026-08-24 |
+| [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
+| [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
+
 ---
 
+<a id="1"></a>
 ## 1. Streaming decoder is not fully causal — `test_streaming_parity` fails
 
 **Status:** closed 2026-08-20 — not a bug; the test asked the wrong question
@@ -50,6 +69,7 @@ QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build -R streami
 
 ---
 
+<a id="2"></a>
 ## 2. Voice cache is not invalidated across model variants
 
 **Status:** fixed 2026-08-20
@@ -78,6 +98,7 @@ free. Not done: switching is rare and one file per voice is simpler.
 
 ---
 
+<a id="3"></a>
 ## 3. `--temperature 0` degenerates
 
 **Status:** fixed 2026-08-20 (budget catches it, both front ends warn)
@@ -101,6 +122,7 @@ The failure is input- and seed-dependent, which is what made it confusing.
 
 ---
 
+<a id="4"></a>
 ## 4. Vendored ggml could not build against CUDA 13
 
 **Status:** fixed (ggml 0.9.11 → 0.20.2)
@@ -124,6 +146,7 @@ measurements were taken. The reason CUDA measured slower back then is issue
 
 ---
 
+<a id="5"></a>
 ## 5. Two ggml Vulkan backend instances serialise on one device
 
 **Status:** worked around (pipeline gated to CUDA/Metal)
@@ -147,6 +170,7 @@ Nvidia's Vulkan driver, plus `streaming_parity_test`, which passes at −62.4 dB
 
 ---
 
+<a id="6"></a>
 ## 6. Stale architecture numbers in `AGENTS.md`
 
 **Status:** fixed 2026-08-20
@@ -173,6 +197,7 @@ and the missing language ids.
 
 ---
 
+<a id="7"></a>
 ## 7. Codebook truncation breaks generation, not just fidelity
 
 **Status:** wontfix 2026-08-20 — the dial works, the payoff does not justify it
@@ -213,6 +238,7 @@ a research knob.
 
 ---
 
+<a id="8"></a>
 ## 8. ggml Vulkan multi-add fusion is pathological on RADV / RDNA2
 
 **Status:** worked around (env var), upstream bug
@@ -244,6 +270,7 @@ on an AMD card. Set in `Dockerfile.vulkan`. Harmless on NVIDIA.
 
 ---
 
+<a id="9"></a>
 ## 9. ROCm is no longer the slow option on gfx1030
 
 **Status:** resolved — recommendation changed
@@ -269,6 +296,7 @@ fallback despite AMD having dropped the card from official support.
 
 ---
 
+<a id="10"></a>
 ## 10. Why CUDA used to measure slower than Vulkan
 
 **Status:** explained; fixed by the KV window
@@ -293,6 +321,7 @@ that waste worse than the other backend did.
 
 ---
 
+<a id="11"></a>
 ## 11. Generation does not stop — runs to the 6144-frame cap on long text
 
 **Status:** mitigated (guard + retry); root cause is upstream and unfixed
@@ -400,6 +429,7 @@ concurrently with generation — CUDA and ROCm, not Vulkan. Not implemented.
 
 ---
 
+<a id="12"></a>
 ## 12. Frame budget counted a digit as a letter
 
 **Status:** fixed 2026-08-20
@@ -434,6 +464,7 @@ risk. It does not — zero runaways in 60 runs. The bug was ours.
 
 ---
 
+<a id="13"></a>
 ## 13. The vocoder never ran on the GPU
 
 **Status:** fixed 2026-08-24
@@ -490,6 +521,7 @@ mis-attributed profile above.
 
 ---
 
+<a id="14"></a>
 ## 14. GPU vocoder accumulated the whole conv tower in F16
 
 **Status:** fixed 2026-08-24
@@ -532,6 +564,7 @@ correct, the accumulator type was not.
 
 ---
 
+<a id="15"></a>
 ## 15. Voice cloning spent 40 s in a hand-rolled O(n²) DFT
 
 **Status:** fixed 2026-08-24

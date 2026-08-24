@@ -113,7 +113,9 @@ Backend initialization and scheduling notes:
 
 - Use `init_preferred_backend()` (`src/gguf_loader.cpp`) to select backend in order: `IGPU -> GPU -> ACCEL -> CPU`
 - If the selected runtime backend is not CPU, add a CPU backend as scheduler fallback (`backend_cpu`) when calling `ggml_backend_sched_new(...)`
-- Decoder follows the same backend preference; load decoder weights with `GGML_BACKEND_DEVICE_TYPE_IGPU` preference for Metal-first execution
+- **Weights decide where a graph runs.** `ggml_backend_sched` pins a node to the buffer its weights live in, so `load_tensor_data_from_file()` has to land them on the accelerator too. It walks the same ladder; passing one exact device class is not enough. Getting this wrong is silent — the log still prints the compute backend's name while the whole graph runs on the CPU (`known-issues.md` #13)
+- **A stage that runs concurrently with another needs `init_preferred_backend(..., exclusive=true)`.** One instance owns one stream and one memory pool, and the CUDA pool asserts frees arrive in reverse order, which two threads cannot honour. Only the decoder needs this today (`known-issues.md` #13)
+- **Conv-tower graphs must call `force_f32_matmuls()` before allocation.** Conv weights are F16 and `ggml_conv_1d` keeps its im2col F16, so CUDA/HIP pick a half-precision accumulator and a deep tower loses ~30 dB. Applies to the vocoder and the speaker encoder; talker graphs deliberately keep F16 accumulation (`known-issues.md` #14)
 
 ### Model Architecture
 
@@ -180,7 +182,7 @@ Verified against the ggufs and `tts_transformer.h` on 2026-08-20.
 - `tts_transformer.cpp` — The core file (~3200 lines). Contains `generate()`, `forward_prefill()`, `forward_step()`, `predict_codes_autoregressive()`, and all graph builders.
 - `qwen3_tts.cpp` — Pipeline orchestration. Calls tokenizer, encoder, transformer, decoder in sequence. Also hosts audio I/O helpers (`load_audio_file`, `save_audio_file`, `encode_wav/mp3/opus`).
 - `audio_streamers.h/cpp` — `opus_streamer` and `mp3_streamer`. Both server-side live streaming AND the one-shot `encode_mp3`/`encode_opus` go through these, so VBR settings live in one place.
-- `voice_store.h/cpp` — Two-tier voice library: disk (`<dir>/<id>/{sample.wav|mp3,sample.txt?,cache.bin}`) is read-only via the API, plus an in-memory session tier created via `POST /v1/audio/voices`. `refresh()` is cheap (directory listing only); `preload_all()` and `get()` are where encoding happens. Disk-vs-session collisions return 409.
+- `voice_store.h/cpp` — Two-tier voice library: disk (`<dir>/<id>/{sample.wav|mp3,sample.txt?,cache.bin}`) is read-only via the API, plus an in-memory session tier created via `POST /v1/audio/voices`. `refresh()` is cheap (directory listing only); `preload_all()` and `get()` are where encoding happens. `preload_all()` locks per voice and is cancellable, so the server runs it on a background thread and starts listening immediately; `get()` encodes on demand for anything the sweep has not reached. Disk-vs-session collisions return 409.
 - `server.cpp` — HTTP entrypoints. The handlers themselves live here; everything around them was moved out: arg parsing/env/HF download → `server_args.cpp`, PCM/WAV/base64/SSE payload → `server_audio.cpp`.
 - `CMakeLists.txt` — Build configuration. Each pipeline component is a separate static library; `qwen3_tts` aggregates them and embeds the audio I/O + streamer code.
 
@@ -225,21 +227,34 @@ bash scripts/run_all_tests.sh           # Full suite
 
 ## Performance Profile
 
-Measured August 2026 on CUDA (GTX 1660 SUPER, Q8_0 1.7B, ~42 s clip), after the
-August sweep (ggml 0.20.2, KV windowing, generate/decode overlap):
+Measured 2026-08-24 on CUDA (GTX 1660 SUPER, Q8_0 1.7B, `ward.txt`), stages
+timed apart with `QWEN3_TTS_PIPELINE=0`:
 
-- RTF 0.53 on a long clip (1.9x realtime), 0.60 on a short line via a warm
-  server. CUDA is the fastest backend on NVIDIA by a wide margin.
+| stage | ms/frame |
+|---|---|
+| talker | 10.1 |
+| code predictor | 13.2 |
+| generate total | 25.1 |
+| vocoder decode | 12.9 |
+
+RTF 0.44 (2.3x realtime) end to end with the pipeline on; 0.30 on ROCm/6800 XT.
+
+- **Generation is now ~2x the vocoder**, and the code predictor is the largest
+  single line. It costs the same on the 0.6B and the 1.7B — 15 sequential
+  5-layer passes over weights that do not scale with the talker — and it is
+  ~70% weight-read bandwidth, not arithmetic. Quantising it works and was
+  rejected on audible quality.
+- Inside the vocoder, `CONV_TRANSPOSE_1D` is 52% of decode and `IM2COL` is 1.7%.
+  Anything premised on avoiding im2col is not worth doing for this model.
 - Vocoder decode runs on a worker thread concurrently with generation
-  (`decode_pipeline` in `qwen3_tts.cpp`). This is gated per backend: on CUDA and
-  Metal it is the biggest single win; on Vulkan two backend instances serialise
-  and it must stay off. `QWEN3_TTS_PIPELINE=1/0` overrides.
+  (`decode_pipeline` in `qwen3_tts.cpp`), gated per backend. Worth ~7% now that
+  both stages share the GPU; it was worth far more when it overlapped a GPU
+  talker with a CPU vocoder. On Vulkan two instances cannot run at once and it
+  must stay off. `QWEN3_TTS_PIPELINE=1/0` overrides.
 - Attention graphs view only the populated part of the KV cache
   (`QWEN3_TTS_KV_STEP` granularity). Viewing the full `MAX_AUDIO_TOKENS`-sized
   cache used to make flash-attn 31% of generation.
-- Within generation the code predictor now dominates (~13 ms/frame) and costs
-  the same on the 0.6B and 1.7B talkers — it is 15 sequential 5-layer passes,
-  bound by per-kernel latency rather than arithmetic.
+- Peak VRAM: ~3.2 GB for the 1.7B, ~2.1 GB for the 0.6B.
 - Speaker embeddings are hidden-size wide, so a voices directory is tied to one
   model variant.
 
@@ -249,6 +264,8 @@ wall time; `--temperature 0` is unstable on this model).
 
 ## Historical Performance Profile
 
-Superseded numbers (June 2026 Vulkan/RX 6800 XT sweep, and the CPU-only era
-before it) live in `docs/optimization.md`, which also records why each old
-conclusion changed. Do not re-derive backend advice from those figures.
+Superseded numbers live in `docs/optimization.md`, which records why each old
+conclusion changed. Do not re-derive advice from them. In particular, **every
+figure measured before 2026-08-24 described a build whose vocoder ran on the
+CPU** — including the "vocoder is the wall, write a conv1d kernel" conclusion,
+which is retracted.

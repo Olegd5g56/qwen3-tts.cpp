@@ -13,9 +13,8 @@ and a one-shot CLI.
 Languages: en, ru, zh, ja, ko, de, fr, es, it, pt.
 Backends: CUDA / ROCm / Vulkan / Metal / CPU.
 
-Design notes and measurements live in `docs/` — `optimization.md` for
-performance, `known-issues.md` for the bug log, `ggml-notes.md` for the ggml
-side.
+Measurements and design notes are in `docs/`: `optimization.md` (performance),
+`known-issues.md` (bug log), `ggml-notes.md` (ggml side).
 
 ## Quickstart
 
@@ -54,27 +53,24 @@ cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release # Vulkan
 
 Outputs: `build/qwen3-tts-server`, `build/qwen3-tts-cli`.
 
-**Use the vendor backend, not Vulkan.** Only CUDA/ROCm/Metal can overlap the
-vocoder with generation, which is worth 25–40% end to end.
+Prefer CUDA/ROCm/Metal over Vulkan on the same card.
 
-- CUDA: set `-DCMAKE_CUDA_ARCHITECTURES=` to your card (75 Turing, 86 Ampere,
-  89 Ada, 120 Blackwell). CUDA 13 needs GCC ≤ 15
+- **CUDA**: set `-DCMAKE_CUDA_ARCHITECTURES=` to your card (75 Turing,
+  86 Ampere, 89 Ada, 120 Blackwell). CUDA 13 needs GCC ≤ 15
   (`-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15`).
-- ROCm on gfx1030: add `-DAMDGPU_TARGETS=gfx1030
+- **ROCm on gfx1030**: add `-DAMDGPU_TARGETS=gfx1030
   -DCMAKE_HIP_ARCHITECTURES=gfx1030 -DCMAKE_PREFIX_PATH=/opt/rocm` and point
   the compilers at `/opt/rocm/llvm/bin/clang{,++}`.
-- Vulkan on AMD: set `GGML_VK_DISABLE_MULTI_ADD=1` at runtime or it is ~3x
-  slower (`known-issues.md` #8).
+- **Vulkan on AMD**: set `GGML_VK_DISABLE_MULTI_ADD=1` at runtime, or it is
+  ~3x slower.
 
-Toggles: `QWEN3_TTS_SERVER=OFF` skips the server, `QWEN3_TTS_TIMING=ON`
-compiles in per-stage timing, `QWEN3_TTS_NATIVE=ON` builds for the CPU doing
-the building (`-march=native`, and it pins ggml's `GGML_NATIVE` to match).
+### Build toggles
 
-`QWEN3_TTS_NATIVE` is **off** by default: a native binary run on a different
-CPU dies with `SIGILL` and no useful message, and building on a workstation to
-deploy on something else is a normal thing to do. Turn it on when the build
-host and the run host are the same machine. Note that off means "any modern
-x86-64", not "anything" — ggml's CPU backend still assumes AVX2.
+| Option | Default | Effect |
+|---|---|---|
+| `QWEN3_TTS_NATIVE` | `OFF` | `-march=native` for this CPU (also pins ggml's `GGML_NATIVE`). Turn on only when the build host and the run host are the same machine — elsewhere the binary dies with `SIGILL`. `OFF` still assumes AVX2. |
+| `QWEN3_TTS_SERVER` | `ON` | `OFF` skips building the server. |
+| `QWEN3_TTS_TIMING` | `OFF` | Compiles in per-stage timing. |
 
 ## Docker
 
@@ -84,26 +80,23 @@ docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD/Intel
 docker build -f Dockerfile.cpu    -t qwen3-tts:cpu    .   # CPU
 ```
 
-Images are portable by default. Add `--build-arg QWEN3_TTS_NATIVE=ON` to tune
-one to the CPU that built it — worth a few percent, and only correct when the
-build host and the run host are the same machine. `Dockerfile.cuda` also takes
-`--build-arg CUDA_ARCH=75` (default) and carries a `HEALTHCHECK`.
+Build args: `QWEN3_TTS_NATIVE=ON` (see the table above), and for
+`Dockerfile.cuda` also `CUDA_ARCH=75` (default). `Dockerfile.cuda` carries a
+`HEALTHCHECK`.
 
 ```bash
 docker run --rm -it --gpus '"device=0"' \
     -p 8081:8081 \
     -v /path/to/models:/models:ro \
     -v /path/to/voices:/voices \
-    -e TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-    -e TTS_VOCODER=/models/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
+    -e TTS_MODEL=/models/talker.gguf \
+    -e TTS_VOCODER=/models/vocoder.gguf \
     -e TTS_VOICES_DIR=/voices \
-    -e TZ=Europe/Warsaw \
+    -e TTS_HOST=0.0.0.0 \
     qwen3-tts:cuda
 ```
 
-Vulkan image: `--device /dev/dri --group-add video` instead of `--gpus`. CPU
-image: neither. Mount the voices directory **writable** — the server keeps
-`cache.bin` beside each sample. Container time is UTC unless `TZ` is set.
+Set `-e TZ=<IANA name>` to match log timestamps to the host.
 
 ## Models
 
@@ -117,40 +110,27 @@ GGUFs: [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-
 | 1.7B **VoiceDesign** | no | yes | no |
 | **vocoder** (Qwen3-TTS-Tokenizer-12Hz) | — | — | — |
 
-Only Base has a speaker encoder, so voice cloning works only there; loading a
-non-Base model disables the voice library at startup. The 0.6B is mostly a
-memory choice (~1 GB less); it is 11-13% faster per frame, not proportionally
-faster, because the code predictor and the vocoder are the same size in both.
+Cloning and the voice library need a **Base** model; loading anything else
+disables the library at startup.
 
-**GPU memory**: measured peak on a long clip, all three models resident, is
-**~3.2 GB for the 1.7B** and **~2.1 GB for the 0.6B**. Budget for that plus
-whatever else shares the card — a CUDA out-of-memory aborts the process rather
-than falling back. `QWEN3_TTS_DECODE_BATCH=8` trims ~120 MB at ~7% throughput,
-and `QWEN3_TTS_LOW_MEM=1` trades a model load per request for a much lower
-peak.
+0.6B vs 1.7B: ~1 GB less VRAM, ~11% faster per frame, audibly worse quality.
+
+**GPU memory** — peak on a long clip, everything resident:
+
+| Model | Peak VRAM |
+|---|---|
+| 1.7B | ~3.2 GB |
+| 0.6B | ~2.1 GB |
+
+Budget for that plus anything else on the card; a CUDA out-of-memory aborts the
+process. To cut it: `QWEN3_TTS_DECODE_BATCH=8` (−120 MB, −7% throughput) or
+`QWEN3_TTS_LOW_MEM=1` (much lower peak, one model load per request).
 
 **Auto-download**: `--hf-repo <repo>[:<quant>]` and `--hf-repo-v ...` (default
 quant `Q8_0`, cached in `~/.cache/huggingface/`). **Local**: `-m talker.gguf
 -v vocoder.gguf`; `-m` also takes a directory and finds the vocoder itself.
 
 ## Server
-
-One request at a time: synthesis is serialized, so a second request waits for
-the first to finish (tens of seconds on long text). `/health` answers while
-busy and reports `"busy": true`.
-
-**The server starts listening before the voice library is warm.** Encoding a
-voice with no `cache.bin` costs ~1.4 s, so a few hundred voices is minutes of
-work; it runs on a background thread and nothing waits for it. Voices encode on
-demand, so a request for a voice the sweep has not reached yet just pays for
-that one voice. `/health` reports progress and stays available throughout:
-
-```json
-{"status":"ok","model_loaded":true,"busy":true,
- "voices":{"total":312,"warmed":47,"warming":true}}
-```
-
-The `voices` object is absent when no voice library is configured.
 
 All flags have matching `TTS_*` env vars (CLI > env > default).
 
@@ -168,8 +148,15 @@ All flags have matching `TTS_*` env vars (CLI > env > default).
 | `-V, --verbose` | `TTS_VERBOSE` | off | per-stage progress + timing logs |
 | `--temperature`, `--top-k`, `--repetition-penalty`, `--seed` | `TTS_*` | `0.9` / `50` / `1.05` / `-1` | sampling defaults |
 
-`--temperature 0` is greedy and degenerates on this model — use a low
-temperature with a fixed `--seed` for repeatable output.
+Notes:
+
+- **One request at a time.** A second request waits for the first (tens of
+  seconds on long text).
+- `--temperature 0` degenerates on this model. Use a low temperature with a
+  fixed `--seed` for repeatable output.
+- The port opens before the voice library is warm. Voices encode on demand, so
+  requests work immediately; the first call for a not-yet-warmed voice is
+  slower.
 
 ### Endpoints
 
@@ -182,6 +169,15 @@ temperature with a fixed `--seed` for repeatable output.
 | `POST` | `/v1/audio/voices` | upload an in-memory session voice (multipart) |
 | `DELETE` | `/v1/audio/voices/:id` | drop a session voice |
 | `POST` | `/v1/audio/speech` | synthesize (one-shot or streaming) |
+
+`/health`:
+
+```json
+{"status":"ok","model_loaded":true,"busy":false,
+ "voices":{"total":312,"warmed":312,"warming":false}}
+```
+
+`voices` is absent when no voice library is configured.
 
 ### `POST /v1/audio/speech`
 
@@ -239,10 +235,10 @@ Two sources that never overlap.
     cache.bin      # generated: embedding + reference codes
 ```
 
-The server pre-warms the library at startup and re-encodes a voice whenever
-`sample.*` changes or the model variant does (~10 s per voice). First use of an
-ICL voice also pays a ~5 s vocoder warm-up, cached in-process afterwards.
-`DELETE` on a disk voice returns **409** — remove the directory instead.
+A voice is re-encoded (~1.4 s) whenever `sample.*` changes or the model variant
+does. First use of an ICL voice also pays a ~2 s vocoder warm-up, cached
+in-process afterwards. `DELETE` on a disk voice returns **409** — remove the
+directory instead.
 
 **Session**: `POST /v1/audio/voices` holds a voice in RAM. Survives idle
 unload, dies on restart, **409** on a name that collides with a disk voice.
@@ -270,18 +266,19 @@ Voices load lazily — only the one passed to `-v` is encoded.
 
 CLI-only flags: `-t/--text`, `-o/--output`, `-r/--reference`, `--ref-text`,
 `-l/--language`, `-i/--instructions`, `--list-voices`, `--codebooks`,
-`--streaming-batch-size`. `--codebooks` below 12 wrecks the spoken text, not
-just the timbre (`known-issues.md` #7).
+`--streaming-batch-size`. Do not set `--codebooks` below 12 — it wrecks the
+spoken text, not just the timbre.
 
 ## Environment knobs
 
 | Variable | Default | Effect |
 |---|---|---|
-| `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/Metal, off for Vulkan. `1`/`0` forces it. |
-| `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch when not streaming. Tuning it is worth ~2% and only on long lines. |
-| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard — caps generated frames from the input length, because the model sometimes never emits end-of-speech. `0` disables it. |
-| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only: disables fusion and syncs per node. |
-| `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and the vocoder resident at once — each is unloaded as soon as its stage is done. Cuts peak memory, costs a model load per request and gives up vocoder/generation overlap on the one-shot path. |
+| `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/ROCm/Metal, off for Vulkan. `1`/`0` forces it. |
+| `QWEN3_TTS_DECODE_BATCH` | 16 | Frames per vocoder batch. `8` saves ~120 MB VRAM and costs ~7%. |
+| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from input length. `0` disables it. |
+| `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
+| `QWEN3_TTS_FORCE_CPU` | off | `1` keeps everything on the CPU. |
+| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
 
 ## Testing
 
@@ -290,10 +287,9 @@ ctest --test-dir build
 QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build
 ```
 
-Most per-stage tests need reference dumps of the original Python inference,
-which are not in the repo; without them they report **Skipped**, so a red run
-means a real regression. `QWEN3_TTS_TEST_MODEL` points at a talker GGUF,
-`scripts/generate_deterministic_reference.py` regenerates the dumps.
+Tests without their fixtures report **Skipped**, so a red run is a real
+regression. `QWEN3_TTS_TEST_MODEL` points at a talker GGUF;
+`scripts/generate_deterministic_reference.py` regenerates the reference dumps.
 
 ## Acknowledgments
 
