@@ -711,8 +711,16 @@ bool Qwen3TTS::warmup_decoder_for_icl(const int32_t * ref_codes, int32_t n_ref_f
 
     audio_decoder_.stream_reset();
     std::vector<float> warmup_pcm;
-    if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
-        return false;
+    // Feed the reference in the same chunks the live path uses. One graph over
+    // all ~150 ref frames materialises im2col intermediates well over a GiB,
+    // which a GPU vocoder cannot allocate next to the talker; stream_decode is
+    // incremental and appends, so chunking changes only the working set.
+    const int32_t warmup_batch = decode_batch_frames();
+    for (int32_t off = 0; off < n_ref_frames; off += warmup_batch) {
+        const int32_t n = std::min(warmup_batch, n_ref_frames - off);
+        if (!audio_decoder_.stream_decode(ref_codes + (size_t) off * n_cb, n, warmup_pcm)) {
+            return false;
+        }
     }
 
     std::lock_guard<std::mutex> lock(cache_mutex);

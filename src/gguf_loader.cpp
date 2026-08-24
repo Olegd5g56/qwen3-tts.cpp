@@ -174,8 +174,30 @@ bool load_tensor_data_from_file(
     std::string & error_msg,
     enum ggml_backend_dev_type preferred_backend_type
 ) {
-    ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
-    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+    // Weights decide where the graph runs: ggml_backend_sched pins a node to the
+    // buffer its weights live in, so a CPU buffer here silently drags the whole
+    // model onto the CPU. Asking for one exact device class is therefore not
+    // enough -- IGPU does not exist on a desktop with a discrete card -- so walk
+    // the same accelerator ladder as init_preferred_backend() before settling
+    // for the CPU.
+    ggml_backend_t backend = nullptr;
+    if (preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+        if (!(force_cpu && force_cpu[0] == '1')) {
+            static const enum ggml_backend_dev_type ladder[] = {
+                GGML_BACKEND_DEVICE_TYPE_IGPU,
+                GGML_BACKEND_DEVICE_TYPE_GPU,
+                GGML_BACKEND_DEVICE_TYPE_ACCEL,
+            };
+            backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
+            for (size_t i = 0; !backend && i < sizeof(ladder) / sizeof(ladder[0]); ++i) {
+                if (ladder[i] != preferred_backend_type) {
+                    backend = ggml_backend_init_by_type(ladder[i], nullptr);
+                }
+            }
+        }
+    }
+    if (!backend) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (!backend) {
