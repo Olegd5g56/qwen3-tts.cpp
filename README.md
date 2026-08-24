@@ -67,7 +67,14 @@ vocoder with generation, which is worth 25–40% end to end.
   slower (`known-issues.md` #8).
 
 Toggles: `QWEN3_TTS_SERVER=OFF` skips the server, `QWEN3_TTS_TIMING=ON`
-compiles in per-stage timing.
+compiles in per-stage timing, `QWEN3_TTS_NATIVE=ON` builds for the CPU doing
+the building (`-march=native`, and it pins ggml's `GGML_NATIVE` to match).
+
+`QWEN3_TTS_NATIVE` is **off** by default: a native binary run on a different
+CPU dies with `SIGILL` and no useful message, and building on a workstation to
+deploy on something else is a normal thing to do. Turn it on when the build
+host and the run host are the same machine. Note that off means "any modern
+x86-64", not "anything" — ggml's CPU backend still assumes AVX2.
 
 ## Docker
 
@@ -77,9 +84,10 @@ docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD/Intel
 docker build -f Dockerfile.cpu    -t qwen3-tts:cpu    .   # CPU
 ```
 
-The binary is built `-march=native`, so an image is tied to the CPU that built
-it. `Dockerfile.cuda` takes `--build-arg CUDA_ARCH=75` (default) and carries a
-`HEALTHCHECK`.
+Images are portable by default. Add `--build-arg QWEN3_TTS_NATIVE=ON` to tune
+one to the CPU that built it — worth a few percent, and only correct when the
+build host and the run host are the same machine. `Dockerfile.cuda` also takes
+`--build-arg CUDA_ARCH=75` (default) and carries a `HEALTHCHECK`.
 
 ```bash
 docker run --rm -it --gpus '"device=0"' \

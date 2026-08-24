@@ -40,9 +40,14 @@
 # TZ defaults to UTC inside the container; set -e TZ=<IANA name> so the
 # server's log timestamps match wall-clock time on the host.
 #
-# Note: the binary is compiled with `-march=native` (from CMakeLists.txt), so
-# the image is tuned to the CPU that ran `docker build`. Fine for "build and
-# run on the same box"; not portable across machines with different CPUs.
+# Note: the build is portable by default (plain -O3; ggml's CPU backend still
+# assumes AVX2, so "portable" means any modern x86-64). To tune the image to the
+# CPU that runs `docker build` — worth a few percent, and only correct when the
+# build host and the run host are the same machine:
+#
+#   docker build -f Dockerfile.cuda --build-arg QWEN3_TTS_NATIVE=ON -t qwen3-tts:cuda .
+#
+# A native image moved to a different CPU dies with SIGILL and no useful error.
 
 ARG CUDA_VERSION=13.3.1
 ARG UBUNTU_VERSION=26.04
@@ -69,8 +74,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
+ARG QWEN3_TTS_NATIVE=OFF
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DQWEN3_TTS_NATIVE=${QWEN3_TTS_NATIVE} \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
         -DCMAKE_INSTALL_PREFIX=/opt/qwen3-tts \
@@ -105,8 +112,10 @@ ENV PATH=/opt/qwen3-tts/bin:$PATH \
 EXPOSE 8081
 
 # /health answers without taking the synthesis lock, so a busy server still
-# reports healthy rather than flapping mid-request.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+# reports healthy rather than flapping mid-request — and the voice library warms
+# on a background thread, so the port is open long before the library is ready.
+# The start period therefore only has to cover loading the model itself.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${TTS_PORT}/health" || exit 1
 
 ENTRYPOINT ["/opt/qwen3-tts/bin/qwen3-tts-server"]

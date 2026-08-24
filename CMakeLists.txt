@@ -5,10 +5,23 @@ project(qwen3-tts-ggml VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Build for the machine doing the building. OFF by default: a -march=native
+# binary run on a different CPU dies with SIGILL and no useful message, and
+# "built on the workstation, deployed on the mini-PC" is a normal thing to do.
+# Turn it on when the build host and the run host are the same machine.
+#
+# This governs ggml too (see below). Splitting the two would produce a binary
+# that is portable in our sources and not in ggml's, which is no kind of
+# portable at all.
+option(QWEN3_TTS_NATIVE "Optimize for the build machine's CPU (-march=native)" OFF)
+
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+    if(QWEN3_TTS_NATIVE)
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+    endif()
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 endif()
 
@@ -57,7 +70,11 @@ endif()
 # PIC is needed for the shared library — set globally so GGML libs get it too
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# GGML as subdirectory — options like GGML_VULKAN, GGML_METAL pass through automatically
+# GGML as subdirectory — options like GGML_VULKAN, GGML_METAL pass through
+# automatically. GGML_NATIVE is the exception: it defaults to ON in ggml, so it
+# has to be pinned to ours before the subdirectory is added, or the CPU backend
+# is built for this machine no matter what QWEN3_TTS_NATIVE says.
+set(GGML_NATIVE ${QWEN3_TTS_NATIVE} CACHE BOOL "ggml: optimize for the build machine" FORCE)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
 
