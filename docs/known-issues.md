@@ -425,3 +425,101 @@ Found while checking upstream #318's claim that mixed script raises the runaway
 risk. It does not — zero runaways in 60 runs. The bug was ours.
 
 ---
+
+---
+
+## 13. The vocoder never ran on the GPU
+
+**Status:** fixed 2026-08-24
+**Found:** 2026-08-24
+**Severity:** performance (3x on the dominant stage), and it invalidated the
+profile everything else was planned around
+
+`AudioTokenizerDecoder::load_model` asked for its weight buffer with
+`GGML_BACKEND_DEVICE_TYPE_IGPU` alone (`audio_tokenizer_decoder.cpp:289`,
+introduced upstream in `87a169b`). `load_tensor_data_from_file` had no ladder:
+if the exact device class was missing it fell straight to the CPU. There is no
+integrated GPU on a desktop with a discrete card, so the vocoder weights landed
+in a CPU buffer — and `ggml_backend_sched` pins a node to the buffer its weights
+live in, so **the entire vocoder graph ran on the CPU** while the log cheerfully
+reported `AudioTokenizerDecoder backend: CUDA0`.
+
+The tell was there all along and was misread as evidence of a GPU limit: the
+vocoder took the same time on cards that differ 4x in compute, and reached
+"12% of FP32 peak". Neither card was doing the work.
+
+**Reproducer** (before the fix), CUDA build, 61 frames:
+
+| `TTS_THREADS` | decode |
+|---|---|
+| 1 | 28 301 ms |
+| 8 | 5 619 ms |
+
+A 5x swing from CPU thread count is not something a GPU does.
+`GGML_SCHED_DEBUG=2` confirmed it: `IM2COL`, `SIN`, `CONCAT`,
+`CONV_TRANSPOSE_1D` and every `MUL_MAT` of the vocoder graph assigned to CPU.
+
+**Fixed** by giving `load_tensor_data_from_file` the same IGPU → GPU → ACCEL →
+CPU ladder `init_preferred_backend` already used, and honouring
+`QWEN3_TTS_FORCE_CPU` there.
+
+Two things surfaced only once the graph was actually on the GPU:
+
+- **ICL warm-up had to be chunked.** It fed all ~150 reference frames to
+  `stream_decode` in one call; that graph's im2col intermediates ask for
+  ~1.5 GiB, which will not allocate next to the talker. It now uses the same
+  batch the live path does. `stream_decode` is incremental and appends, so
+  only the working set changed.
+- **F16 accumulation** — see #14.
+
+**Numbers** (RX 6800 XT, same seed, 68 frames both runs, `QWEN3_TTS_PIPELINE=0`):
+
+| vocoder | decode |
+|---|---|
+| CPU (before) | 6 754 ms |
+| GPU (after) | 1 979 ms |
+
+`docs/ggml-notes.md` was rewritten: its conv1d section was built on the
+mis-attributed profile above.
+
+---
+
+## 14. GPU vocoder accumulated the whole conv tower in F16
+
+**Status:** fixed 2026-08-24
+**Severity:** correctness (30 dB of accuracy, failed streaming parity)
+
+Fixing #13 made `streaming_parity_test` fail. Every matmul in the vocoder has an
+F16 left-hand side — `ggml_conv_1d` lowers to im2col + `mul_mat` and keeps the
+im2col in F16, and the pre-transformer's weights are F16 in the GGUF. With an
+F16 `src0` the CUDA/HIP backends select `CUBLAS_COMPUTE_16F`
+(`ggml-cuda.cu:1394`), so a 25-layer convolution tower accumulates in half
+precision.
+
+This is not streaming-specific: the *one-shot* GPU decode already diverges from
+the CPU reference. Same codes, dumped and compared outside the process
+(`test_streaming_parity --dump`):
+
+| backend | one-shot vs CPU | streaming vs one-shot |
+|---|---|---|
+| CPU | — | −55.5 dB (pass) |
+| CUDA, F16 accum | 32.3 dB SNR | −30.0 dB (**fail**) |
+| ROCm, F16 accum | 22.4 dB SNR | −24.8 dB (**fail**) |
+| CUDA, F32 accum | 51.6 dB SNR | −50.0 dB (pass) |
+| ROCm, F32 accum | 53.0 dB SNR | −61.3 dB (pass) |
+
+Worst single sample before the fix: CPU `0.2278` vs ROCm `0.0048`. Not rounding.
+
+**Fixed** by walking the finished vocoder graph and marking every `MUL_MAT`
+`GGML_PREC_F32` (`force_f32_matmuls`, `audio_tokenizer_decoder.cpp`). Scoped to
+this graph on purpose — F16 accumulation is the right default for the talker.
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` reproduces the same effect process-wide and
+was how the cause was isolated.
+
+**It is also faster.** On a 1660 SUPER (Turing TU116, no tensor cores) F16 GEMM
+buys nothing and the F32 path is better optimised: decode 4 089 ms → 2 729 ms.
+Do not assume this trade costs speed without measuring it on the target card.
+
+**Ruled out:** the individual kernels. `test-backend-ops` passes for `IM2COL`,
+`CONV_TRANSPOSE_1D`, `SIN`, `CONCAT`, `SQR` and `EXP` on ROCm — the ops are
+correct, the accumulator type was not.

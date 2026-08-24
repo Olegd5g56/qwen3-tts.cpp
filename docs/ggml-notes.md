@@ -50,45 +50,39 @@ older ggml with a current toolkit will hit it.
 
 ---
 
-## Missing kernel: direct 1D convolution
+## `ggml_conv_1d` has no direct kernel, and keeps its im2col in F16
 
-`ggml_conv_1d` is still im2col + `mul_mat`, with no direct kernel (unlike
-`ggml_conv_2d_direct`). For audio decoders this is the dominant cost and it
-leaves most of the GPU unused:
+`ggml_conv_1d` is not an op. It is a graph-level composition — `ggml_im2col`
+followed by `ggml_mul_mat` (`ggml/src/ggml.c:4521`) — so there is no
+`GGML_OP_CONV_1D` node to look for and no backend kernel to be missing. Upstream
+has `ggml_conv_2d_direct` and `ggml_conv_3d_direct`; a `conv_1d_direct` still
+does not exist as of ggml 0.20.2. Two consequences for audio models:
 
-- On the 1660 SUPER the vocoder's convolutions reach roughly **12% of the
-  card's FP32 peak**. A `mul_mat` of 192x64000x1344 takes ~57 ms where the
-  arithmetic alone should be ~10 ms.
-- More telling: the vocoder takes **the same time on both cards** — 19.1 s on
-  the RX 6800 XT vs 18.1 s on the 1660 SUPER, despite roughly 4x the compute
-  and 1.5x the bandwidth. Whatever the limit is, it is not the GPU.
-- im2col also materialises very large intermediates (`[672, 192000]` F16 =
-  ~258 MB per call) that a fused direct conv would never write.
+- **im2col materialises very large intermediates.** For this vocoder,
+  `[672, 287445]` F16 is ~386 MB per call, written and read back for nothing a
+  fused direct conv would need. On a 6 GB card this is the binding constraint,
+  not arithmetic: decoding ~150 frames in one graph asks for ~1.5 GiB and simply
+  fails to allocate. Chunked decode is not an optimisation here, it is what makes
+  the GPU path fit at all.
+- **The im2col is F16 unless the weights are BF16**, hardcoded at that call site.
+  That makes the matmul's `src0` F16, which is what makes the CUDA/HIP backends
+  choose a half-precision accumulator — see `known-issues.md` #14, where it cost
+  30 dB. Upstream PR ggml-org/llama.cpp#25323 ("use kernel type for conv_1d
+  im2col to support f32") is the fix for this and was still open in August 2026.
 
-This is the single largest unexploited win seen in this project, and it would
-benefit every audio/TTS model on ggml, not just this one. It is a ggml-side
-project, not something that can be worked around in the caller.
+**Correction (2026-08-24).** This section previously claimed the convolutions
+reached only ~12% of the card's FP32 peak, and cited "the vocoder takes the same
+time on both cards, despite 4x the compute" as proof that ggml's conv was the
+wall. Both observations were real; the explanation was wrong. The vocoder was
+running **on the CPU** — see `known-issues.md` #13 — so of course the two cards
+agreed. Any conclusion drawn from those numbers, including "a direct conv1d
+kernel is the only remaining target", was drawn from a profile of the wrong
+device. Re-profile before planning against this stage again.
 
-**It is now the *only* target left on this path** (measured 2026-08-20, one run
-of `ward.txt`, 1.7B, CUDA, `QWEN3_TTS_PIPELINE=0` so the two stages are timed
-separately):
-
-```
-generate  13 025 ms   25.1 ms/frame   (talker 10.1 + code predictor 13.1)
-decode    27 703 ms   53.4 ms/frame
-```
-
-The vocoder costs **twice the whole talker + code predictor**. With the
-pipeline on, generation hides entirely behind it — 7.5 s of the "generate"
-wall time is the talker blocked on the decode queue. So the code predictor,
-long treated as the remaining floor, is already free: making it instantaneous
-would take generation from 13.0 s to 6.2 s and change the total by nothing.
-Everything below the vocoder's 27.7 s is invisible until that number moves.
-
-The same kernel is also what makes a voice expensive to start using: the ICL
-warm-up decodes the reference frames through this convolution tower before the
-first synthesis, ~6.2 s for a 150-frame (11.9 s) reference. Shortening the
-reference or fixing the kernel are the only two ways to move it.
+A direct conv1d kernel is still a plausible upstream contribution, and the
+im2col traffic above is a real argument for it. It is no longer supported by
+*this* project's measurements, because this project no longer has a measurement
+that isolates it.
 
 ---
 
