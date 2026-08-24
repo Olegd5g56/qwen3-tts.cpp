@@ -24,6 +24,7 @@ root cause still there) / **wontfix**.
 | [13](#13) | The vocoder never ran on the GPU | fixed 2026-08-24 |
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
+| [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | open 2026-08-24 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -624,6 +625,58 @@ default for LLM-shaped matmuls, and only these deep conv towers compound it.
 
 The Mimi codec encoder is still CPU-resident, and has no trig and no deep conv
 tower — not investigated further.
+
+---
+
+<a id="16"></a>
+## 16. An F16 talker runs away every time; Q8_0 and F32 do not
+
+**Status:** open, isolated but not root-caused
+**Found:** 2026-08-24
+**Severity:** correctness — `--type f16` produces an unusable talker
+
+`scripts/convert_tts_to_gguf.py --type f16` produces a GGUF whose talker never
+emits an end-of-speech token. Every generation runs to the frame budget, so
+every request degenerates into the #11 failure — except that here it is not
+rare, it is total.
+
+**Measured** (0.6B Base converted from `Qwen/Qwen3-TTS-12Hz-0.6B-Base`,
+`ward.txt`, ICL with the model card's 8.08 s `clone.wav`, CUDA on the 1660
+SUPER):
+
+| talker weights | seeds tried | runaways |
+|---|---|---|
+| Q8_0 (shipped file) | 10 | **0** |
+| Q8_0 (converted here) | 2 | 0 |
+| **F16** | **10** | **10** |
+| F32 | 2 | 0 |
+
+On the first sentence of `ward.txt` the contrast is exact and repeatable: Q8_0
+stops at 128 and 135 frames on seeds 42/43, F32 at 125 and 155, and F16 hits
+the 353-frame budget on both. #11 records 40 clean seeds on `ward.txt` with
+Q8_0, so this is not the same phenomenon at a higher rate — it is a different
+failure.
+
+**What it is not:**
+
+- *Not precision loss.* F16 carries more information than the Q8_0 that works.
+- *Not F16 range.* Every 2D+ tensor in the checkpoint was scanned: none exceeds
+  65504 and none collapses below the F16 normal range.
+- *Not the converter or the weights.* Converting the same HF checkpoint to Q8_0
+  with the same script reproduces the shipped file's behaviour frame for frame
+  (128/135 on seeds 42/43).
+- *Not a GPU accumulation bug like #14.* The same F16 file runs away on the CPU
+  backend too (`CUDA_VISIBLE_DEVICES=""`, 353 frames again).
+
+**Where it must be.** The F16 and Q8_0 files differ in exactly 233 tensors, all
+of them `talker.*` (198) and `code_pred.*` (35); the vocoder and speaker encoder
+are byte-identical F16 in both. So whatever mishandles F16 is on the talker /
+code-predictor path and is reached on both backends.
+
+**Practical effect today:** none — every shipped GGUF is Q8_0. It matters the
+moment anyone converts with `--type f16`, and it blocks using F16 as the
+precision control when attributing speed wins to quantisation (see
+`optimization.md`). F32 works and can stand in, at 2x the weight bytes.
 
 ---
 

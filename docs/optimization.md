@@ -54,6 +54,10 @@ Note what this kills. The whole previous roadmap was built on giving ggml a
 direct `conv_1d` kernel to avoid im2col — and im2col is now **1.7%** of decode.
 That project is not worth doing for this model.
 
+Re-measured 2026-08-24 on the 0.6B with `ward.txt` (6742 ms of decode, 782
+distinct nodes): `CONV_TRANSPOSE_1D` **44.8%**, `MUL_MAT` 17.9%, `ADD` 6.7%,
+`IM2COL` 4.1%. Same verdict from a different workload.
+
 The new target is `CONV_TRANSPOSE_1D`, and it is a far better-shaped one,
 because unlike `conv_1d` it is a real op with a real kernel to improve. The
 biggest single entry costs **71 ms per call** for a `[520, 768]` output, which
@@ -62,6 +66,83 @@ it: one thread per output element, each looping over every input channel and
 the whole kernel width, reading weights and inputs straight from global memory
 with no tiling or reuse — and `continue`-ing out of roughly `s0-1` of every
 `s0` iterations, so most of the loop is thrown away. See `ggml-notes.md`.
+
+## Against the reference PyTorch pipeline
+
+Measured 2026-08-24. The point of this section is not the headline ratio — it
+is that the ratio is the average of a large win and a large loss, and that the
+loss has a name.
+
+Setup, identical on both sides: 0.6B Base, `ward.txt` (726 chars, Russian),
+ICL cloning from the model card's `clone.wav` (8.08 s, 97-101 reference
+frames), `QWEN3_TTS_PIPELINE=0`, one warm-up then the median of three runs.
+Reference side is `qwen-tts` 0.1.1 + transformers 4.57.3, bf16, `sdpa`.
+Frame counts differ between engines because sampling does, so everything is
+per frame. Scripts: `scripts/bench_torch_vs_ggml.py` and
+`scripts/bench_ggml_cli.py`, which print the same summary.
+
+| | PyTorch, CUDA (1660S) | **ggml, CUDA (1660S)** | PyTorch, ROCm (6800 XT) | **ggml, HIP (6800 XT)** |
+|---|---|---|---|---|
+| talker | — | 6.4 ms/frame | — | 4.5 ms/frame |
+| code predictor | — | 13.0 ms/frame | — | 10.8 ms/frame |
+| **generate** | 104.5 ms/frame | **20.4 ms/frame** | 233.9 ms/frame | **15.9 ms/frame** |
+| **vocoder decode** | **2.67 ms/frame** | 9.60 ms/frame | 60.1 ms/frame | **6.25 ms/frame** |
+| reference encode | 53 ms | 85 ms | 35 ms | 164 ms |
+| wall | 60.1 s | **19.1 s** | 175.7 s | **13.6 s** |
+| host RSS peak | 2.94 GB | **1.53 GB** | 3.98 GB | — |
+| VRAM peak (nvidia-smi) | 5.17 GB | **3.40 GB** | — | — |
+
+### What the numbers say
+
+**We are 3.1x faster end-to-end on CUDA and 13x on ROCm** — but on CUDA that
+average hides a 5.1x win on generation and a **3.6x loss on the vocoder**.
+
+**The vocoder loss is cuDNN, not PyTorch.** The same PyTorch code on ROCm
+decodes at 60.1 ms/frame — **9.6x slower than our own naive kernel** on the same
+card, with MIOpen falling back to untuned GEMM solvers and warning about it.
+NVIDIA ships a decade of hand-tuned transposed-convolution kernels; AMD does
+not, for these shapes on gfx1030; ggml has one naive kernel and sits between
+them. So `CONV_TRANSPOSE_1D` remains the right target, and 2.67 ms/frame is now
+a **demonstrated ceiling on a 1660 SUPER** rather than a hope — but closing the
+gap means writing a genuinely good kernel, not finding a silly mistake.
+
+**A second, independent pointer at the same op.** PyTorch decodes all 653
+frames in one shot inside 5.2 GB. We must chunk, because one-shot costs ~14 GB
+host RSS (`project_vocoder_chunked_decode`). Slow and memory-hungry most likely
+share one cause.
+
+**The generation win is mostly engine, not quantisation.** Controlling with an
+F32 GGUF (2x the weight bytes of PyTorch's bf16) still gives 34.1 ms/frame
+against PyTorch's 104.5. So of our 5.1x: **3.1x is the engine, 1.7x is Q8_0** —
+and the 3.1x is understated, since the control carries heavier weights than the
+thing it is compared against.
+
+| talker weights | generate | talker | code predictor |
+|---|---|---|---|
+| Q8_0 | 20.4 ms/frame | 6.4 | 13.0 |
+| F32 | 34.1 ms/frame | 10.2 | 23.3 |
+| F16 | *unusable — see known-issues #16* | | |
+
+Decode is unaffected by talker precision (9.60 / 9.49 / 9.44 ms/frame across
+the three), which is expected — the vocoder is the same F16 file in all of them
+— and is a useful check that the vocoder comparison above is not an artefact.
+
+### Caveats that the table would otherwise hide
+
+- **Neither card has bf16 in hardware** (Turing sm_75, RDNA2 gfx1030), so the
+  reference runs emulated. It is still the only usable mode: **fp16 makes the
+  model produce NaN logits in the code predictor** and `torch.multinomial`
+  dies with a device-side assert. So this is the reference pipeline at its
+  practical best on this hardware, not a strawman — but on a bf16-native card
+  its generate numbers would improve and ours would not.
+- **The vocoder gap is measured in the same bf16**, so it is if anything
+  understated by that handicap.
+- Two ways to get nonsense out of the reference, both hit while setting this
+  up: a reference clip much longer than its transcript makes ICL degenerate
+  (generation ran to the 8192-token cap, 655 s of audio), and
+  `non_streaming_mode=True` puts the whole text in the prefill and lets the
+  model stop after a few frames. Our CLI feeds text one token per frame, so
+  the comparable setting is the default `False`.
 
 ## 0.6B vs 1.7B — not a speed dial
 
@@ -111,11 +192,19 @@ related, not independent.
 
 ## Remaining ideas (descending value)
 
-1. **`CONV_TRANSPOSE_1D` kernel in ggml** — 52% of decode, and the current CUDA
-   kernel is naive enough that this is ordinary optimisation work rather than
-   research: tile it, stage weights in shared memory, and stop iterating over
-   the stride positions that are discarded. Upstream project; benefits every
-   audio decoder on ggml.
+1. **`CONV_TRANSPOSE_1D` kernel in ggml** — 45-52% of decode, and the current
+   CUDA kernel is naive enough that this is ordinary optimisation work rather
+   than research: tile it, stage weights in shared memory, and stop iterating
+   over the stride positions that are discarded. Upstream project; benefits
+   every audio decoder on ggml.
+
+   **There is now a number to aim at.** cuDNN does this vocoder at 2.67
+   ms/frame on the same 1660 SUPER where we take 9.60 — see *Against the
+   reference PyTorch pipeline*. That is a demonstrated ceiling on this
+   hardware, worth ~26% end-to-end (19.1 s → ~14.3 s, RTF 0.39 → 0.29). It is
+   also proof the work is kernel-quality work: the same PyTorch code on ROCm,
+   where MIOpen has no tuned kernels for these shapes, is 9.6x *slower* than
+   our naive one.
 2. **The code predictor: only one lever left, and it is not a code change.**
    At 13.2 ms/frame it is the largest single line and no longer hidden, but it
    is ~70% weight traffic (see the ruled-out entry). Quantising it works and is
