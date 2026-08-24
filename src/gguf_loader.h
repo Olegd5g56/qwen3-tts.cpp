@@ -73,8 +73,15 @@ bool load_tensor_data_from_file(
     enum ggml_backend_dev_type preferred_backend_type = GGML_BACKEND_DEVICE_TYPE_CPU
 );
 
-// Helper to initialize backend with GPU preference and CPU fallback
-ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg);
+// Helper to initialize backend with GPU preference and CPU fallback.
+//
+// By default this hands out one process-wide instance, which is what you want
+// for stages that run one after another. Pass `exclusive` for a stage that runs
+// *concurrently* with another one: a ggml backend instance owns a stream and a
+// memory pool, and the CUDA pool is a bump allocator that asserts frees happen
+// in reverse order, so two threads sharing one instance will trip it.
+ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
+                                      bool exclusive = false);
 void release_preferred_backend(ggml_backend_t backend);
 
 // Set the thread count on `backend` if and only if it is a CPU backend.

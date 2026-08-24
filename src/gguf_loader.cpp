@@ -34,11 +34,12 @@ GGUFLoader::~GGUFLoader() {
     close();
 }
 
-ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
+ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
+                                      bool exclusive) {
     if (error_msg) error_msg->clear();
 
     auto & shared = get_shared_backend_state();
-    if (shared.backend) {
+    if (!exclusive && shared.backend) {
         shared.ref_count++;
         return shared.backend;
     }
@@ -63,7 +64,9 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         *error_msg = "Failed to initialize backend (IGPU/GPU/ACCEL/CPU) for " + std::string(name);
     }
 
-    if (backend) {
+    // An exclusive instance is never published as the shared one: it is handed
+    // to a single owner, and release_preferred_backend() frees it directly.
+    if (backend && !exclusive) {
         shared.backend = backend;
         shared.ref_count = 1;
     }

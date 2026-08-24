@@ -372,7 +372,12 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+    // Exclusive on purpose: decode_pipeline runs this decoder on a worker thread
+    // while the talker generates on the caller's. Sharing one ggml backend means
+    // sharing its stream and its memory pool, and the CUDA pool asserts that
+    // frees come in reverse order of allocations -- which two threads cannot
+    // honour. This was invisible while the vocoder was stuck on the CPU.
+    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_, true);
     if (!state_.backend) {
         return false;
     }
