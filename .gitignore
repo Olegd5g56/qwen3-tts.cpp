@@ -61,3 +61,9 @@ build-*/
 # Local scratch scripts — personal launchers, not part of the project
 /test.sh
 /test_cli.sh
+
+# Output of an ad-hoc synthesis run. scripts/bench_speed.sh keeps its audio in a
+# temp dir, but Oleg's test_tts.sh writes out.mp3 into the working directory,
+# and running it from the repo root once put a 375 KB stowaway into a commit.
+out.mp3
+*.opus
