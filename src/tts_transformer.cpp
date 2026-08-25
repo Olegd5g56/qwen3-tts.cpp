@@ -1506,6 +1506,9 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
+        // Named because this is where the model's largest activations live and
+        // the numeric probe reports by name (docs/known-issues.md #16).
+        ggml_format_name(cur, "talker.blk.%d.ffn_swiglu", il);
 
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
 
@@ -1645,6 +1648,8 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
+        // See the prefill path: this is the graph's largest activation.
+        ggml_format_name(cur, "blk.%d.ffn_swiglu", il);
         
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
 
@@ -1765,6 +1770,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
+        ggml_format_name(cur, "cp_dec.blk.%d.ffn_swiglu", il);
         
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
         
@@ -1910,6 +1916,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
+        ggml_format_name(cur, "cp_prefill.blk.%d.ffn_swiglu", il);
         
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
         
@@ -2061,6 +2068,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
+        ggml_format_name(cur, "cp_step.blk.%d.ffn_swiglu", il);
         
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
         

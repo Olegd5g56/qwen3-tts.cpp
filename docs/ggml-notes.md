@@ -165,3 +165,30 @@ rather than adding a missing op, and it benefits every audio decoder on ggml.
   supported by AMD, but Arch's rocBLAS still ships Tensile kernels for it (88
   library files), so GEMM does not fall back to a generic path. HIP performance
   is competitive with Vulkan there, and ahead once you use two streams.
+
+## The weight type silently picks the activation type, and F16 has a ceiling
+
+`ggml_mul_mat` never feeds `src1` to the kernel as it stands. Each `src0` type
+declares a `vec_dot_type` (`ggml/src/ggml-cpu/ggml-cpu.c`, the type traits
+table) and `src1` is converted to it first:
+
+| `src0` (weights) | `vec_dot_type` | what happens to the activations |
+|---|---|---|
+| F32 | F32 | nothing |
+| F16 | **F16** | **hard cast — anything above 65504 becomes inf** |
+| Q8_0 | Q8_0 | block-scaled int8; the per-block scale absorbs any magnitude |
+
+The surprising part is the ordering of robustness: **Q8_0 weights are safer
+than F16 weights** on a model with large activations, even though Q8_0 carries
+less information per value. Quantised types cannot overflow, because their
+scale is derived from the data; F16 has a fixed exponent range and cannot
+adapt.
+
+This is not a bug, but it is a trap, and it is invisible: nothing warns, the
+matmul just returns inf. Any model with activations above 65504 — which
+includes the "massive activations" that modern LLM/TTS transformers are known
+for — is unusable in plain F16 while working fine in Q8_0. Qwen3-TTS's code
+predictor hits 185587 and does exactly this; see `known-issues.md` #16.
+
+BF16 sidesteps it entirely (F32's exponent range in 2 bytes) and is a
+first-class type on both the CPU and CUDA backends.

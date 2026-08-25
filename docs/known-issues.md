@@ -24,7 +24,7 @@ root cause still there) / **wontfix**.
 | [13](#13) | The vocoder never ran on the GPU | fixed 2026-08-24 |
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
-| [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | open 2026-08-24 |
+| [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | root-caused 2026-08-25 |
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
@@ -632,7 +632,7 @@ tower — not investigated further.
 <a id="16"></a>
 ## 16. An F16 talker runs away every time; Q8_0 and F32 do not
 
-**Status:** open, isolated but not root-caused
+**Status:** root-caused 2026-08-25; fix not yet chosen (see *The fix* below)
 **Found:** 2026-08-24
 **Severity:** correctness — `--type f16` produces an unusable talker
 
@@ -658,21 +658,79 @@ the 353-frame budget on both. #11 records 40 clean seeds on `ward.txt` with
 Q8_0, so this is not the same phenomenon at a higher rate — it is a different
 failure.
 
-**What it is not:**
+**Root cause (2026-08-25): one activation tensor does not fit in F16.**
 
-- *Not precision loss.* F16 carries more information than the Q8_0 that works.
-- *Not F16 range.* Every 2D+ tensor in the checkpoint was scanned: none exceeds
-  65504 and none collapses below the F16 normal range.
-- *Not the converter or the weights.* Converting the same HF checkpoint to Q8_0
-  with the same script reproduces the shipped file's behaviour frame for frame
-  (128/135 on seeds 42/43).
-- *Not a GPU accumulation bug like #14.* The same F16 file runs away on the CPU
-  backend too (`CUDA_VISIBLE_DEVICES=""`, 353 frames again).
+It is not the weights — it is what the weights' *type* does to the activations.
+In ggml the weight type picks the type the activation side is converted to
+before the dot product (`ggml/src/ggml-cpu/ggml-cpu.c:224`: `vec_dot_type` of
+`GGML_TYPE_F16` is `GGML_TYPE_F16`). So:
 
-**Where it must be.** The F16 and Q8_0 files differ in exactly 233 tensors, all
-of them `talker.*` (198) and `code_pred.*` (35); the vocoder and speaker encoder
-are byte-identical F16 in both. So whatever mishandles F16 is on the talker /
-code-predictor path and is reached on both backends.
+| weights | activation side becomes | ceiling |
+|---|---|---|
+| F16 | F16 | **65504** |
+| Q8_0 | Q8_0, block-scaled int8 | none — the block scale absorbs any magnitude |
+| F32 | F32 | none |
+
+F16 is the only one of the three with a ceiling, which is exactly why only F16
+fails, and why it fails identically on CPU and on CUDA.
+
+**The measurement.** `QWEN3_TTS_PROBE_NUM=1` scans every graph node's output for
+`max|x|` and non-finite values. On the working Q8_0 file, over the whole
+generation, **exactly one node in the entire pipeline exceeds 65504**:
+
+```
+max|x|=185587.2  nonfinite=0  n=129  MUL  cp_prefill.blk.2.ffn_swiglu [3072,2,1]
+```
+
+That is the SwiGLU output (`silu(gate) * up`) of **code-predictor layer 2**,
+2.83x above the F16 ceiling, hit once per frame on every frame. Its consumer is
+`code_pred.blk.2.ffn_down`. On the F16 file the probe names that consumer as
+the first non-finite node in the graph, on the very first frame:
+
+```
+[probe] FIRST non-finite output: MUL_MAT node_127 [1024,2]  (1024 of 2048 values)
+```
+
+Same node, Q8_0: 63417.7, finite. So the code predictor emits inf on frame 1,
+every frame, and the sampler never draws EOS.
+
+**The output was never speech.** The CLI refuses to save a runaway
+(`qwen3_tts.cpp`), which is why this looked like "speech that will not stop"
+for a day — nobody had heard it. With `QWEN3_TTS_KEEP_RUNAWAY=1`:
+
+| | RMS | zero-crossing rate |
+|---|---|---|
+| Q8_0 | −24.6 dB | 0.130 |
+| F16 | −34.5 dB | 0.332 |
+
+Noise from the first second, not speech. This is **not** #11 at a higher rate,
+and the earlier "it degenerates into #11" reading was wrong.
+
+**Confirmed by flipping it.** Converting `--type f16` with
+`code_pred.blk.2.ffn_down` alone forced to F32 — 1 tensor of 478 — ends the
+runaway completely: 10/10 seeds terminate (124–142 frames, against Q8_0's
+128/135), and the audio matches Q8_0's character (RMS −24.9, ZCR 0.133).
+
+**Corroboration from upstream.** The reference PyTorch pipeline has the same
+failure in the same place: it runs bf16 only, because in fp16 *its* code
+predictor emits NaN logits and `torch.multinomial` dies. This is a property of
+the model, not of our port.
+
+**What the earlier notes got wrong:** "Not F16 range — every 2D+ tensor was
+scanned" checked the *weights*. The weights are all in range. The activations
+are not, and only F16 weights drag the activations through F16.
+
+**The fix — not yet chosen.** Two candidates:
+
+- **BF16 for the talker** (preferred). Same 2 bytes, but F32's exponent range,
+  so no ceiling at all; ggml supports it on CPU (`vec_dot_type` BF16) and as a
+  first-class cuBLAS compute type (`ggml-cuda.cu:1652`); and it is what the
+  reference runs. Needs `--type bf16` in `convert_tts_to_gguf.py`, which does
+  not exist yet.
+- **Keep the offending tensors out of F16.** One line in `_should_quantize`.
+  Fragile: the residual stream was measured at 63554, i.e. **97% of the F16
+  ceiling**, so a different voice, text or model size can push another node
+  over. Only the 0.6B on one sentence has been probed.
 
 **Practical effect today:** none — every shipped GGUF is Q8_0. It matters the
 moment anyone converts with `--type f16`, and it blocks using F16 as the

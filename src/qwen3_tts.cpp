@@ -989,7 +989,11 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     // salvageable — the tail is noise and the end of the text never got said —
     // so say so and let the caller decide whether to retry.
     if (n_frames >= frame_budget) {
-        result.hit_token_budget = true;
+        // Debug escape hatch: keep the (unusable) audio so a runaway can be
+        // listened to instead of only counted. See docs/known-issues.md #16.
+        const char * keep = std::getenv("QWEN3_TTS_KEEP_RUNAWAY");
+        const bool   keep_runaway = keep && keep[0] && keep[0] != '0';
+        result.hit_token_budget = !keep_runaway;
         result.error_msg = "the model did not signal end of speech and ran to the "
                            + std::to_string(frame_budget) + "-frame budget";
         log_warn("generation hit the %d-frame budget without an end-of-speech token "

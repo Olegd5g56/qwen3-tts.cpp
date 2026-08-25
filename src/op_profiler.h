@@ -9,6 +9,13 @@
 // before invoking it, so the wall time between two callbacks is the cost of
 // the node that just finished. Results are aggregated per (op, shape) under a
 // caller-supplied label and dumped by op_profiler_report().
+//
+// The same hook carries a second, independent probe: QWEN3_TTS_PROBE_NUM=1
+// records each node's largest |value| and any non-finite output, and reports
+// every node that cannot survive a cast to F16. It exists because the weight
+// type decides the activation type in ggml, so an activation above 65504 turns
+// into inf under F16 weights and under nothing else - see known-issues.md #16.
+// Both flags are independent; either one installs the callback.
 namespace qwen3_tts {
 
 bool op_profiler_enabled();
