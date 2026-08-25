@@ -19,6 +19,36 @@
 
 namespace qwen3_tts {
 
+// On CUDA and HIP a matmul whose weights are Q4_0, Q4_1 or Q5_1 packs the
+// activations as block_q8_1, which carries the block's sum in F16
+// (ggml-common.h:263) so the kernel can correct for those types' dequant
+// offset. Q8_0 and friends use the D4 layout, which has no sum field
+// (ggml-cuda/mmq.cuh:60), which is why they are immune.
+//
+// A block covers 32 values, so the sum can reach 32x the largest of them. This
+// model's SwiGLU reaches ~185k, the sum runs past F16's 65504, and the field
+// becomes inf on the first frame. See docs/known-issues.md #21.
+static bool needs_q8_1_activation_sum(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Divides the activation going into such a matmul and multiplies the result
+// back. The matmul is linear so the answer is unchanged, and Q8_1 quantisation
+// is per-block, so the integer quants come out bit-identical - only the block's
+// d and s shrink by the same factor, which is exactly what has to happen.
+//
+// 128 is a power of two (so the scaling itself is exact) and clears the worst
+// case: 32 x 185587 / 128 = 46.4k against a 65504 ceiling.
+static const float QWEN3_TTS_Q8_1_ACT_SCALE = 128.0f;
+
+
 TTSTransformer::TTSTransformer() = default;
 
 TTSTransformer::~TTSTransformer() {
@@ -1550,7 +1580,14 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         // the numeric probe reports by name (docs/known-issues.md #16).
         ggml_format_name(cur, "talker.blk.%d.ffn_swiglu", il);
 
+        const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, 1.0f / QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
 
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1695,7 +1732,14 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         // See the prefill path: this is the graph's largest activation.
         ggml_format_name(cur, "blk.%d.ffn_swiglu", il);
         
+        const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, 1.0f / QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
 
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1816,7 +1860,14 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         cur = ggml_mul(ctx0, gate, up);
         ggml_format_name(cur, "cp_dec.blk.%d.ffn_swiglu", il);
         
+        const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, 1.0f / QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1966,7 +2017,14 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         cur = ggml_mul(ctx0, gate, up);
         ggml_format_name(cur, "cp_prefill.blk.%d.ffn_swiglu", il);
         
+        const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, 1.0f / QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -2122,7 +2180,14 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         cur = ggml_mul(ctx0, gate, up);
         ggml_format_name(cur, "cp_step.blk.%d.ffn_swiglu", il);
         
+        const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, 1.0f / QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        if (ffn_down_rescale) {
+            cur = ggml_scale(ctx0, cur, QWEN3_TTS_Q8_1_ACT_SCALE);
+        }
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }

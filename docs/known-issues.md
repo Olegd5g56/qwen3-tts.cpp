@@ -29,7 +29,7 @@ root cause still there) / **wontfix**.
 | [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
 | [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
-| [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` is GPU-only broken | converter fixed 2026-08-25; q4_0 is CPU-only |
+| [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU | fixed 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1000,7 +1000,7 @@ does run. But it means the one-shot path has no automated cover at all.
 <a id="21"></a>
 ## 21. 4-bit: `q4_k` never worked at all, and `q4_0` breaks on GPU
 
-**Status:** converter fixed 2026-08-25; `q4_0` usable on CPU only
+**Status:** fixed 2026-08-25 — converter repaired, and q4_0 now works on GPU too
 **Found:** 2026-08-25
 **Severity:** was correctness (silent broken output), now a documented limit
 
@@ -1031,7 +1031,7 @@ The general lesson: **falling back to F16 on error is the bug**, because on this
 model F16 is not a safe degradation, it is a broken model. Verified no
 regression — reconverting q8_0 reproduces the previous file byte for byte.
 
-### `--type q4_0` works on CPU and returns inf on CUDA and ROCm
+### `--type q4_0` returned inf on CUDA and ROCm (fixed)
 
 Same symptom as #16 and the same node — `code_pred.blk.2.ffn_down` goes
 non-finite on frame 0 — but a different mechanism, and this one is
@@ -1063,48 +1063,58 @@ the normal band (RMS −23.4, ZCR 0.148). The file is only 20% smaller rather th
 half, because embeddings, heads and norms stay F16 and dominate a model this
 small.
 
-**Verdict:** q4_0 is worth having for CPU-only deployments and must not be used
-on a GPU build. Nothing enforces that split today — the logit guard from
-`06cd5fc` catches it on frame 0 with a clear message, which is adequate but
-after the fact.
+### The fix, and what it costs
 
-### Could q4_0 be made to work on the GPU? Yes, and it is one node
+Only one node needed it. The real ceiling on an activation is `65504/32 = 2047`,
+not 65504, because the sum covers 32 values. Probing every node above 2047 finds
+eight, but only one is an *input* to a quantised matmul — the code predictor's
+layer-2 SwiGLU at 185587. The five residual `ADD`s at 63554 all pass through an
+RMS norm before they reach the next matmul, which renormalises them.
 
-**What it would buy** (CUDA, 0.6B, seed 42, median of 3, measured with the logit
-guard temporarily bypassed so the kernels run on garbage — the timings are real
-even though the tokens are not):
+`ffn_down` is linear, so the input is divided by 128 and the result multiplied
+back (`needs_q8_1_activation_sum` in `tts_transformer.cpp`). 128 is the smallest
+power of two that clears the worst case (`32 x 185587 / 128 = 46.4k` against
+65504) — a power of two so the scaling itself is exact, and the smallest one so
+the cost below stays as small as it can be. It is applied only for Q4_0, Q4_1
+and Q5_1, so a Q8_0 or bf16 graph gains no nodes at all — measured: q8_0 stayed
+at 24.9 ms/frame either way.
 
-| stage | q4_0 | q8_0 |
+**Result:** 10/10 seeds on CUDA and 5/5 on ROCm, audio in the same band as the
+CPU reference. **21.3 ms/frame against q8_0's 24.9** — 15%, of which the scaling
+ops themselves cost ~0.6.
+
+**It is not free, and the first write-up of this was wrong to say so.** The
+integer quants really are unchanged, but `d` is stored in F16 too, and scaling
+down pushes small blocks toward the subnormal range. Isolated by forcing the
+scale on for Q8_0, where it is unnecessary, and comparing frame by frame:
+
+| | without scale | with scale |
 |---|---|---|
-| talker | 5.4 ms/frame | 6.8 |
-| code predictor | 14.7 | 16.7 |
-| **generate** | **20.7** | **24.9** |
+| frame 0 hidden norm | 180.0888 | 180.0888 (identical) |
+| frame 0 top-5 cb0 | 24.922 22.141 21.906 … | identical |
+| frame 1 hidden norm | 181.4621 | 181.7267 |
+| frame 1 top-5 cb0 | 24.166 24.004 21.818 … | 24.276 24.116 21.961 … |
 
-~17% faster overall, on a 20% smaller file.
+Frame 0 is bit-identical; from frame 1 the logits drift ~0.5% with the token
+ranking preserved. The talker is unaffected — its activations never get near the
+subnormal boundary — so the drift comes entirely from the code predictor, whose
+SwiGLU spans from near-zero to 185587 in one tensor.
 
-**The real threshold is 2047, not 65504.** `s = d * sum(qs[i])` sums 32 values,
-so a block can reach 32x the largest value in it. Probing every node above
-`65504/32 = 2047` finds eight, but only one of them is an *input* to a
-quantised matmul:
+That is the same order as the reduction-order noise `f569cb0` introduced, and it
+reshuffles frame counts the same way (see the warning under #11 about seeds).
+Against the alternative for Q4_0 — inf on frame 0 — it is not a real cost. It
+would be one if it were ever applied to a type that does not need it, which is
+why it is gated on the weight type.
 
-- `cp_prefill.blk.2.ffn_swiglu` at 185587 — feeds `ffn_down`. This is the one.
-- five residual `ADD`s at 63554 and two `MUL_MAT` outputs — all of these are
-  either outputs, or feed an RMS norm before they reach the next matmul, which
-  renormalises them back to unit scale.
+### Alternatives that were rejected
 
-**The clean fix is a scale trick.** `ffn_down` is linear, so `W·(x/k)·k = W·x`
-exactly. And Q8_1 quantisation is scale-invariant per block: dividing x by k
-leaves `qs` bit-identical and scales `d` and `s` by 1/k, so the F16 sum field
-comes back into range with no accuracy change at all. Two cheap elementwise ops
-around one matmul, no ggml change, no new type.
+`GGML_CUDA_FORCE_CUBLAS` is a compile-time option that reroutes *every* matmul
+away from the quantised kernels, giving up the speed that was the point.
+Widening `block_q8_1`'s sum to F32 is a core ggml layout change affecting every
+model and backend. And `GGML_PREC_F32` does not help at all: the MMQ/MMVQ path
+is chosen before precision is ever consulted (`ggml-cuda.cu:1815`).
 
-The alternatives are worse: `GGML_CUDA_FORCE_CUBLAS` is a compile-time option
-that reroutes *every* matmul away from the quantised kernels, giving up the
-speed that was the point; and widening `block_q8_1`'s sum to F32 is a core ggml
-layout change affecting every model and backend.
-
-**Not done, deliberately.** The payoff is 17% on a quantisation we do not ship,
-the audio cost of 4-bit on this model has only been spot-checked on CPU, and
-`GGML_PREC_F32` does not help because the MMQ/MMVQ path is chosen before
-precision is consulted (`ggml-cuda.cu:1815`). Revisit if a 4-bit GPU build is
-ever actually wanted.
+**Still true:** q4_0 costs real quality at 4 bits, which has only been checked
+by ear-level statistics here, and the file is 20% smaller rather than half
+because embeddings, heads and norms stay F16 and dominate a model this small.
+q8_0 remains the default.
