@@ -14,7 +14,8 @@ Languages: en, ru, zh, ja, ko, de, fr, es, it, pt.
 Backends: CUDA / ROCm / Vulkan / Metal / CPU.
 
 Measurements and design notes are in `docs/`: `optimization.md` (performance),
-`known-issues.md` (bug log), `ggml-notes.md` (ggml side).
+`quantisation.md` (which weight type to use), `known-issues.md` (bug log),
+`ggml-notes.md` (ggml side).
 
 ## Quickstart
 

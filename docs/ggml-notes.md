@@ -192,3 +192,54 @@ predictor hits 185587 and does exactly this; see `known-issues.md` #16.
 
 BF16 sidesteps it entirely (F32's exponent range in 2 bytes) and is a
 first-class type on both the CPU and CUDA backends.
+
+## `block_q8_1` keeps its block sum in F16, and that is a second hidden ceiling
+
+Separate from the weight-type trap above, and easy to miss because it depends on
+the backend.
+
+When `src0` is Q4_0, Q4_1 or Q5_1, the CUDA/HIP matmul packs the activations as
+`block_q8_1` (`ggml-common.h:258`):
+
+```c
+typedef struct {
+    ggml_half d;       // delta
+    ggml_half s;       // d * sum(qs[i])   <-- F16
+    int8_t qs[QK8_1];  // 32 quants
+} block_q8_1;
+```
+
+`s` exists so the kernel can correct for those types' dequant offset. It is a
+**sum over 32 values**, so the effective ceiling on a single activation is
+`65504 / 32 = 2047`, not 65504 — two orders of magnitude tighter than the
+weight-type trap, and nothing warns.
+
+Which types are affected is decided by `mmq_get_q8_1_ds_layout`
+(`ggml-cuda/mmq.cuh:60`): the `DS4` and `D2S6` layouts carry `s`, `D4` does not.
+
+| carries `s` | does not |
+|---|---|
+| Q4_0, Q4_1, Q5_1, Q4_K, Q5_K, Q2_K, IQ1_S | Q8_0, Q5_0, Q3_K, Q6_K, most IQ, MXFP4 |
+
+Two consequences worth remembering:
+
+- **Q8_0 is immune and Q4_0 is not**, for a reason that has nothing to do with
+  bit width.
+- **The CPU is immune** — its `vec_dot_type` for Q4_0 is `block_q8_0`, which has
+  no sum field. So a model can quantise fine, run fine on CPU, and return inf on
+  the GPU. That is not a backend bug; it is two correct implementations with
+  different intermediate formats.
+
+## The Python `gguf` package cannot write K-quants
+
+It implements them for dequantisation only. `gguf.quants.quantize` raises a
+message-less `NotImplementedError` for every K- and IQ-type; what it can write
+is `F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 MXFP4 TQ1_0 TQ2_0`.
+
+This is by design upstream — `convert_hf_to_gguf.py` writes F16/BF16/Q8_0 and
+the C++ `llama-quantize` does the rest, because the K-quant search lives in
+`ggml-quants.c`. It only bites projects like this one that convert in a single
+Python step.
+
+`ggml_quantize_chunk()` (`ggml.h:2861`) is public C API and is the way out for
+anyone who needs K-quants without llama.cpp's model loader.

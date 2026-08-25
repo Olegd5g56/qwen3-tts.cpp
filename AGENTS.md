@@ -47,6 +47,7 @@ qwen3-tts.cpp/
                                 # + cache.bin (encoded embedding + ref codes)
   docs/                         # Design notes (streaming, optimization, tensors)
                                 # + known-issues.md: running bug log, append to it
+                                # + quantisation.md: which weight type works, and why
                                 # + ggml-notes.md: upstream ggml bugs/gaps
   CMakeLists.txt
 ```
@@ -108,6 +109,13 @@ ggml_backend_sched_reset(state_.sched);
 ```
 
 Important: `ggml_mul_mat` consumes F16/quantized weights directly — do NOT insert a `ggml_cast` to F32 in front of it. An old `ffn_down` cast workaround forced a full dequant of the largest FFN matrix on every step and cost ~6x in generation time (removed in d544a6f).
+
+Not to be confused with it: `ffn_down` **does** carry a deliberate
+`ggml_scale` pair (down by 128 before, up by 128 after), added in 63aad82 and
+applied only when the weight type is Q4_0/Q4_1/Q5_1. That is not a dequant and
+costs two elementwise ops; it exists because CUDA/HIP pack activations for those
+types as `block_q8_1`, whose block sum is F16, and this model's activations
+overflow it. Removing it returns inf on frame 0. See `known-issues.md` #21.
 
 Backend initialization and scheduling notes:
 
@@ -220,7 +228,11 @@ bash scripts/run_all_tests.sh           # Full suite
 
 ## Known Limitations
 
-- F16 model weights cause autoregressive divergence vs Python's float32 — speech codes differ but audio is perceptually equivalent
+- **F16 talker weights do not work at all** — not "divergence", not "perceptually
+  equivalent". The code predictor's SwiGLU reaches ~185k on the 0.6B and F16
+  stops at 65504, so the FFN below it returns inf on frame 0 of every request
+  and the model generates noise forever. Use `--type bf16` (same size, and the
+  checkpoint is already bf16) or the default `q8_0`. See `known-issues.md` #16
 - M-RoPE uses 1D positions (equivalent for single-batch, may differ for batched inference)
 - `--top-p` is parsed in CLI params but currently not used in transformer sampling
 - Top-level CMake expects vendored GGML at `./ggml`
@@ -254,7 +266,9 @@ RTF 0.44 (2.3x realtime) end to end with the pipeline on; 0.30 on ROCm/6800 XT.
 - Attention graphs view only the populated part of the KV cache
   (`QWEN3_TTS_KV_STEP` granularity). Viewing the full `MAX_AUDIO_TOKENS`-sized
   cache used to make flash-attn 31% of generation.
-- Peak VRAM: ~3.2 GB for the 1.7B, ~2.1 GB for the 0.6B.
+- Peak VRAM: ~3.2 GB for the 1.7B, ~2.1 GB for the 0.6B — with `q8_0` weights.
+  `bf16` doubles the weight bytes and the 1.7B then does not fit in a 6 GB card
+  (`known-issues.md` #22); `q4_0` is ~30% smaller than q8_0 and 13% faster.
 - Speaker embeddings are hidden-size wide, so a voices directory is tied to one
   model variant.
 

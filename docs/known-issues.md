@@ -680,131 +680,43 @@ tower — not investigated further.
 
 **Status:** fixed 2026-08-25 — `--type bf16` added, `--type f16` kept but warns
 **Found:** 2026-08-24
-**Severity:** correctness — `--type f16` produces an unusable talker
+**Severity:** correctness — `--type f16` produced an unusable talker
 
-`scripts/convert_tts_to_gguf.py --type f16` produces a GGUF whose talker never
-emits an end-of-speech token. Every generation runs to the frame budget, so
-every request degenerates into the #11 failure — except that here it is not
-rare, it is total.
+`--type f16` produced a GGUF whose talker never emitted end-of-speech. Every
+generation ran to the frame budget. Measured on the 0.6B Base with `ward.txt`
+and ICL cloning:
 
-**Measured** (0.6B Base converted from `Qwen/Qwen3-TTS-12Hz-0.6B-Base`,
-`ward.txt`, ICL with the model card's 8.08 s `clone.wav`, CUDA on the 1660
-SUPER):
-
-| talker weights | seeds tried | runaways |
+| talker weights | seeds | runaways |
 |---|---|---|
-| Q8_0 (shipped file) | 10 | **0** |
-| Q8_0 (converted here) | 2 | 0 |
+| Q8_0 | 10 | 0 |
 | **F16** | **10** | **10** |
 | F32 | 2 | 0 |
 
-On the first sentence of `ward.txt` the contrast is exact and repeatable: Q8_0
-stops at 128 and 135 frames on seeds 42/43, F32 at 125 and 155, and F16 hits
-the 353-frame budget on both. #11 records 40 clean seeds on `ward.txt` with
-Q8_0, so this is not the same phenomenon at a higher rate — it is a different
-failure.
+**Root cause: the activations, not the weights.** The weights were all in range;
+nobody had looked at the activations. In ggml the weight type picks the type the
+activation side is converted to, and F16 is the only one of the three with a
+ceiling — so 185587 became inf in `code_pred.blk.2.ffn_down` on frame 0 of every
+request. Full mechanism and the type table: **`quantisation.md`**.
 
-**Root cause (2026-08-25): one activation tensor does not fit in F16.**
+**The output was never speech.** The CLI discards a runaway's audio, which is
+why this looked like "speech that will not stop" for a day — nobody had heard
+it. With `QWEN3_TTS_KEEP_RUNAWAY=1`: RMS −34.5 dB and zero-crossing rate 0.332,
+against Q8_0's −24.6 and 0.130. Noise from the first second. So it was **not**
+#11 at a higher rate, and the original "it degenerates into #11" reading was
+wrong.
 
-It is not the weights — it is what the weights' *type* does to the activations.
-In ggml the weight type picks the type the activation side is converted to
-before the dot product (`ggml/src/ggml-cpu/ggml-cpu.c:224`: `vec_dot_type` of
-`GGML_TYPE_F16` is `GGML_TYPE_F16`). So:
+**Corroboration.** The reference PyTorch pipeline fails the same way in the same
+place: it runs bf16 only, because in fp16 *its* code predictor emits NaN logits
+and `torch.multinomial` dies. A property of the model, not of our port.
 
-| weights | activation side becomes | ceiling |
-|---|---|---|
-| F16 | F16 | **65504** |
-| Q8_0 | Q8_0, block-scaled int8 | none — the block scale absorbs any magnitude |
-| F32 | F32 | none |
+**Fixed** by adding `--type bf16` — 2 bytes like F16 but F32's exponent range,
+and bit-identical to the checkpoint, which is already bf16. 10/10 seeds
+terminate. `f16` is kept so this stays reproducible, but warns before converting
+and is marked broken in `--help`.
 
-F16 is the only one of the three with a ceiling, which is exactly why only F16
-fails, and why it fails identically on CPU and on CUDA.
-
-**The measurement.** `QWEN3_TTS_PROBE_NUM=1` scans every graph node's output for
-`max|x|` and non-finite values. On the working Q8_0 file, over the whole
-generation, **exactly one node in the entire pipeline exceeds 65504**:
-
-```
-max|x|=185587.2  nonfinite=0  n=129  MUL  cp_prefill.blk.2.ffn_swiglu [3072,2,1]
-```
-
-That is the SwiGLU output (`silu(gate) * up`) of **code-predictor layer 2**,
-2.83x above the F16 ceiling, hit once per frame on every frame. Its consumer is
-`code_pred.blk.2.ffn_down`. On the F16 file the probe names that consumer as
-the first non-finite node in the graph, on the very first frame:
-
-```
-[probe] FIRST non-finite output: MUL_MAT node_127 [1024,2]  (1024 of 2048 values)
-```
-
-Same node, Q8_0: 63417.7, finite. So the code predictor emits inf on frame 1,
-every frame, and the sampler never draws EOS.
-
-**The output was never speech.** The CLI refuses to save a runaway
-(`qwen3_tts.cpp`), which is why this looked like "speech that will not stop"
-for a day — nobody had heard it. With `QWEN3_TTS_KEEP_RUNAWAY=1`:
-
-| | RMS | zero-crossing rate |
-|---|---|---|
-| Q8_0 | −24.6 dB | 0.130 |
-| F16 | −34.5 dB | 0.332 |
-
-Noise from the first second, not speech. This is **not** #11 at a higher rate,
-and the earlier "it degenerates into #11" reading was wrong.
-
-**Confirmed by flipping it.** Converting `--type f16` with
-`code_pred.blk.2.ffn_down` alone forced to F32 — 1 tensor of 478 — ends the
-runaway completely: 10/10 seeds terminate (124–142 frames, against Q8_0's
-128/135), and the audio matches Q8_0's character (RMS −24.9, ZCR 0.133).
-
-**Corroboration from upstream.** The reference PyTorch pipeline has the same
-failure in the same place: it runs bf16 only, because in fp16 *its* code
-predictor emits NaN logits and `torch.multinomial` dies. This is a property of
-the model, not of our port.
-
-**What the earlier notes got wrong:** "Not F16 range — every 2D+ tensor was
-scanned" checked the *weights*. The weights are all in range. The activations
-are not, and only F16 weights drag the activations through F16.
-
-**The fix: `--type bf16`.** bf16 spends its 16 bits differently — 8 mantissa
-bits instead of F16's 11, but F32's full exponent range, so there is no ceiling
-to hit. 185587 lands on 185344 instead of inf.
-
-The per-tensor alternative (keep the offending weights out of F16) was rejected:
-the residual stream measures 63554, **97% of the F16 ceiling**, so a different
-voice, text or model size can push another node over. Only the 0.6B on one
-sentence was ever probed.
-
-**It is not a conversion at all.** Every one of the checkpoint's 478 tensors is
-already bf16, so `--type bf16` copies the bits rather than reinterpreting them;
-spot-checked bit-exact against the safetensors for talker, code-predictor and
-attention weights. We were the only step in the chain converting anything, which
-is why we were the only step that broke.
-
-**Verified**: 10/10 seeds terminate normally (119–149 frames, against Q8_0's
-128/135), audio matches Q8_0's character (RMS −25.6 / ZCR 0.142 against −24.6 /
-0.130), no guard trips on either backend.
-
-**Speed** (0.6B, seed 42, median of 3, ms/frame — the f16 row is a proxy file
-with 477 of 478 tensors F16, since a real F16 file now fails at frame 0):
-
-| type | CUDA (1660 SUPER) | ROCm (6800 XT) |
-|---|---|---|
-| **q8_0** | **25.0** | **24.2** |
-| bf16 | 34.4 | 27.0 |
-| f16 (broken) | 37.0 | 24.6 |
-| f32 | 38.0 | — |
-
-Q8_0 stays the default and stays fastest on both cards. Against F16 the two
-backends disagree — bf16 is 7% faster on CUDA (the #14 effect: dodging F16 pays
-on a card with no tensor cores) and 10% slower on ROCm. Either way bf16 is the
-only half-precision type here that is correct, and it is the one to use as the
-precision control in `optimization.md` instead of F32.
-
-**Practical effect today:** none — every shipped GGUF is Q8_0. It matters the
-moment anyone converts with `--type f16`, and it blocks using F16 as the
-precision control when attributing speed wins to quantisation (see
-`optimization.md`). F32 works and can stand in, at 2x the weight bytes.
+**Diagnostic worth keeping:** `QWEN3_TTS_PROBE_NUM=1` reports every graph node
+that cannot survive a cast to F16, and `QWEN3_TTS_KEEP_RUNAWAY=1` saves a
+runaway's audio so it can be listened to instead of only counted.
 
 <a id="17"></a>
 ## 17. A vocoder OOM segfaults instead of failing — upstream ggml
@@ -999,163 +911,57 @@ Not urgent: `test_streaming_parity` covers the decoder's production path and
 does run. But it means the one-shot path has no automated cover at all.
 
 <a id="21"></a>
-## 21. 4-bit: `q4_k` never worked at all, and `q4_0` breaks on GPU
+## 21. 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU
 
-**Status:** fixed 2026-08-25 — converter repaired, and q4_0 now works on GPU too
+**Status:** fixed 2026-08-25
 **Found:** 2026-08-25
-**Severity:** was correctness (silent broken output), now a documented limit
+**Severity:** was correctness (silent broken output), now closed
 
 Two separate things, found while asking whether a 4-bit quant would be faster.
 
 ### `--type q4_k` produced an F16 file, silently
 
-The `gguf` Python package implements K-quants for **dequantisation only**:
+The `gguf` Python package implements K-quants for **dequantisation only**, so
+every one of the 271 quantisable tensors raised `NotImplementedError` — and
+`_convert_dtype` caught it and fell back to F16. The output was byte-for-byte an
+F16 file, i.e. exactly the model #16 says cannot work, while `--help` promised
+"~70% size reduction".
 
-```
-Q4_K: NotImplementedError    Q8_0: OK
-Q5_K: NotImplementedError    Q4_0: OK
-Q6_K: NotImplementedError
-```
+**The blanket `except -> F16` was the real bug**, because on this model F16 is
+not a safe degradation, it is a broken model. Removed. `q4_k` is gone from
+`choices` (an option that cannot work should not be offered) and `q4_0` is
+offered instead. A row that is not a whole number of blocks still falls back to
+F16 — legitimate, what llama.cpp does, affects a few speaker-encoder
+convolutions, and logged. Everything else raises. Verified no regression: q8_0
+reconverts byte for byte identical.
 
-`_convert_dtype` caught that exception and fell back to F16 — for all 271
-quantisable tensors. The output was byte-for-byte an F16 file: same 1835429440
-bytes, `{F32: 174, F16: 304}`, i.e. exactly the model #16 says cannot work. The
-`--help` text promised "~70% size reduction".
+### `q4_0` returned inf on CUDA and ROCm, and worked on CPU
 
-**Fixed.** `q4_k` is gone from `choices` (an option that cannot work should not
-be offered), `q4_0` is offered instead, and the blanket `except -> F16` is gone.
-A row whose length is not a whole number of blocks still falls back to F16 —
-that is legitimate and what llama.cpp does, it affects a handful of
-speaker-encoder convolutions, and it is logged. Every other failure now raises.
+Same node as #16, different mechanism, and backend-dependent: those backends
+pack activations as `block_q8_1`, whose block sum is F16, so the effective
+ceiling is `65504/32 = 2047`. Mechanism and the affected-type table:
+**`quantisation.md`** and `ggml-notes.md`.
 
-The general lesson: **falling back to F16 on error is the bug**, because on this
-model F16 is not a safe degradation, it is a broken model. Verified no
-regression — reconverting q8_0 reproduces the previous file byte for byte.
+**Fixed** by scaling `ffn_down`'s input down by 128 and the result back up,
+gated on the weight type. 10/10 seeds on CUDA and 3/3 on ROCm for the 0.6B, 3/3
+and 3/3 for the 1.7B; **21.3 ms/frame against q8_0's 24.9** on the 0.6B, 28.8
+against 33.0 on the 1.7B.
 
-### `--type q4_0` returned inf on CUDA and ROCm (fixed)
+**The scale is not free** — `d` is F16 too, so small blocks drift toward
+subnormals. Frame 0 is bit-identical; from frame 1 logits move ~0.5% with token
+ranking preserved. Same order as reduction-order noise. Gated rather than
+unconditional for that reason.
 
-Same symptom as #16 and the same node — `code_pred.blk.2.ffn_down` goes
-non-finite on frame 0 — but a different mechanism, and this one is
-backend-dependent:
+**The two model sizes hid the problem in different places** — 0.6B peaks at
+185587 in the code predictor, 1.7B at 9495 in the talker. Scoping the fix to the
+one node the 0.6B pointed at would have left the 1.7B broken; it is applied at
+every `ffn_down` site for that reason. **A magnitude measured on one model size
+says nothing about the other.**
 
-| backend | activation format for a Q4_0 weight | result |
-|---|---|---|
-| CPU | `block_q8_0` — carries `d` only | **works** |
-| CUDA / ROCm | `block_q8_1` — carries `d` **and** `ggml_half s = d * sum(qs[i])` | **inf** |
-
-`block_q8_1` keeps the block's *sum* in F16 (`ggml-common.h:263`). A block of 32
-values around 185587 sums to ~5.9e6, and F16 stops at 65504, so `s` becomes inf
-before the dot product starts. Q8_0 weights are immune because their activation
-format is `block_q8_0`, which has no sum field at all.
-
-So this is #16's disease — an F16 field with a 65504 ceiling meeting this
-model's activations — in a completely different place: not the weights, but a
-housekeeping field of the intermediate activation format.
-
-**Measured** (0.6B, seed 42, median of 3):
-
-| | file size | CPU, 8 threads | CUDA | ROCm |
-|---|---|---|---|---|
-| q8_0 | 1.34 GB | 45.6 ms/frame | 25.0 | 24.2 |
-| q4_0 | 1.08 GB | **27.4 ms/frame** | *inf* | *inf* |
-
-On CPU q4_0 is a real win — 40% faster — and stable across 4 seeds with audio in
-the normal band (RMS −23.4, ZCR 0.148). The file is only 20% smaller rather than
-half, because embeddings, heads and norms stay F16 and dominate a model this
-small.
-
-### The fix, and what it costs
-
-Only one node needed it. The real ceiling on an activation is `65504/32 = 2047`,
-not 65504, because the sum covers 32 values. Probing every node above 2047 finds
-eight, but only one is an *input* to a quantised matmul — the code predictor's
-layer-2 SwiGLU at 185587. The five residual `ADD`s at 63554 all pass through an
-RMS norm before they reach the next matmul, which renormalises them.
-
-`ffn_down` is linear, so the input is divided by 128 and the result multiplied
-back (`needs_q8_1_activation_sum` in `tts_transformer.cpp`). 128 is the smallest
-power of two that clears the worst case (`32 x 185587 / 128 = 46.4k` against
-65504) — a power of two so the scaling itself is exact, and the smallest one so
-the cost below stays as small as it can be. It is applied only for Q4_0, Q4_1
-and Q5_1, so a Q8_0 or bf16 graph gains no nodes at all — measured: q8_0 stayed
-at 24.9 ms/frame either way.
-
-**Result:** 10/10 seeds on CUDA and 5/5 on ROCm, audio in the same band as the
-CPU reference. **21.3 ms/frame against q8_0's 24.9** — 15%, of which the scaling
-ops themselves cost ~0.6.
-
-**It is not free, and the first write-up of this was wrong to say so.** The
-integer quants really are unchanged, but `d` is stored in F16 too, and scaling
-down pushes small blocks toward the subnormal range. Isolated by forcing the
-scale on for Q8_0, where it is unnecessary, and comparing frame by frame:
-
-| | without scale | with scale |
-|---|---|---|
-| frame 0 hidden norm | 180.0888 | 180.0888 (identical) |
-| frame 0 top-5 cb0 | 24.922 22.141 21.906 … | identical |
-| frame 1 hidden norm | 181.4621 | 181.7267 |
-| frame 1 top-5 cb0 | 24.166 24.004 21.818 … | 24.276 24.116 21.961 … |
-
-Frame 0 is bit-identical; from frame 1 the logits drift ~0.5% with the token
-ranking preserved. The talker is unaffected — its activations never get near the
-subnormal boundary — so the drift comes entirely from the code predictor, whose
-SwiGLU spans from near-zero to 185587 in one tensor.
-
-That is the same order as the reduction-order noise `f569cb0` introduced, and it
-reshuffles frame counts the same way (see the warning under #11 about seeds).
-Against the alternative for Q4_0 — inf on frame 0 — it is not a real cost. It
-would be one if it were ever applied to a type that does not need it, which is
-why it is gated on the weight type.
-
-### Alternatives that were rejected
-
-`GGML_CUDA_FORCE_CUBLAS` is a compile-time option that reroutes *every* matmul
-away from the quantised kernels, giving up the speed that was the point.
-Widening `block_q8_1`'s sum to F32 is a core ggml layout change affecting every
-model and backend. And `GGML_PREC_F32` does not help at all: the MMQ/MMVQ path
-is chosen before precision is ever consulted (`ggml-cuda.cu:1815`).
-
-**Still true:** q4_0 costs real quality at 4 bits, which has only been checked
-by ear-level statistics here, and the file is 20% smaller rather than half
-because embeddings, heads and norms stay F16 and dominate a model this small.
-q8_0 remains the default.
-
-### The two model sizes hide the problem in different places
-
-Everything above was measured on the 0.6B. Probing the 1.7B afterwards found a
-different picture entirely:
-
-| | largest SwiGLU | where |
-|---|---|---|
-| 0.6B | **185587** | `cp_prefill.blk.2` — the code predictor |
-| 1.7B | **9495** | `talker.blk.2` — the talker |
-
-Twenty times smaller, and in the other subsystem. The 1.7B's code predictor
-peaks at 1922, well inside the safe band; the 0.6B's talker peaks at 1410.
-
-Two things follow. First, the 1.7B **would also have failed** on q4_0 —
-`32 x 9495 = 304k` is past 65504 — just in the talker rather than the code
-predictor. Second, scoping the fix to the one node the 0.6B pointed at would
-have left the 1.7B broken. The scale is applied at every `ffn_down` site for
-that reason, and `k = 128` leaves the 1.7B a 27x margin (`304k / 128 = 2374`).
-
-**Verified end to end on the 1.7B** (2026-08-25, after fetching its HF
-checkpoint): 3/3 seeds on CUDA and 3/3 on ROCm, no non-finite anywhere in the
-talker or code-predictor path, audio matching q8_0's character (RMS −19.8 / ZCR
-0.148 against −21.3 / 0.149).
-
-| 1.7B, CUDA | file | ms/frame |
-|---|---|---|
-| q8_0 | 2.46 GB | 33.0 |
-| q4_0 | 1.71 GB | **28.8** |
-
-13% faster on a 30% smaller file — a better size ratio than the 0.6B's 20%,
-because the F16 embeddings and heads are a smaller share of a larger model.
-
-**The general lesson, worth more than this issue:** a measurement of *magnitude*
-does not carry across model sizes, and this repo's habit of testing on the 0.6B
-means such numbers are systematically one-sided. Anything that fixes a threshold
-or a constant should be probed on both sizes before it is trusted.
+**Still open, and it is the quality question, not the speed one:** Q4_0
+coarsens fine acoustic detail audibly (established in August on the code
+predictor). Everything measured here is signal statistics. See `quantisation.md`
+before shipping 4-bit anywhere.
 
 <a id="22"></a>
 ## 22. A 1.7B bf16 talker does not fit on a 6 GB card
