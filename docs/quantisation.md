@@ -25,25 +25,118 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 
 ## What to use
 
-| `--type` | 0.6B size | works | notes |
-|---|---|---|---|
-| **`q8_0`** | 1.34 GB | everywhere | **the default.** Fastest on both GPUs. |
-| `bf16` | 1.84 GB | everywhere with VRAM | bit-identical to the checkpoint |
-| `q4_0` | 1.08 GB | everywhere | fastest, smallest, **audibly worse** |
-| `f32` | 3.66 GB | everywhere | 2x bytes for nothing; no reason left to use it |
-| `f16` | 1.84 GB | **nowhere** | accepted so #16 stays reproducible; warns |
+| `--type` | works | notes |
+|---|---|---|
+| **`q8_0`** | everywhere | **the default.** Cheapest to be sure about. |
+| `q4_k` | everywhere | same bytes as `q4_0`, less error - see below |
+| `q5_k` `q6_k` | everywhere | the middle of the ladder |
+| `bf16` | everywhere with VRAM | bit-identical to the checkpoint |
+| `q4_0` | everywhere | **superseded by `q4_k`**, kept only for old files |
+| `f32` | everywhere | 2x bytes for nothing; no reason left to use it |
+| `f16` | **nowhere** | accepted so #16 stays reproducible; warns |
 
-Speed, ms/frame, median of 3, one sentence, seed 42:
+K-quants need `qwen3-tts-quantize` (see below); the Python converter cannot
+write them.
 
-| | 0.6B CUDA | 0.6B ROCm | 0.6B CPU 8t | 1.7B CUDA |
+## How much each one throws away
+
+`qwen3-tts-quantize --verify` reports `rms(dequantised - original) / rms(original)`
+per tensor and averaged. It is scale-free, so it compares across tensors, types
+and model sizes - and it is the **only** ranking of weight types available on
+this model, for the reason in the next section.
+
+| type | bits/weight | rel. rms error | 0.6B | 1.7B |
 |---|---|---|---|---|
-| q8_0 | 25.0 | 24.2 | 45.6 | 33.0 |
-| q4_0 | **21.3** | — | **27.4** | **28.8** |
-| bf16 | 34.4 | 27.0 | — | *OOM on 6 GB* |
-| f16 | 37.0¹ | 24.6¹ | — | — |
-| f32 | 38.0 | — | — | — |
+| `q8_0` | 8.5 | **0.55%** | 1281 MiB | 2345 MiB |
+| `q6_k` | 6.56 | 1.81% | 1159 MiB | 1999 MiB |
+| `q5_k` | 5.5 | 3.68% | 1093 MiB | 1809 MiB |
+| `q4_k` | 4.5 | 7.26% | 1030 MiB | 1630 MiB |
+| `q4_0` | 4.5 | 8.82% | 1030 MiB | 1630 MiB |
 
-¹ a proxy file with 477 of 478 tensors F16 — a real one fails on frame 0.
+Measured 2026-08-25 against the bf16 files. The two model sizes agree to the
+third decimal, so this is a property of the format, not of the model.
+
+Two things fall out of it:
+
+**`q4_0` has no reason to exist any more.** Q4_K is the same 4.5 bits per
+weight - the two files match to the byte - for 17% less error, and it is no
+slower anywhere and faster on the CPU.
+
+**A better quant is nearly free in bytes here.** 43% of the file is embeddings
+and heads that are never quantised: of the 0.6B's 1745 MiB only 1002 MiB is
+eligible. So `q4_k` -> `q6_k` costs 129 MiB (+12%) and cuts the error fourfold.
+The usual llama.cpp instinct - squeeze to 4 bits, the file is mostly weights -
+pays much worse on this model than it does on an LLM.
+
+## Why generated audio cannot rank any of this
+
+It is tempting to quantise two ways, synthesise the same sentence, and listen.
+That ranks nothing. The talker is autoregressive, so any numerical difference
+at all changes one sampled token and every token after it differs. Under greedy
+decoding, one sentence on the 0.6B came out:
+
+| bf16 | q8_0 | q6_k | q5_k | q4km | q4_k | q4_0 |
+|---|---|---|---|---|---|---|
+| 107 | 106 | **189** | **189** | 109 | 100 | **52** frames |
+
+`q6_k` is a far better quant than `q4_0` and ran nearly four times longer.
+That spread is chaos, not quality. The same applies with sampling on: a
+listening test compares one draw from each type, not the types.
+
+So: `--verify` for ranking, ears for whether the winner is good enough, and
+never a frame count or a waveform diff.
+
+## Speed, and why the answer depends on the backend
+
+ms/frame, median of 3, same sentence and seed, 2026-08-25.
+
+| 0.6B | CUDA (1660S) | ROCm (6800 XT) | CPU 8t |
+|---|---|---|---|
+| `q8_0` | 23.1 | **17.3** | 39.4 |
+| `q6_k` | 21.9 | 17.7 | 29.5 |
+| `q5_k` | 20.7 | 18.8 | 24.8 |
+| `q4_k` | **20.0** | 18.7 | **20.2** |
+| `q4_0` | 20.0 | 17.8 | 21.5 |
+
+| 1.7B | CUDA (1660S) | ROCm (6800 XT) |
+|---|---|---|
+| `bf16` | *OOM on 6 GB* | 28.4 |
+| `q8_0` | 27.0 | 20.3 |
+| `q6_k` | 25.6 | 20.1 |
+| `q5_k` | 23.4 | 20.9 |
+| `q4_k` | **22.5** | 20.1 |
+| `q4_0` | 22.9 | **19.7** |
+
+**On the CPU the weight type is the single biggest lever there is** - `q8_0` to
+`q4_k` is nearly 2x. On NVIDIA it is worth ~13%. On AMD it is worth nothing at
+all: everything lands within 1.5 ms and `q8_0` is the fastest of them on the
+0.6B. Do not carry a number from one backend to another.
+
+## Making one
+
+The Python converter writes bf16; `qwen3-tts-quantize` does the rest.
+
+```
+scripts/convert_tts_to_gguf.py --type bf16 <hf-dir> model-bf16.gguf
+qwen3-tts-quantize model-bf16.gguf model-q4_k.gguf q4_k --verify
+```
+
+Any input type works - each tensor is dequantised to F32 and requantised - but
+feed it bf16 when you care, since that is a lossless start.
+
+`--tensor-type SUBSTR=TYPE` overrides by name, which is the whole mechanism
+behind an "Unsloth Dynamic" UD-Q4_K_XL: a normal GGUF whose tensors carry
+different types. Theirs are chosen with an importance matrix from a calibration
+run; ours by hand.
+
+```
+qwen3-tts-quantize in.gguf out.gguf q4_k --tensor-type ffn_down=q6_k --tensor-type attn_v=q6_k
+```
+
+It leaves the same tensors alone the converter does (embeddings, norms, biases,
+heads), plus any row that is not a whole number of blocks - 38 speaker-encoder
+convolutions, which K-quants skip far more often than Q8_0 because they need
+rows divisible by 256 rather than 32.
 
 ## Why F16 is not a safe default
 
@@ -59,10 +152,12 @@ converting them — verified bit-exact against the safetensors.
 
 ## Why 4-bit needs a scale, and where it lives
 
-On CUDA and HIP a Q4_0/Q4_1/Q5_1 matmul packs its activations as `block_q8_1`,
-which carries the block's **sum in F16** (`ggml-common.h:263`) so the kernel can
-correct for those types' dequant offset. A block covers 32 values, so the real
-ceiling on an activation is **65504/32 = 2047**, not 65504.
+On CUDA and HIP a matmul whose weights use the DS4 or D2S6 layout packs its
+activations as `block_q8_1`, which carries the block's **sum in F16**
+(`ggml-common.h:263`) so the kernel can correct for those types' dequant offset.
+The sum is over 32 values, so in the worst case an activation of 2047 already
+overflows it — though what actually trips it here is simpler: the 0.6B's 185587
+clears 65504 on its own, no summing needed.
 
 Q8_0 uses the D4 layout, which has no sum field (`ggml-cuda/mmq.cuh:60`) — that
 is the whole reason it is immune. The CPU is immune too: its `vec_dot_type` for
@@ -79,53 +174,46 @@ token ranking preserved — the same order as reduction-order noise. Against inf
 on frame 0 that is not a real cost, which is why it is gated rather than
 unconditional.
 
-## Quality: the part that is not measured
+## Which types need the scale
 
-**Q4_0 coarsens fine acoustic detail and Oleg could hear it** — established in
-August on the code predictor alone, and never retracted. Everything in the
-speed table above is signal statistics (RMS, zero-crossing rate), which only
-proves the output is speech-shaped, not that it sounds right.
-
-So: q4_0 is a real speed and size win and a real quality loss, and the loss has
-only ever been judged by ear, once, on part of the model. **Anyone proposing to
-ship 4-bit has to listen first**, particularly to how a cloned voice holds up
-over a long line.
-
-## Adding K-quants, if that is ever wanted
-
-The motivation is exactly the gap above: Q4_K is better quality than Q4_0 at
-about the same size, which is what 4-bit here is short of.
-
-**Why `--type q4_k` cannot simply be re-added.** The Python `gguf` package
-implements K-quants for *dequantisation only*. It can write:
-
-```
-F32 F16 BF16  Q4_0 Q4_1 Q5_0 Q5_1 Q8_0  MXFP4 TQ1_0 TQ2_0
-```
-
-and nothing else. In llama.cpp the split is deliberate: `convert_hf_to_gguf.py`
-writes F16/BF16/Q8_0 and the C++ `llama-quantize` does the rest, because the
-K-quant search lives in `ggml-quants.c`.
-
-**`llama-quantize` will not work on our files** — it goes through llama.cpp's
-model loader, which needs a known architecture, and ours is a custom
-`qwen3-tts`.
-
-**The path that would work:** `ggml_quantize_chunk()` is public ggml API
-(`ggml.h:2861`) and ggml is our submodule, so a small C++ tool can walk our GGUF
-tensor by tensor. That is also how per-tensor type mixing would be done — which
-is all an "Unsloth Dynamic" UD-Q4_K_XL is: a normal GGUF whose tensors carry
-different types, chosen with an importance matrix from a calibration run and
-per-tensor overrides. Not a new format. Our `_should_quantize()` is the same
-idea by hand, without calibration.
-
-**Watch out:** K-quants hit the same ceiling as #21 and need the same gate.
+`needs_q8_1_activation_sum()` in `tts_transformer.cpp` is a copy of
+`mmq_get_q8_1_ds_layout()` in `ggml-cuda/mmq.cuh`. Keep it that way.
 
 | type | `q8_1` layout | needs the scale? |
 |---|---|---|
-| Q4_K, Q5_K, IQ1_S | DS4 | **yes** |
+| Q4_0, Q4_1, Q5_1, Q4_K, Q5_K, IQ1_S | DS4 | **yes** |
 | Q2_K | D2S6 | **yes** |
-| Q3_K, Q6_K, IQ2/3/4_* | D4 | no |
+| Q8_0, Q5_0, Q3_K, Q6_K, IQ2/3/4_*, MXFP4 | D4 | no |
 
-`needs_q8_1_activation_sum()` currently lists only Q4_0/Q4_1/Q5_1. Adding a
-K-quant without extending it returns inf on frame 0.
+**Q4_K survives without the scale today, and the gate stays on anyway.** Tested
+2026-08-25 by disabling it: Q4_0 fails on frame 0 as expected, Q4_K does not, on
+either model size and on a 157-token prefill. The reason is that CUDA has two
+kernels and only one of them reads the field — `vec_dot_q4_K_q8_1` (the vector
+path, `vecdotq.cuh:946`) takes `d` alone and rebuilds the sum in F32, while
+`vec_dot_q4_K_q8_1_impl_mmq` (`mmq.cuh:552`) reads the F16 `s`. Which one runs
+depends on batch size, and `ggml_cuda_mul_mat` tries MMVQ before MMQ
+(`ggml-cuda.cu:1856`), so the one matmul that carries 185587 — the code
+predictor's, at `ne11 = 2` — happens to take the safe path.
+
+That is a property of today's ggml, not of the model. A submodule bump, a
+different batch shape, or a wider code-predictor prefill flips it, and the
+symptom is inf on frame 0 with nothing else to go on. 0.5% logit drift is the
+right price for not having that mine in the tree.
+
+## Quality
+
+`--verify` ranks the types (see the error table above). Whether the winner is
+*good enough* is an ear question, and the ear test has a trap in it: every type
+produces a different token sequence, so a side-by-side comparison is comparing
+one draw against another, not one type against another. Judge across several
+seeds, or the seed is what you are hearing.
+
+Recorded verdicts, most recent first:
+
+- **2026-08-25, 1.7B, cloned voice, one seed each.** Oleg's read: heavily
+  seed-dependent; on that draw `q4_k` came out best of the six, with possibly
+  weaker voice-cloning fidelity than `q8_0`/`bf16` but correct stress placement
+  throughout.
+- **August 2026, code predictor only.** `q4_0` coarsens fine acoustic detail
+  and Oleg could hear it. Never retracted, and `q4_0`'s 8.82% error is the
+  worst of any type here.

@@ -131,6 +131,25 @@ process. To cut it: `QWEN3_TTS_DECODE_BATCH=8` (−120 MB, −7% throughput) or
 quant `Q8_0`, cached in `~/.cache/huggingface/`). **Local**: `-m talker.gguf
 -v vocoder.gguf`; `-m` also takes a directory and finds the vocoder itself.
 
+### Building a GGUF yourself
+
+```bash
+scripts/convert_tts_to_gguf.py --type q8_0 <hf-checkpoint-dir> talker.gguf
+```
+
+`--type` takes `q8_0` (default), `bf16`, `q4_0`, `f32`. Do not use `f16` — this
+model's activations do not fit in it and the result generates noise.
+
+For K-quants (`q4_k`, `q5_k`, `q6_k`, …) convert to `bf16` first, then:
+
+```bash
+build/qwen3-tts-quantize talker-bf16.gguf talker-q4_k.gguf q4_k --verify
+```
+
+`--verify` prints how much each tensor lost. `--tensor-type SUBSTR=TYPE`
+overrides individual tensors. See `docs/quantisation.md` for which type to pick
+— the answer is not the usual llama.cpp answer.
+
 ## Server
 
 All flags have matching `TTS_*` env vars (CLI > env > default).

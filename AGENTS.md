@@ -60,6 +60,9 @@ qwen3-tts.cpp/
 - `qwen3-tts-cli` — CLI executable, links qwen3_tts + voice_store
 - `qwen3-tts-server` — HTTP server, links qwen3_tts + voice_store + httplib +
   nlohmann_json. Gated by `-DQWEN3_TTS_SERVER=ON` (default ON).
+- `qwen3-tts-quantize` — re-quantises a GGUF to a type the Python converter
+  cannot write (K-quants). Links `ggml` alone: it never loads the model, it
+  walks the file tensor by tensor over `ggml_quantize_chunk()`.
 
 ## Build System
 
