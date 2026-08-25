@@ -17,6 +17,10 @@ Measurements and design notes are in `docs/`: `optimization.md` (performance),
 `quantisation.md` (which weight type to use), `known-issues.md` (bug log),
 `ggml-notes.md` (ggml side).
 
+`scripts/bench_speed.sh` times one configuration and appends it to
+`benchmarks/speed.tsv`, which is committed so speed can be compared across
+commits.
+
 ## Quickstart
 
 ```bash
@@ -298,6 +302,7 @@ spoken text, not just the timbre.
 | `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from input length. `0` disables it. |
 | `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
 | `QWEN3_TTS_FORCE_CPU` | off | `1` keeps everything on the CPU. |
+| `QWEN3_TTS_VOCODER` | gpu | `cpu` moves the vocoder (weights and compute) off the accelerator. Much slower everywhere measured; it exists for diagnosis. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
 
 ## Testing

@@ -108,7 +108,21 @@ that isolates it.
 
 ---
 
-## `CONV_TRANSPOSE_1D` has a naive CUDA kernel — the real target
+## `CONV_TRANSPOSE_1D` — the real target, and it is not reaching the GPU
+
+**Correction, 2026-08-25.** The kernel analysis below is sound but it is not
+what has been running. `GGML_SCHED_DEBUG=2` shows seven `CONV_TRANS` splits per
+graph executing on the **CPU**, on the CUDA build and the HIP build alike:
+`supports_op` in `ggml-cuda.cu` accepts this op only when both inputs are F32,
+and the vocoder stores its conv weights as F16. So the timings below are CPU
+convolutions with a GPU round trip either side, filed under a "CUDA" op because
+the profiler times the gap between scheduler callbacks and never asks which
+device did the work.
+
+The first fix is therefore not a better kernel — it is making the op eligible at
+all, by converting the vocoder's conv weights to F32 at load or by teaching the
+kernel to take F16. Only then does the analysis below start to apply. See
+`optimization.md`.
 
 Re-profiling after the vocoder reached the GPU (`known-issues.md` #13) put
 **52% of decode in `CONV_TRANSPOSE_1D`**, against 1.7% in `IM2COL`. The biggest

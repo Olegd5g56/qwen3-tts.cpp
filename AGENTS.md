@@ -42,6 +42,12 @@ qwen3-tts.cpp/
     test_streaming_parity.cpp   # Streaming-vs-oneshot decoder parity
     test_icl_dump.cpp           # ICL diagnostic dump
   scripts/                      # Python utilities (HF↔GGUF conversion, refs)
+                                # + bench_speed.sh: the speed protocol
+  benchmarks/                   # speed.tsv: committed speed history, one row
+                                #   per run — append, never tidy
+                                # + bench_ru.txt and voice/: the fixed input
+                                #   and reference voice. Changing either starts
+                                #   a new series.
   reference/                    # Reference data (*.bin gitignored, *.json tracked)
   voices/                       # Default --voices-dir, per-id sample.{wav,mp3,txt}
                                 # + cache.bin (encoded embedding + ref codes)

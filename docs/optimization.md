@@ -100,13 +100,15 @@ per frame. Scripts: `scripts/bench_torch_vs_ggml.py` and
 average hides a 5.1x win on generation and a **3.6x loss on the vocoder**.
 
 **The vocoder loss is cuDNN, not PyTorch.** The same PyTorch code on ROCm
-decodes at 60.1 ms/frame — **9.6x slower than our own naive kernel** on the same
-card, with MIOpen falling back to untuned GEMM solvers and warning about it.
-NVIDIA ships a decade of hand-tuned transposed-convolution kernels; AMD does
-not, for these shapes on gfx1030; ggml has one naive kernel and sits between
-them. So `CONV_TRANSPOSE_1D` remains the right target, and 2.67 ms/frame is now
-a **demonstrated ceiling on a 1660 SUPER** rather than a hope — but closing the
-gap means writing a genuinely good kernel, not finding a silly mistake.
+decodes at 60.1 ms/frame — **9.6x slower than our path** on the same card, with
+MIOpen falling back to untuned GEMM solvers and warning about it. NVIDIA ships a
+decade of hand-tuned transposed-convolution kernels; AMD does not, for these
+shapes on gfx1030. So `CONV_TRANSPOSE_1D` remains the right target and 2.67
+ms/frame is a **demonstrated ceiling on a 1660 SUPER** rather than a hope.
+
+Note that "our path" here is not ggml's CUDA kernel — see the next section. It
+is a CPU convolution with a GPU round trip either side, which makes beating
+MIOpen by 9.6x a comment on MIOpen rather than a compliment to us.
 
 **PyTorch also decodes all 653 frames in one shot inside 5.2 GB where we must
 chunk.** That looked like a second pointer at the same op — memory-hungry and
@@ -237,19 +239,31 @@ related, not independent.
 
 ## Remaining ideas (descending value)
 
-1. **`CONV_TRANSPOSE_1D` kernel in ggml** — 45-52% of decode, and the current
-   CUDA kernel is naive enough that this is ordinary optimisation work rather
-   than research: tile it, stage weights in shared memory, and stop iterating
-   over the stride positions that are discarded. Upstream project; benefits
-   every audio decoder on ggml.
+1. **`CONV_TRANSPOSE_1D` — and the first step is not a kernel at all.**
+   45-52% of decode, and **it never reaches the GPU**. Verified 2026-08-25 with
+   `GGML_SCHED_DEBUG=2`: seven splits per graph run on the CPU, on the CUDA
+   build *and* the HIP build, every one a `CONV_TRANS` node in the vocoder
+   (`tok_dec.upsample.*`, `tok_dec.dec.*.conv_t`). `supports_op` in
+   `ggml-cuda.cu` returns true only when both inputs are F32; the vocoder stores
+   its conv weights as F16. Each node is therefore a CPU convolution with a GPU
+   round trip either side.
 
-   **There is now a number to aim at.** cuDNN does this vocoder at 2.67
-   ms/frame on the same 1660 SUPER where we take 9.60 — see *Against the
-   reference PyTorch pipeline*. That is a demonstrated ceiling on this
-   hardware, worth ~26% end-to-end (19.1 s → ~14.3 s, RTF 0.39 → 0.29). It is
-   also proof the work is kernel-quality work: the same PyTorch code on ROCm,
-   where MIOpen has no tuned kernels for these shapes, is 9.6x *slower* than
-   our naive one.
+   This supersedes the older entry here, which said the cost was ggml's naive
+   CUDA kernel. That kernel may well be naive — it has simply not been running.
+   The op profiler times the gap between scheduler callbacks and does not care
+   which device did the work, which is how CPU time got filed under a "CUDA" op.
+   It also explains why `GGML_NATIVE` is worth 2.25x end-to-end: that flag
+   governs exactly the CPU kernels these seven nodes land in.
+
+   **Two ways in, neither tried.** Convert the vocoder's conv weights to F32 at
+   load so `supports_op` accepts them — costs VRAM, `tok_dec.dec.1.conv_t.weight`
+   alone is ~36 MB — or teach the CUDA/HIP kernel to take F16 inputs. Only after
+   one of those is the kernel's quality worth arguing about.
+
+   **There is a number to aim at.** cuDNN does this vocoder at 2.67 ms/frame on
+   the same 1660 SUPER where we take 9.60 — see *Against the reference PyTorch
+   pipeline*. Worth ~26% end-to-end. Measure before and after with
+   `scripts/bench_speed.sh`, and put both rows in `benchmarks/speed.tsv`.
 2. **The code predictor: only one lever left, and it is not a code change.**
    At 13.2 ms/frame it is the largest single line and no longer hidden, but it
    is ~70% weight traffic (see the ruled-out entry). Quantising it works and is

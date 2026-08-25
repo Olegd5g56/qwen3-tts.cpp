@@ -811,6 +811,9 @@ scratch. Each was verified against the code on 2026-08-24.
   audio) — it cost real time on 2026-08-24 before the mismatch was spotted.
   Replace it with the model card's `clone.wav`, which is what the transcript
   actually matches, or delete both and the stale transcript with them.
+  `benchmarks/voice/` is now the reference pair to reach for instead: 8.9 s of
+  audio this model generated from the transcript beside it, so the two match by
+  construction.
 - **`docs/model_inspection.txt`** is a raw metadata dump with no header saying
   which GGUF it came from or when.
 - **Two ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
