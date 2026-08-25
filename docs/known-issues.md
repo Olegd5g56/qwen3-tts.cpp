@@ -30,6 +30,7 @@ root cause still there) / **wontfix**.
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
 | [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
 | [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU | fixed 2026-08-25 |
+| [22](#22) | A 1.7B bf16 talker does not fit on a 6 GB card | open 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1138,11 +1139,46 @@ predictor. Second, scoping the fix to the one node the 0.6B pointed at would
 have left the 1.7B broken. The scale is applied at every `ffn_down` site for
 that reason, and `k = 128` leaves the 1.7B a 27x margin (`304k / 128 = 2374`).
 
-Not verified end to end on the 1.7B: its HF checkpoint is not on this disk, only
-the converted Q8_0, so there is no 1.7B q4_0 file to run. The claim above rests
-on the measured activation, not on a generation.
+**Verified end to end on the 1.7B** (2026-08-25, after fetching its HF
+checkpoint): 3/3 seeds on CUDA and 3/3 on ROCm, no non-finite anywhere in the
+talker or code-predictor path, audio matching q8_0's character (RMS −19.8 / ZCR
+0.148 against −21.3 / 0.149).
+
+| 1.7B, CUDA | file | ms/frame |
+|---|---|---|
+| q8_0 | 2.46 GB | 33.0 |
+| q4_0 | 1.71 GB | **28.8** |
+
+13% faster on a 30% smaller file — a better size ratio than the 0.6B's 20%,
+because the F16 embeddings and heads are a smaller share of a larger model.
 
 **The general lesson, worth more than this issue:** a measurement of *magnitude*
 does not carry across model sizes, and this repo's habit of testing on the 0.6B
 means such numbers are systematically one-sided. Anything that fixes a threshold
 or a constant should be probed on both sizes before it is trusted.
+
+<a id="22"></a>
+## 22. A 1.7B bf16 talker does not fit on a 6 GB card
+
+**Status:** open — a hardware limit, recorded so it is not rediscovered
+**Found:** 2026-08-25
+**Severity:** capacity — bf16 is unusable on the 1660 SUPER at 1.7B
+
+`--type bf16` doubles the weight bytes against q8_0: the 1.7B comes out at
+3.86 GB, and loading it asks CUDA for a 3656 MiB buffer. The GTX 1660 SUPER has
+6144 MiB total, and with the vocoder and compute buffers on top it does not fit:
+
+```
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 3656.04 MiB on device 0:
+cudaMalloc failed: out of memory
+```
+
+It fails cleanly rather than crashing — that is #17's fix doing its job — and
+the same file runs fine on the 6800 XT's 16 GB (3/3 seeds).
+
+So the recommendation from #16, "use bf16 as the half-precision type", holds for
+the 0.6B on any card and for the 1.7B only on a card with headroom. q8_0 remains
+the default and the only thing that fits everywhere.
+
+**Found only because the 1.7B was tested at all** — the 0.6B bf16 is 1.8 GB and
+fits anywhere, so nothing about it would have surfaced this.
