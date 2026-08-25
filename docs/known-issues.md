@@ -1067,3 +1067,44 @@ small.
 on a GPU build. Nothing enforces that split today — the logit guard from
 `06cd5fc` catches it on frame 0 with a clear message, which is adequate but
 after the fact.
+
+### Could q4_0 be made to work on the GPU? Yes, and it is one node
+
+**What it would buy** (CUDA, 0.6B, seed 42, median of 3, measured with the logit
+guard temporarily bypassed so the kernels run on garbage — the timings are real
+even though the tokens are not):
+
+| stage | q4_0 | q8_0 |
+|---|---|---|
+| talker | 5.4 ms/frame | 6.8 |
+| code predictor | 14.7 | 16.7 |
+| **generate** | **20.7** | **24.9** |
+
+~17% faster overall, on a 20% smaller file.
+
+**The real threshold is 2047, not 65504.** `s = d * sum(qs[i])` sums 32 values,
+so a block can reach 32x the largest value in it. Probing every node above
+`65504/32 = 2047` finds eight, but only one of them is an *input* to a
+quantised matmul:
+
+- `cp_prefill.blk.2.ffn_swiglu` at 185587 — feeds `ffn_down`. This is the one.
+- five residual `ADD`s at 63554 and two `MUL_MAT` outputs — all of these are
+  either outputs, or feed an RMS norm before they reach the next matmul, which
+  renormalises them back to unit scale.
+
+**The clean fix is a scale trick.** `ffn_down` is linear, so `W·(x/k)·k = W·x`
+exactly. And Q8_1 quantisation is scale-invariant per block: dividing x by k
+leaves `qs` bit-identical and scales `d` and `s` by 1/k, so the F16 sum field
+comes back into range with no accuracy change at all. Two cheap elementwise ops
+around one matmul, no ggml change, no new type.
+
+The alternatives are worse: `GGML_CUDA_FORCE_CUBLAS` is a compile-time option
+that reroutes *every* matmul away from the quantised kernels, giving up the
+speed that was the point; and widening `block_q8_1`'s sum to F32 is a core ggml
+layout change affecting every model and backend.
+
+**Not done, deliberately.** The payoff is 17% on a quantisation we do not ship,
+the audio cost of 4-bit on this model has only been spot-checked on CPU, and
+`GGML_PREC_F32` does not help because the MMQ/MMVQ path is chosen before
+precision is consulted (`ggml-cuda.cu:1815`). Revisit if a 4-bit GPU build is
+ever actually wanted.
