@@ -1118,3 +1118,31 @@ is chosen before precision is ever consulted (`ggml-cuda.cu:1815`).
 by ear-level statistics here, and the file is 20% smaller rather than half
 because embeddings, heads and norms stay F16 and dominate a model this small.
 q8_0 remains the default.
+
+### The two model sizes hide the problem in different places
+
+Everything above was measured on the 0.6B. Probing the 1.7B afterwards found a
+different picture entirely:
+
+| | largest SwiGLU | where |
+|---|---|---|
+| 0.6B | **185587** | `cp_prefill.blk.2` — the code predictor |
+| 1.7B | **9495** | `talker.blk.2` — the talker |
+
+Twenty times smaller, and in the other subsystem. The 1.7B's code predictor
+peaks at 1922, well inside the safe band; the 0.6B's talker peaks at 1410.
+
+Two things follow. First, the 1.7B **would also have failed** on q4_0 —
+`32 x 9495 = 304k` is past 65504 — just in the talker rather than the code
+predictor. Second, scoping the fix to the one node the 0.6B pointed at would
+have left the 1.7B broken. The scale is applied at every `ffn_down` site for
+that reason, and `k = 128` leaves the 1.7B a 27x margin (`304k / 128 = 2374`).
+
+Not verified end to end on the 1.7B: its HF checkpoint is not on this disk, only
+the converted Q8_0, so there is no 1.7B q4_0 file to run. The claim above rests
+on the measured activation, not on a generation.
+
+**The general lesson, worth more than this issue:** a measurement of *magnitude*
+does not carry across model sizes, and this repo's habit of testing on the 0.6B
+means such numbers are systematically one-sided. Anything that fixes a threshold
+or a constant should be probed on both sizes before it is trusted.
