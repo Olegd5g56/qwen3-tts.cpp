@@ -2,11 +2,33 @@
 
 Things found in ggml itself while working on this fork — upstream bugs, missing
 kernels, and defaults worth knowing. Kept separately from `known-issues.md`
-because none of it can be fixed here: it is either a patch to send upstream or
-context for the next person who wonders why a backend behaves oddly.
+because none of it lives in this repository's own sources: it is either a patch
+carried in our ggml fork, something to send upstream, or context for the next
+person who wonders why a backend behaves oddly.
 
 Measured against **ggml 0.20.2** (commit `8c63e70`) on a GTX 1660 SUPER
 (Turing TU116, no tensor cores) and an RX 6800 XT (RADV, gfx1030).
+
+---
+
+## Where our ggml patches live
+
+The `ggml` submodule points at **`Olegd5g56/ggml`, branch `qwen3-tts`**, not at
+`ggml-org/ggml`. The branch is `8c63e70` (v0.20.2) plus one commit per fix, each
+written to stand alone so it can be cherry-picked into an upstream PR later
+without dragging the others along.
+
+| commit | what |
+|---|---|
+| `f0aeec2` | check `ggml_gallocr_reserve_n` return value — `known-issues.md` #17 |
+
+Inside the submodule, `origin` is the fork and `upstream` is `ggml-org/ggml`
+with pushing disabled, so a stray `git push upstream` cannot reach the real
+project. To take a newer ggml: `git fetch upstream && git merge upstream/master`
+on `qwen3-tts`, then move the submodule pointer in the parent repo.
+
+Nothing here has been sent upstream yet; that is a deliberate hold, not an
+oversight. See `known-issues.md` #17 for the reasoning.
 
 ---
 

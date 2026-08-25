@@ -682,8 +682,8 @@ precision control when attributing speed wins to quantisation (see
 <a id="17"></a>
 ## 17. A vocoder OOM segfaults instead of failing — upstream ggml
 
-**Status:** fixed locally in the ggml submodule; **deliberately not reported
-upstream** — Oleg's call, 2026-08-24, revisit alongside the kernel work
+**Status:** fixed in our ggml fork, branch `qwen3-tts`; **deliberately not
+reported upstream** — Oleg's call, 2026-08-24, revisit alongside the kernel work
 **Found:** 2026-08-24
 **Severity:** availability — an out-of-memory kills the process, server included
 
@@ -725,10 +725,16 @@ if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph,
 Verified: the same run now exits 1 with `Failed to decode speech codes: Failed
 to allocate streaming graph`.
 
-**Caveat: `ggml` is a submodule pinned at v0.20.2, so this patch is not
-committed and `git submodule update` silently removes it**, restoring the
-crash. That is why the diff is written out in full above — it is the only copy.
 Reproduce with any `QWEN3_TTS_DECODE_BATCH` large enough to exhaust the card.
+
+The patch lives in the fork as commit `f0aeec2` on `qwen3-tts`, so a plain
+`git submodule update` now restores it rather than removing it. It used to be
+an uncommitted working-tree edit, which is why the diff is written out in full
+above; that copy is now redundant and kept only because it reads well here.
+
+Worth noting for the eventual upstream report: `ggml_backend_sched_reserve()`
+in the same file already checks this exact call. The patch makes the two paths
+agree rather than introducing a new convention.
 
 Reporting it upstream was considered and deferred on 2026-08-24: worth doing
 together with the `CONV_TRANSPOSE_1D` work, which touches the same project, so

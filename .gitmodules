@@ -1,3 +1,4 @@
 [submodule "ggml"]
 	path = ggml
-	url = https://github.com/ggml-org/ggml.git
+	url = https://github.com/Olegd5g56/ggml.git
+	branch = qwen3-tts
