@@ -28,6 +28,7 @@ root cause still there) / **wontfix**.
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
 | [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
+| [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -968,3 +969,29 @@ guard is the same three lines but was not exercised: `test_decoder` cannot run
 here at all, because it needs `reference/speech_codes.bin` and
 `reference/decoded_audio.bin`, which are not in the repository. That gap
 predates this change and is worth its own entry.
+
+<a id="20"></a>
+## 20. The decoder tests cannot run — their reference dumps are not in the repo
+
+**Status:** open
+**Found:** 2026-08-25 (while verifying #19)
+**Severity:** process — a whole test binary is dead weight
+
+`tests/test_decoder.cpp` reads `reference/speech_codes.bin` and
+`reference/decoded_audio.bin`. Neither is in the repository, and `reference/`
+holds only the three JSON metadata files. Pointing `QWEN3_TTS_TEST_MODEL` and
+`QWEN3_TTS_TEST_VOCODER` at local ggufs does not help — the dumps are the
+missing part, and the test exits with its "not part of the repository" notice.
+
+So `test_decoder` builds, is listed as a target, and has never run for anyone
+who did not generate those dumps themselves. It surfaced while verifying #19:
+the one-shot `decode()` guard could not be exercised, because the only caller
+of that path is a test that cannot start.
+
+**What the fix looks like:** either a script that regenerates the dumps from a
+local model (they are derived data, so they need not be committed), or commit a
+small enough pair to be checked in. The first is better - the dumps depend on
+the vocoder file, and a stale committed dump would be worse than none.
+
+Not urgent: `test_streaming_parity` covers the decoder's production path and
+does run. But it means the one-shot path has no automated cover at all.

@@ -16,6 +16,14 @@
 // type decides the activation type in ggml, so an activation above 65504 turns
 // into inf under F16 weights and under nothing else - see known-issues.md #16.
 // Both flags are independent; either one installs the callback.
+//
+// Reading the probe: rows naming a *weight* ("...weight (reshaped)") or an
+// IM2COL output, capped at exactly 65504.0 with a small non-finite count, are
+// an artefact and not a finding. The scheduler reuses compute buffers, so the
+// regions a node does not write still hold the previous node's bytes, and the
+// scan reads them. Checked on 2026-08-25: the vocoder GGUF's F16 weights hold
+// zero inf, zero nan and nothing above 60000. Trust the rows for tensors a node
+// actually produces; treat a weight row as noise.
 namespace qwen3_tts {
 
 bool op_profiler_enabled();
