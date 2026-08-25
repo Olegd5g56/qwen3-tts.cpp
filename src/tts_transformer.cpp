@@ -702,6 +702,29 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
          }
      }
 
+     // This model does not fit in F16 and never has: the code predictor's SwiGLU
+     // reaches ~185k, and F16 weights drag the activations through F16 too, so
+     // the FFN below it returns inf on the first frame of every generation.
+     // Warn rather than refuse - the check reads the weight type, which says
+     // nothing about a future checkpoint's activations. The non-finite logit
+     // guard in the decode loop is what actually stops a broken run.
+     // See docs/known-issues.md #16.
+     {
+         int n_f16 = 0;
+         for (const auto & kv : model_.tensors) {
+             if (kv.second && kv.second->type == GGML_TYPE_F16 &&
+                 (strncmp(kv.first.c_str(), "talker.", 7) == 0 ||
+                  strncmp(kv.first.c_str(), "code_pred.", 10) == 0)) {
+                 n_f16++;
+             }
+         }
+         if (n_f16 > 0) {
+             log_warn("%d talker/code_pred tensors are F16. This model overflows F16 and "
+                      "generation is expected to fail on the first frame - reconvert with "
+                      "--type bf16 (or q8_0). See docs/known-issues.md #16.", n_f16);
+         }
+     }
+
      // Validate MTP projection consistency
      const bool has_mtp_w = model_.mtp_proj_weight != nullptr;
      const bool has_mtp_b = model_.mtp_proj_bias != nullptr;
@@ -2468,6 +2491,22 @@ bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_co
     return true;
 }
 
+// Index of the first non-finite logit, or -1 when they are all finite.
+//
+// One linear scan over a few thousand floats costs ~0.01% of a frame's ~35 ms,
+// which buys the difference between failing in a second and generating minutes
+// of noise. It is deliberately general: an F16 talker trips it on frame 0
+// (known-issues.md #16), but so would a bad quantisation, a driver fault or a
+// backend bug, and none of those should reach the user as audio.
+static int32_t first_nonfinite(const float * data, int32_t n) {
+    for (int32_t i = 0; i < n; ++i) {
+        if (!std::isfinite(data[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int32_t argmax(const float * data, int32_t n) {
     int32_t max_idx = 0;
     float max_val = data[0];
@@ -2578,6 +2617,13 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
 
         if ((int32_t)logits_data.size() != cfg.code_pred_vocab_size) {
             error_msg_ = "CoreML predictor returned unexpected logits size";
+            return false;
+        }
+        if (first_nonfinite(logits_data.data(), cfg.code_pred_vocab_size) >= 0) {
+            error_msg_ = "code predictor logits are not finite at codebook " +
+                         std::to_string(step + 1) + " - the model's numbers overflowed "
+                         "(see docs/known-issues.md #16)";
+            log_error("%s", error_msg_.c_str());
             return false;
         }
         output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
@@ -2769,6 +2815,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         ggml_backend_tensor_get(logits, logits_data.data(), 0, 
                                  cfg.code_pred_vocab_size * sizeof(float));
         
+        if (first_nonfinite(logits_data.data(), cfg.code_pred_vocab_size) >= 0) {
+            error_msg_ = "code predictor logits are not finite at codebook 0 - the model's "
+                         "numbers overflowed (see docs/known-issues.md #16)";
+            log_error("%s", error_msg_.c_str());
+            return false;
+        }
         output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
         
         ggml_backend_sched_reset(state_.sched);
@@ -2864,6 +2916,13 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         ggml_backend_tensor_get(logits, logits_data.data(), 0, 
                                  cfg.code_pred_vocab_size * sizeof(float));
         
+        if (first_nonfinite(logits_data.data(), cfg.code_pred_vocab_size) >= 0) {
+            error_msg_ = "code predictor logits are not finite at codebook " +
+                         std::to_string(step + 1) + " - the model's numbers overflowed "
+                         "(see docs/known-issues.md #16)";
+            log_error("%s", error_msg_.c_str());
+            return false;
+        }
         output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
         
         ggml_backend_sched_reset(state_.sched);
@@ -3045,6 +3104,16 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                      last_hidden_[0], last_hidden_[1], last_hidden_[2], last_hidden_[3], last_hidden_[4],
                      top5.c_str());
         }
+        const int32_t bad_logit = first_nonfinite(logits.data(), cfg.codec_vocab_size);
+        if (bad_logit >= 0) {
+            error_msg_ = "talker logits are not finite at frame " + std::to_string(frame) +
+                         " (first at index " + std::to_string(bad_logit) +
+                         ") - the model's numbers overflowed. If this talker was converted "
+                         "with --type f16, that is expected and total: see docs/known-issues.md #16.";
+            log_error("%s", error_msg_.c_str());
+            return false;
+        }
+
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
             if (i != cfg.codec_eos_id) {
