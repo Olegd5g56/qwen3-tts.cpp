@@ -19,20 +19,28 @@
 
 namespace qwen3_tts {
 
-// On CUDA and HIP a matmul whose weights are Q4_0, Q4_1 or Q5_1 packs the
+// On CUDA and HIP a matmul whose weights use the DS4 or D2S6 layout packs the
 // activations as block_q8_1, which carries the block's sum in F16
 // (ggml-common.h:263) so the kernel can correct for those types' dequant
-// offset. Q8_0 and friends use the D4 layout, which has no sum field
-// (ggml-cuda/mmq.cuh:60), which is why they are immune.
+// offset. Q8_0 and friends use the D4 layout, which has no sum field, which is
+// why they are immune.
 //
 // A block covers 32 values, so the sum can reach 32x the largest of them. This
 // model's SwiGLU reaches ~185k, the sum runs past F16's 65504, and the field
 // becomes inf on the first frame. See docs/known-issues.md #21.
+//
+// The list below is mmq_get_q8_1_ds_layout() in ggml-cuda/mmq.cuh: every type
+// it maps to DS4 or D2S6 belongs here. Adding a weight type without checking
+// that table gets you inf on frame 0 and nothing else to go on.
 static bool needs_q8_1_activation_sum(enum ggml_type t) {
     switch (t) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_0:   // DS4
+        case GGML_TYPE_Q4_1:   // DS4
+        case GGML_TYPE_Q5_1:   // DS4
+        case GGML_TYPE_Q4_K:   // DS4
+        case GGML_TYPE_Q5_K:   // DS4
+        case GGML_TYPE_IQ1_S:  // DS4
+        case GGML_TYPE_Q2_K:   // D2S6
             return true;
         default:
             return false;

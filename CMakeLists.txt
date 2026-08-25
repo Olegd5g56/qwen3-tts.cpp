@@ -233,6 +233,16 @@ target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
 )
 
+# Quantiser: re-quantises a GGUF to a type the Python converter cannot write.
+# Links ggml only - it never loads the model, it walks the file tensor by tensor.
+add_executable(qwen3-tts-quantize
+    src/quantize.cpp
+)
+target_link_libraries(qwen3-tts-quantize PRIVATE
+    ggml
+    Threads::Threads
+)
+
 # Test executable for tokenizer
 add_executable(test_tokenizer
     tests/test_tokenizer.cpp
