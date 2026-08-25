@@ -26,6 +26,8 @@ root cause still there) / **wontfix**.
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
 | [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | root-caused 2026-08-25 |
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
+| [18](#18) | The converter's default output type is the one that does not work | open 2026-08-25 |
+| [19](#19) | Nothing checks the vocoder's output for non-finite samples | open 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -887,3 +889,52 @@ scratch. Each was verified against the code on 2026-08-24.
   from the reference. #11 also rules the penalty out as a runaway cause by
   measurement. Raised by an external review, recorded here because the same
   suggestion looks plausible on a quick read.
+
+<a id="18"></a>
+## 18. The converter's default output type is the one that does not work
+
+**Status:** open
+**Found:** 2026-08-25
+**Severity:** correctness — the no-argument path produces an unusable model
+
+`scripts/convert_tts_to_gguf.py` declares `--type` with `default="f16"`, and
+its own usage example in the module docstring passes `--type f16`. Per #16 an
+F16 talker never emits end-of-speech and generates noise from the first frame.
+
+So the obvious way to run the converter — no `--type` at all, or copying the
+example — silently produces a broken GGUF. Everything shipped is Q8_0 only
+because whoever converted those files happened to pass `--type q8_0`.
+
+This is the answer to "where would a bad GGUF even come from": from here, by
+default.
+
+**The fix** is one line, but which line is a taste call:
+
+- `default="q8_0"` — matches every file we ship and is known good.
+- make `--type` required — forces a deliberate choice, breaks existing scripts.
+- `default="bf16"` — the right answer eventually, but bf16 does not exist in
+  the converter yet (#16).
+
+Until then the load-time warning added in `06cd5fc` at least names the problem
+the moment such a file is loaded.
+
+<a id="19"></a>
+## 19. Nothing checks the vocoder's output for non-finite samples
+
+**Status:** open
+**Found:** 2026-08-25
+**Severity:** robustness — a numerically broken vocoder fails silently
+
+`06cd5fc` guards the talker and the code predictor: their logits are checked
+for non-finite values on every frame. The vocoder has no such check anywhere in
+`audio_tokenizer_decoder.cpp` — and #14 was precisely a numerical failure of
+the vocoder, caught only because someone measured SNR by hand.
+
+If the conv tower goes non-finite again the samples reach the encoder as-is,
+and the user gets silence or noise with a clean log.
+
+**Cost of fixing it:** one scan of the decoded samples, ~675k floats for a 28 s
+clip, against ~495 ms of decode. Below noise.
+
+Worth pairing with the same reporting style as the logit guard: say which stage
+failed, not just that audio is bad.
