@@ -1465,6 +1465,10 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
 
         struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.cache.n_ctx, k_cache->nb[2], 0);
         struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.cache.n_ctx, v_cache->nb[2], 0);
+        // K and V are written into an F16 cache regardless of the weight type,
+        // so they carry an F16 ceiling of their own - name them for the probe.
+        ggml_format_name(Kcur, "prefill.blk.%d.Kcur", il);
+        ggml_format_name(Vcur, "prefill.blk.%d.Vcur", il);
         struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
         struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos));
@@ -1614,6 +1618,10 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
 
         struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.cache.n_ctx, k_cache->nb[2], 0);
         struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.cache.n_ctx, v_cache->nb[2], 0);
+        // K and V are written into an F16 cache regardless of the weight type,
+        // so they carry an F16 ceiling of their own - name them for the probe.
+        ggml_format_name(Kcur, "step.blk.%d.Kcur", il);
+        ggml_format_name(Vcur, "step.blk.%d.Vcur", il);
         struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
         struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos));
@@ -1883,6 +1891,10 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
 
         struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.code_pred_cache.n_ctx, k_cache->nb[2], 0);
         struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.code_pred_cache.n_ctx, v_cache->nb[2], 0);
+        // K and V are written into an F16 cache regardless of the weight type,
+        // so they carry an F16 ceiling of their own - name them for the probe.
+        ggml_format_name(Kcur, "cp_prefill.blk.%d.Kcur", il);
+        ggml_format_name(Vcur, "cp_prefill.blk.%d.Vcur", il);
         struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
         struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos));
@@ -2034,6 +2046,10 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
 
         struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.code_pred_cache.n_ctx, k_cache->nb[2], 0);
         struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.code_pred_cache.n_ctx, v_cache->nb[2], 0);
+        // K and V are written into an F16 cache regardless of the weight type,
+        // so they carry an F16 ceiling of their own - name them for the probe.
+        ggml_format_name(Kcur, "cp_step.blk.%d.Kcur", il);
+        ggml_format_name(Vcur, "cp_step.blk.%d.Vcur", il);
         struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
         struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos));

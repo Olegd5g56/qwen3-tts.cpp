@@ -201,7 +201,14 @@ void op_profiler_report(const char * label) {
         while (n_over < nrows.size() && nrows[n_over].second.max_abs > 65504.0) {
             n_over++;
         }
-        const size_t n_show = std::min<size_t>(nrows.size(), std::max<size_t>(n_over, 25));
+        size_t n_top = 25;
+        if (const char * env = std::getenv("QWEN3_TTS_PROBE_TOP")) {
+            const long v = strtol(env, nullptr, 10);
+            if (v > 0) {
+                n_top = (size_t) v;
+            }
+        }
+        const size_t n_show = std::min<size_t>(nrows.size(), std::max<size_t>(n_over, n_top));
         for (size_t i = 0; i < n_show; ++i) {
             const auto & r = nrows[i];
             log_info("  max|x|=%12.1f  nonfinite=%-8lld n=%-6lld %s",
