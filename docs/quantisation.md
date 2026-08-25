@@ -205,15 +205,58 @@ right price for not having that mine in the tree.
 `--verify` ranks the types (see the error table above). Whether the winner is
 *good enough* is an ear question, and the ear test has a trap in it: every type
 produces a different token sequence, so a side-by-side comparison is comparing
-one draw against another, not one type against another. Judge across several
-seeds, or the seed is what you are hearing.
+one draw against another. Judge across several seeds, or the seed is what you
+are hearing.
 
-Recorded verdicts, most recent first:
+### Voice cloning is not an axis to choose on
 
-- **2026-08-25, 1.7B, cloned voice, one seed each.** Oleg's read: heavily
-  seed-dependent; on that draw `q4_k` came out best of the six, with possibly
-  weaker voice-cloning fidelity than `q8_0`/`bf16` but correct stress placement
-  throughout.
+Measured 2026-08-25 the objective way: synthesise with a cloned voice, run the
+output back through the speaker encoder, and cosine it against the reference
+voice's own embedding. Score every candidate with the **bf16** model or the
+quant grades its own homework. The speaker encoder is bf16 in every file anyway
+— all 38 of its convolutions have rows that are not a whole number of blocks,
+at any block size — so that part of the pipeline is identical throughout.
+
+Two voices, 1.7B, same sentence, 6-14 seeds each:
+
+| type | `bolshshalskiy` | `ostro` |
+|---|---|---|
+| bf16 | 0.9938 | 0.9914 |
+| q8_0 | 0.9934 | 0.9909 |
+| q6_k | 0.9931 | **0.9916** |
+| q5_k | 0.9924 | 0.9906 |
+| q4_k | 0.9918 | 0.9905 |
+| q4_0 | 0.9924 | 0.9909 |
+
+The first voice gives a clean ladder that matches the weight-error table. The
+second does not reproduce it — `q6_k` scores above `bf16` and `q4_0` ties
+`q8_0`. Read one voice alone and you would ship a conclusion that is not there.
+
+What settles it is the scale, which is easy to forget to measure:
+
+| | cosine |
+|---|---|
+| two **different people** (`bolshshalskiy` vs `ostro` references) | **0.9446** |
+| any correctly cloned voice | 0.990 - 0.994 |
+| two seeds of the *same* type, to each other | 0.9956 |
+
+So the usable range is 0.055 wide and every weight type lands inside the top
+0.001 of it — 2%, and less than the seed-to-seed spread within one type. The
+t-test still calls `q4_k` significantly below `bf16`; it is a significant 0.1%.
+
+**Conclusion: the weight type does not change whose voice it is.** Whatever
+4-bit costs, it is not speaker identity, and a speaker-similarity number will
+not find it - the embedding is invariant to prosody, articulation and noise
+floor, which is where quantisation damage would live. Choose on size, on speed
+for the backend that will run it, and on ears.
+
+### Recorded ear verdicts, most recent first
+
+- **2026-08-25, 1.7B, cloned Russian voice, one seed each.** Oleg's read:
+  heavily seed-dependent; on that draw `q4_k` came out best of the six, with
+  possibly weaker cloning fidelity than `q8_0`/`bf16` but correct stress
+  placement throughout. The cloning half of that was then measured and is below
+  the resolution of the metric (above).
 - **August 2026, code predictor only.** `q4_0` coarsens fine acoustic detail
-  and Oleg could hear it. Never retracted, and `q4_0`'s 8.82% error is the
-  worst of any type here.
+  and Oleg could hear it. Never retracted, and `q4_0` has the worst weight
+  error of any type here.
