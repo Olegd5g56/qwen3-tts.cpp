@@ -113,17 +113,23 @@ chunk.** That looked like a second pointer at the same op — memory-hungry and
 slow sharing one cause. It is not; see *Chunk size is not a speed lever* below.
 The memory difference is real, the speed inference was wrong.
 
-**The generation win is mostly engine, not quantisation.** Controlling with an
-F32 GGUF (2x the weight bytes of PyTorch's bf16) still gives 34.1 ms/frame
-against PyTorch's 104.5. So of our 5.1x: **3.1x is the engine, 1.7x is Q8_0** —
-and the 3.1x is understated, since the control carries heavier weights than the
-thing it is compared against.
+**The generation win is mostly engine, not quantisation.** The control is now
+**bf16**, which is an exact match rather than a handicap: the same 2 bytes as
+PyTorch's weights and bit-identical to them (see known-issues #16), so nothing
+has to be discounted. It gives 30.3 ms/frame against PyTorch's 104.5. Of our
+5.1x: **3.45x is the engine, 1.48x is Q8_0.**
 
 | talker weights | generate | talker | code predictor |
 |---|---|---|---|
 | Q8_0 | 20.4 ms/frame | 6.4 | 13.0 |
+| **bf16** (matched control) | **30.3 ms/frame** | 9.2 | 20.5 |
 | F32 | 34.1 ms/frame | 10.2 | 23.3 |
 | F16 | *unusable — see known-issues #16* | | |
+
+The earlier F32 control read 3.1x / 1.7x and had to be hedged, because F32
+carries twice the weight bytes of the thing it was compared against. bf16
+removes the hedge: the engine share is larger than that reading suggested and
+the quantisation share smaller.
 
 Decode is unaffected by talker precision (9.60 / 9.49 / 9.44 ms/frame across
 the three), which is expected — the vocoder is the same F16 file in all of them

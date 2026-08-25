@@ -941,7 +941,8 @@ bool TTSTransformer::lookup_embedding_rows(struct ggml_tensor * embedding, const
 
     const int32_t embd_dim = (int32_t) embedding->ne[0];
     if (n_tokens <= 32 &&
-        (embedding->type == GGML_TYPE_F16 || embedding->type == GGML_TYPE_F32)) {
+        (embedding->type == GGML_TYPE_F16 || embedding->type == GGML_TYPE_F32 ||
+         embedding->type == GGML_TYPE_BF16)) {
         output.resize((size_t) embd_dim * n_tokens);
         for (int32_t t = 0; t < n_tokens; ++t) {
             if (!lookup_single_embedding_row(embedding, token_ids[t],
@@ -1033,6 +1034,18 @@ bool TTSTransformer::lookup_single_embedding_row(struct ggml_tensor * embedding,
                                 row_offset, (size_t) embd_dim * sizeof(ggml_fp16_t));
         for (int64_t i = 0; i < embd_dim; ++i) {
             out_row[i] = ggml_fp16_to_fp32(embd_row_fp16_scratch_[i]);
+        }
+        return true;
+    }
+    if (embedding->type == GGML_TYPE_BF16) {
+        // Same shape as the F16 path; bf16 is 2 bytes too, so the scratch
+        // buffer is reused and only the widening differs.
+        embd_row_fp16_scratch_.resize((size_t) embd_dim);
+        ggml_backend_tensor_get(embedding, embd_row_fp16_scratch_.data(),
+                                row_offset, (size_t) embd_dim * sizeof(ggml_bf16_t));
+        const ggml_bf16_t * src = (const ggml_bf16_t *) embd_row_fp16_scratch_.data();
+        for (int64_t i = 0; i < embd_dim; ++i) {
+            out_row[i] = ggml_bf16_to_fp32(src[i]);
         }
         return true;
     }

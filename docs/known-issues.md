@@ -24,9 +24,9 @@ root cause still there) / **wontfix**.
 | [13](#13) | The vocoder never ran on the GPU | fixed 2026-08-24 |
 | [14](#14) | GPU vocoder accumulated the whole conv tower in F16 | fixed 2026-08-24 |
 | [15](#15) | Voice cloning spent 40 s in a hand-rolled O(n²) DFT | fixed 2026-08-24 |
-| [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | root-caused 2026-08-25 |
+| [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | fixed 2026-08-25 (bf16 added) |
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
-| [18](#18) | The converter's default output type is the one that does not work | open 2026-08-25 |
+| [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | open 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
@@ -675,7 +675,7 @@ tower — not investigated further.
 <a id="16"></a>
 ## 16. An F16 talker runs away every time; Q8_0 and F32 do not
 
-**Status:** root-caused 2026-08-25; fix not yet chosen (see *The fix* below)
+**Status:** fixed 2026-08-25 — `--type bf16` added, `--type f16` kept but warns
 **Found:** 2026-08-24
 **Severity:** correctness — `--type f16` produces an unusable talker
 
@@ -763,17 +763,40 @@ the model, not of our port.
 scanned" checked the *weights*. The weights are all in range. The activations
 are not, and only F16 weights drag the activations through F16.
 
-**The fix — not yet chosen.** Two candidates:
+**The fix: `--type bf16`.** bf16 spends its 16 bits differently — 8 mantissa
+bits instead of F16's 11, but F32's full exponent range, so there is no ceiling
+to hit. 185587 lands on 185344 instead of inf.
 
-- **BF16 for the talker** (preferred). Same 2 bytes, but F32's exponent range,
-  so no ceiling at all; ggml supports it on CPU (`vec_dot_type` BF16) and as a
-  first-class cuBLAS compute type (`ggml-cuda.cu:1652`); and it is what the
-  reference runs. Needs `--type bf16` in `convert_tts_to_gguf.py`, which does
-  not exist yet.
-- **Keep the offending tensors out of F16.** One line in `_should_quantize`.
-  Fragile: the residual stream was measured at 63554, i.e. **97% of the F16
-  ceiling**, so a different voice, text or model size can push another node
-  over. Only the 0.6B on one sentence has been probed.
+The per-tensor alternative (keep the offending weights out of F16) was rejected:
+the residual stream measures 63554, **97% of the F16 ceiling**, so a different
+voice, text or model size can push another node over. Only the 0.6B on one
+sentence was ever probed.
+
+**It is not a conversion at all.** Every one of the checkpoint's 478 tensors is
+already bf16, so `--type bf16` copies the bits rather than reinterpreting them;
+spot-checked bit-exact against the safetensors for talker, code-predictor and
+attention weights. We were the only step in the chain converting anything, which
+is why we were the only step that broke.
+
+**Verified**: 10/10 seeds terminate normally (119–149 frames, against Q8_0's
+128/135), audio matches Q8_0's character (RMS −25.6 / ZCR 0.142 against −24.6 /
+0.130), no guard trips on either backend.
+
+**Speed** (0.6B, seed 42, median of 3, ms/frame — the f16 row is a proxy file
+with 477 of 478 tensors F16, since a real F16 file now fails at frame 0):
+
+| type | CUDA (1660 SUPER) | ROCm (6800 XT) |
+|---|---|---|
+| **q8_0** | **25.0** | **24.2** |
+| bf16 | 34.4 | 27.0 |
+| f16 (broken) | 37.0 | 24.6 |
+| f32 | 38.0 | — |
+
+Q8_0 stays the default and stays fastest on both cards. Against F16 the two
+backends disagree — bf16 is 7% faster on CUDA (the #14 effect: dodging F16 pays
+on a card with no tensor cores) and 10% slower on ROCm. Either way bf16 is the
+only half-precision type here that is correct, and it is the one to use as the
+precision control in `optimization.md` instead of F32.
 
 **Practical effect today:** none — every shipped GGUF is Q8_0. It matters the
 moment anyone converts with `--type f16`, and it blocks using F16 as the
@@ -908,15 +931,11 @@ because whoever converted those files happened to pass `--type q8_0`.
 This is the answer to "where would a bad GGUF even come from": from here, by
 default.
 
-**The fix** is one line, but which line is a taste call:
-
-- `default="q8_0"` — matches every file we ship and is known good.
-- make `--type` required — forces a deliberate choice, breaks existing scripts.
-- `default="bf16"` — the right answer eventually, but bf16 does not exist in
-  the converter yet (#16).
-
-Until then the load-time warning added in `06cd5fc` at least names the problem
-the moment such a file is loaded.
+**Fixed 2026-08-25.** `default="q8_0"` — what every shipped file uses and the
+fastest option on both cards. The docstring example follows it, `--type f16` now
+prints a warning naming #16 before it converts anything, and the help text marks
+f16 as broken. f16 is kept rather than removed so that anyone reproducing #16
+still can.
 
 <a id="19"></a>
 ## 19. Nothing checks the vocoder's output for non-finite samples

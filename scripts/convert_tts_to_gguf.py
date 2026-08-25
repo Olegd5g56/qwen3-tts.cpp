@@ -12,8 +12,11 @@ Supports all model variants:
 Usage:
     python scripts/convert_tts_to_gguf.py \
         --input models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-        --output models/qwen3-tts-1.7b-customvoice-f16.gguf \
-        --type f16
+        --output models/qwen3-tts-1.7b-customvoice-q8_0.gguf \
+        --type q8_0
+
+Do not use --type f16: this model's activations do not fit in F16 and the
+result never stops generating. See docs/known-issues.md #16.
 """
 
 from __future__ import annotations
@@ -322,6 +325,15 @@ class Qwen3TTSConverter:
         # For 2D+ tensors, use the specified output type
         if self.output_type == "f32":
             return data.astype(np.float32), gguf.GGMLQuantizationType.F32
+        elif self.output_type == "bf16":
+            # The checkpoint is already bf16, so this is a copy, not a
+            # conversion - the low 16 bits are zero and round-trip exactly.
+            # bf16 keeps F32's exponent range in 2 bytes, which is what this
+            # model needs: F16 tops out at 65504 and its code predictor reaches
+            # ~185k. See docs/known-issues.md #16.
+            return (gguf.quants.quantize(data.astype(np.float32),
+                                         gguf.GGMLQuantizationType.BF16),
+                    gguf.GGMLQuantizationType.BF16)
         elif self.output_type == "f16":
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         elif self.output_type == "q8_0":
@@ -457,6 +469,8 @@ class Qwen3TTSConverter:
         # File type
         if self.output_type == "f32":
             ftype = gguf.LlamaFileType.ALL_F32
+        elif self.output_type == "bf16":
+            ftype = gguf.LlamaFileType.MOSTLY_BF16
         elif self.output_type == "f16":
             ftype = gguf.LlamaFileType.MOSTLY_F16
         elif self.output_type == "q8_0":
@@ -601,9 +615,13 @@ def main():
     )
     parser.add_argument(
         "--type", "-t",
-        choices=["f16", "f32", "q8_0", "q4_k"],
-        default="f16",
-        help="Output data type (default: f16). q8_0 provides ~50%% size reduction, q4_k provides ~70%% size reduction."
+        choices=["q8_0", "bf16", "f32", "q4_k", "f16"],
+        default="q8_0",
+        help="Output data type (default: q8_0, what every shipped file uses). "
+             "bf16 is the full-precision-range half type and matches the checkpoint "
+             "bit for bit; f32 doubles the bytes for nothing on this model; "
+             "q4_k provides ~70%% size reduction. "
+             "f16 is accepted but BROKEN on this architecture - see docs/known-issues.md #16."
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -615,6 +633,14 @@ def main():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.type == "f16":
+        logger.warning(
+            "--type f16 produces a talker that never emits end-of-speech and "
+            "generates noise from the first frame: this model's code predictor "
+            "reaches ~185k and F16 tops out at 65504. Use bf16 (same size, same "
+            "bits as the checkpoint) or q8_0. See docs/known-issues.md #16."
+        )
 
     converter = Qwen3TTSConverter(
         input_dir=args.input,
