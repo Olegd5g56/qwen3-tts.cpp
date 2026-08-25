@@ -278,9 +278,23 @@ related, not independent.
    pipeline overlapped two different pieces of hardware; now both stages want
    the same GPU and it recovers only part of the decode (CUDA 20 493 → 18 977
    ms, ROCm 13 715 → 11 846). Still worth keeping on, no longer a big lever.
-4. **Prefill** (793 ms, 1.7B) is dominated by the 150 ICL reference frames. A
-   shorter reference shrinks it — but pick a reference for prosody, not speed;
-   see the ruled-out note on reference length.
+4. **Cache the reference prefix's KV per voice.** Prefill is 793 ms on the 1.7B
+   and is dominated by the 150 ICL reference frames — **and it is recomputed on
+   every request**, though for a fixed voice that prefix is byte-identical every
+   time. The server log shows the bill directly:
+   `ok 5.20s audio ... (prefill=401ms gen=2111ms decode=328ms)` — **16% of that
+   request spent re-deriving something that never changes.** The share grows as
+   the line gets shorter, and short lines are most of what a TTS server does.
+
+   This is ordinary prefix-KV reuse from LLM serving, and it fits: the voice is
+   already a cached object on disk (`VoiceStore`), so the KV joins the embedding
+   and the ref codes.
+
+   **Design it with the cost in mind from the start.** The KV for 150 frames is
+   held per cached voice; one or two voices is nothing, 198 is not. It wants an
+   explicit cap with LRU eviction, decided up front rather than bolted on. The
+   existing shortening advice — pick a shorter reference — treats the symptom;
+   pick a reference for prosody and cache its KV instead.
 5. **The streaming vocoder's host round-trip — mostly bounded, never timed
    directly.** `stream_decode` pulls the conv tails and KV device→host after
    every chunk and pushes them back before the next, a fixed cost per chunk.
@@ -291,6 +305,32 @@ related, not independent.
    efficiency, and the 25-frame cliff is large enough that *something* per
    chunk is expensive. One timing line around the copy block in
    `audio_tokenizer_decoder.cpp` still settles it, and it is cheap.
+
+## Two cards, and what that is actually good for
+
+Both stages want the same GPU now, which is why the overlap fell from 25-40% to
+~7% (idea 3). This machine has two cards, so splitting the two models across
+them is the obvious thought. Two things to know before trying it.
+
+**CUDA and ROCm cannot be linked into one binary.** The HIP backend compiles the
+*same* `ggml-cuda/*.cu` sources with a different compiler
+(`ggml/src/ggml-hip/CMakeLists.txt` globs them), so a static build with both
+collides on every symbol. The only route is `GGML_BACKEND_DL=ON`, which builds
+each backend as its own shared object loaded at runtime — untested here, and it
+requires `BUILD_SHARED_LIBS`. **CUDA + Vulkan in one binary is fine**: separate
+sources, no conflict. So the cheap experiment is talker on CUDA, vocoder on
+Vulkan pointed at the other card, which needs `QWEN3_TTS_VOCODER` extended from
+`cpu`/`gpu` to a device selector. Whether it wins is unmeasured — the ceiling is
+`max(talker, vocoder)` per frame instead of the sum, minus whatever the
+cross-device transfer costs.
+
+**For batch work, do not do any of that.** Splitting one request across two
+cards is a latency optimisation and a hard one. Audiobook-style work wants
+throughput, and there the answer is free: **run two independent servers, one per
+card, and split the text between them.** Separate processes, separate binaries,
+no symbol problem, no code. On 2026-08-25 numbers (10.76 s and 16.16 s for the
+same work) that is about +65% throughput — more than any single optimisation
+listed above.
 
 ## Tried and ruled out — do not redo
 
