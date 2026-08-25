@@ -27,7 +27,7 @@ root cause still there) / **wontfix**.
 | [16](#16) | An F16 talker runs away every time; Q8_0 and F32 do not | fixed 2026-08-25 (bf16 added) |
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
 | [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
-| [19](#19) | Nothing checks the vocoder's output for non-finite samples | open 2026-08-25 |
+| [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -940,7 +940,7 @@ still can.
 <a id="19"></a>
 ## 19. Nothing checks the vocoder's output for non-finite samples
 
-**Status:** open
+**Status:** fixed 2026-08-25
 **Found:** 2026-08-25
 **Severity:** robustness — a numerically broken vocoder fails silently
 
@@ -952,8 +952,19 @@ the vocoder, caught only because someone measured SNR by hand.
 If the conv tower goes non-finite again the samples reach the encoder as-is,
 and the user gets silence or noise with a clean log.
 
-**Cost of fixing it:** one scan of the decoded samples, ~675k floats for a 28 s
-clip, against ~495 ms of decode. Below noise.
+**Fixed.** Both sample-output sites in `audio_tokenizer_decoder.cpp` now scan
+the decoded block and fail with the stage named, matching the logit guard's
+reporting style. One scan is ~675k floats for a 28 s clip against ~495 ms of
+decode.
 
-Worth pairing with the same reporting style as the logit guard: say which stage
-failed, not just that audio is bad.
+**Verified by injecting an inf** into the decoded samples: the streaming path —
+the one production actually uses — reports it and aborts the request. Note what
+that showed: the failure surfaced during the *vocoder warm-up on the reference
+codes*, before any generated audio, which is the earliest point it could.
+
+`decode()`, the one-shot path, is called only from `tests/`; production always
+goes through `stream_decode` (chunked decode is mandatory, ~15 MiB/frame). Its
+guard is the same three lines but was not exercised: `test_decoder` cannot run
+here at all, because it needs `reference/speech_codes.bin` and
+`reference/decoded_audio.bin`, which are not in the repository. That gap
+predates this change and is worth its own entry.

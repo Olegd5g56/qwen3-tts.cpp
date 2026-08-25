@@ -14,6 +14,23 @@
 
 namespace qwen3_tts {
 
+// Index of the first non-finite decoded sample, or -1 when they are all finite.
+//
+// #14 was a numerical failure of exactly this conv tower - the whole 25-layer
+// stack accumulating in F16 - and it was caught only because someone measured
+// SNR by hand afterwards. Nothing in the pipeline would have complained. One
+// scan of the decoded samples is ~675k comparisons for a 28 s clip against
+// ~495 ms of decode, so the check costs nothing and the silent failure it
+// prevents costs a debugging session. See docs/known-issues.md #19.
+static int64_t first_nonfinite_sample(const float * data, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(data[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 AudioTokenizerDecoder::AudioTokenizerDecoder() = default;
 
 AudioTokenizerDecoder::~AudioTokenizerDecoder() {
@@ -1103,7 +1120,17 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
-    
+
+    const int64_t bad_sample = first_nonfinite_sample(samples.data(), n_samples);
+    if (bad_sample >= 0) {
+        error_msg_ = "vocoder produced non-finite audio at sample " +
+                     std::to_string(bad_sample) + " of " + std::to_string(n_samples) +
+                     " - the decoder's numbers blew up (see docs/known-issues.md #19)";
+        log_error("%s", error_msg_.c_str());
+        ggml_backend_sched_reset(state_.sched);
+        return false;
+    }
+
     ggml_backend_sched_reset(state_.sched);
 
     return true;
@@ -1256,6 +1283,17 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(base + n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data() + base, 0, n_samples * sizeof(float));
+
+    const int64_t bad_sample = first_nonfinite_sample(samples.data() + base, n_samples);
+    if (bad_sample >= 0) {
+        error_msg_ = "stream: vocoder produced non-finite audio at sample " +
+                     std::to_string(base + (size_t) bad_sample) +
+                     " - the decoder's numbers blew up (see docs/known-issues.md #19)";
+        log_error("%s", error_msg_.c_str());
+        ggml_backend_sched_reset(state_.sched);
+        streaming_mode_ = false;
+        return false;
+    }
 
     // roll each causal-conv tail ring forward.
     for (const auto & t : stream_tails_) {
