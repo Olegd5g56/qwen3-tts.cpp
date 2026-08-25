@@ -29,6 +29,7 @@ root cause still there) / **wontfix**.
 | [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
 | [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
+| [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` is GPU-only broken | converter fixed 2026-08-25; q4_0 is CPU-only |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -995,3 +996,74 @@ the vocoder file, and a stale committed dump would be worse than none.
 
 Not urgent: `test_streaming_parity` covers the decoder's production path and
 does run. But it means the one-shot path has no automated cover at all.
+
+<a id="21"></a>
+## 21. 4-bit: `q4_k` never worked at all, and `q4_0` breaks on GPU
+
+**Status:** converter fixed 2026-08-25; `q4_0` usable on CPU only
+**Found:** 2026-08-25
+**Severity:** was correctness (silent broken output), now a documented limit
+
+Two separate things, found while asking whether a 4-bit quant would be faster.
+
+### `--type q4_k` produced an F16 file, silently
+
+The `gguf` Python package implements K-quants for **dequantisation only**:
+
+```
+Q4_K: NotImplementedError    Q8_0: OK
+Q5_K: NotImplementedError    Q4_0: OK
+Q6_K: NotImplementedError
+```
+
+`_convert_dtype` caught that exception and fell back to F16 — for all 271
+quantisable tensors. The output was byte-for-byte an F16 file: same 1835429440
+bytes, `{F32: 174, F16: 304}`, i.e. exactly the model #16 says cannot work. The
+`--help` text promised "~70% size reduction".
+
+**Fixed.** `q4_k` is gone from `choices` (an option that cannot work should not
+be offered), `q4_0` is offered instead, and the blanket `except -> F16` is gone.
+A row whose length is not a whole number of blocks still falls back to F16 —
+that is legitimate and what llama.cpp does, it affects a handful of
+speaker-encoder convolutions, and it is logged. Every other failure now raises.
+
+The general lesson: **falling back to F16 on error is the bug**, because on this
+model F16 is not a safe degradation, it is a broken model. Verified no
+regression — reconverting q8_0 reproduces the previous file byte for byte.
+
+### `--type q4_0` works on CPU and returns inf on CUDA and ROCm
+
+Same symptom as #16 and the same node — `code_pred.blk.2.ffn_down` goes
+non-finite on frame 0 — but a different mechanism, and this one is
+backend-dependent:
+
+| backend | activation format for a Q4_0 weight | result |
+|---|---|---|
+| CPU | `block_q8_0` — carries `d` only | **works** |
+| CUDA / ROCm | `block_q8_1` — carries `d` **and** `ggml_half s = d * sum(qs[i])` | **inf** |
+
+`block_q8_1` keeps the block's *sum* in F16 (`ggml-common.h:263`). A block of 32
+values around 185587 sums to ~5.9e6, and F16 stops at 65504, so `s` becomes inf
+before the dot product starts. Q8_0 weights are immune because their activation
+format is `block_q8_0`, which has no sum field at all.
+
+So this is #16's disease — an F16 field with a 65504 ceiling meeting this
+model's activations — in a completely different place: not the weights, but a
+housekeeping field of the intermediate activation format.
+
+**Measured** (0.6B, seed 42, median of 3):
+
+| | file size | CPU, 8 threads | CUDA | ROCm |
+|---|---|---|---|---|
+| q8_0 | 1.34 GB | 45.6 ms/frame | 25.0 | 24.2 |
+| q4_0 | 1.08 GB | **27.4 ms/frame** | *inf* | *inf* |
+
+On CPU q4_0 is a real win — 40% faster — and stable across 4 seeds with audio in
+the normal band (RMS −23.4, ZCR 0.148). The file is only 20% smaller rather than
+half, because embeddings, heads and norms stay F16 and dominate a model this
+small.
+
+**Verdict:** q4_0 is worth having for CPU-only deployments and must not be used
+on a GPU build. Nothing enforces that split today — the logit guard from
+`06cd5fc` catches it on frame 0 with a clear message, which is adequate but
+after the fact.

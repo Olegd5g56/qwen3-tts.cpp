@@ -336,32 +336,34 @@ class Qwen3TTSConverter:
                     gguf.GGMLQuantizationType.BF16)
         elif self.output_type == "f16":
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-        elif self.output_type == "q8_0":
+        elif self.output_type in ("q8_0", "q4_0"):
             if not self._should_quantize(tensor_name):
                 logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-            
-            data = data.astype(np.float32)
-            try:
-                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q8_0)
-                return quantized, gguf.GGMLQuantizationType.Q8_0
-            except Exception as e:
-                logger.warning(f"Q8_0 quantization failed for {tensor_name}: {e}, falling back to F16")
+
+            qtype = (gguf.GGMLQuantizationType.Q8_0 if self.output_type == "q8_0"
+                     else gguf.GGMLQuantizationType.Q4_0)
+            block_size, _ = gguf.GGML_QUANT_SIZES[qtype]
+
+            # A row that is not a whole number of blocks cannot be quantised at
+            # all - a handful of speaker-encoder convolutions are shaped that
+            # way. Keeping those in F16 is what llama.cpp does too, and is safe:
+            # #16 is about F16 *matmul weights* dragging activations through a
+            # 65504 ceiling, and these are small convolutions well inside it.
+            if data.shape[-1] % block_size != 0:
+                logger.info(f"{tensor_name}: row of {data.shape[-1]} is not a multiple "
+                            f"of {block_size}, keeping F16")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-        elif self.output_type == "q4_k":
-            if not self._should_quantize(tensor_name):
-                logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
-                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-            
-            data = data.astype(np.float32)
-            try:
-                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_K)
-                return quantized, gguf.GGMLQuantizationType.Q4_K
-            except Exception as e:
-                logger.warning(f"Q4_K quantization failed for {tensor_name}: {e}, falling back to F16")
-                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+            # Any other failure is NOT caught, deliberately. This used to fall
+            # back to F16, which on this model means a file that generates noise
+            # and never stops (docs/known-issues.md #16) - the fallback turned a
+            # loud failure into a silent broken model. --type q4_k did exactly
+            # that for all 271 quantisable tensors, because the gguf package
+            # implements K-quants for dequantisation only.
+            return gguf.quants.quantize(data.astype(np.float32), qtype), qtype
         else:
-            return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+            raise ValueError(f"unhandled output type: {self.output_type}")
 
     def _load_tokenizer(self) -> tuple[list[str], list[int], list[str]]:
         """Load tokenizer vocabulary and merges."""
@@ -475,10 +477,10 @@ class Qwen3TTSConverter:
             ftype = gguf.LlamaFileType.MOSTLY_F16
         elif self.output_type == "q8_0":
             ftype = gguf.LlamaFileType.MOSTLY_Q8_0
-        elif self.output_type == "q4_k":
-            ftype = gguf.LlamaFileType.MOSTLY_Q4_K_M
+        elif self.output_type == "q4_0":
+            ftype = gguf.LlamaFileType.MOSTLY_Q4_0
         else:
-            ftype = gguf.LlamaFileType.MOSTLY_F16
+            raise ValueError(f"unhandled output type: {self.output_type}")
         writer.add_file_type(ftype)
 
         # Quantization version
@@ -615,12 +617,12 @@ def main():
     )
     parser.add_argument(
         "--type", "-t",
-        choices=["q8_0", "bf16", "f32", "q4_k", "f16"],
+        choices=["q8_0", "bf16", "f32", "q4_0", "f16"],
         default="q8_0",
         help="Output data type (default: q8_0, what every shipped file uses). "
              "bf16 is the full-precision-range half type and matches the checkpoint "
              "bit for bit; f32 doubles the bytes for nothing on this model; "
-             "q4_k provides ~70%% size reduction. "
+             "q4_0 halves q8_0 again, at a real quality cost. "
              "f16 is accepted but BROKEN on this architecture - see docs/known-issues.md #16."
     )
     parser.add_argument(
