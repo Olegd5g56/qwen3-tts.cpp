@@ -1,0 +1,15 @@
+date	commit	label	model	text	native	timing	mean_s	runs_s	note
+2026-08-25T18:16Z	62b2d6b-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ON	OFF	12.81	12.61,12.21,12.61,13.81	
+2026-08-25T18:17Z	62b2d6b-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ON	OFF	8.51	8.61,8.41,8.81,8.21	
+2026-08-25T18:18Z	62b2d6b-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ON	OFF	10.41	10.41,10.21,9.81,11.21	
+2026-08-25T18:19Z	62b2d6b-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ON	OFF	18.31	17.81,18.21,18.41,18.81	
+2026-08-20T00:00Z	pre-9d4785d	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	33.00		Oleg, banch.csv, inherited ggml
+2026-08-20T00:00Z	pre-9d4785d	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	25.50		Oleg, banch.csv, inherited ggml
+2026-08-20T12:00Z	pre-9d4785d	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	19.50		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	18.00		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	30.50		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	?	25.00		Oleg, banch.csv, first fresh ggml
+2026-08-25T18:05Z	62b2d6b	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	OFF	17.46	17.61,17.21,16.61,18.41	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	OFF	11.66	11.21,11.61,11.61,12.21	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	OFF	14.47	14.21,14.22,15.62,13.82	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	ON	OFF	26.92	31.02,28.82,24.62,23.22	reproduction of Oleg's protocol

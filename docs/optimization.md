@@ -472,6 +472,45 @@ in `known-issues.md` #9 (ROCm) and #10 (CUDA).
    that it disables kernel fusion and adds sync per node, so treat its absolute
    numbers as upper bounds and its proportions as the signal.
 
+## Tracking speed across commits
+
+`scripts/bench_speed.sh` runs one configuration and appends a row to
+`benchmarks/speed.tsv`, which is committed. The point is to be able to look back
+and say *this backend was faster a week ago, so we broke something* — or the
+reverse — instead of arguing from memory.
+
+```
+export TTS_MODEL=... TTS_VOCODER=... TTS_VOICES_DIR=...
+scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" --env CUDA_VISIBLE_DEVICES=0
+```
+
+Every row carries the commit, the build's `GGML_NATIVE` and `QWEN3_TTS_TIMING`,
+the model, and the text with its byte count. **A comparison is only honest
+between rows where all of those match except the one being studied.** That is
+not pedantry: on 2026-08-25 a full day of cross-backend work turned out to be
+measuring `GGML_NATIVE` differing between two build directories, because a cache
+made before `063470c` keeps `ON` and anything configured after it gets `OFF`.
+
+What the protocol does and why each part is load-bearing:
+
+- **A warm server, not the CLI.** The CLI pays model load, kernel and shader
+  compilation, and the ICL warm-up on every invocation; the deployment pays them
+  once. The CLI also defaults to one-shot decode where the server streams.
+- **One warm-up request, discarded** — it costs about double (79.9 vs ~32
+  ms/frame on CUDA, 2026-08-25).
+- **Four timed requests, averaged**, with every individual run kept in the row
+  so a bad spread is visible rather than hidden in a mean.
+- **Whole request wall time.** Never compare backends by generation ms/frame:
+  the vocoder is overlapped into generation on CUDA, ROCm and Metal and not on
+  Vulkan or CPU (`pipeline_supported()` in `qwen3_tts.cpp`), so the number means
+  different things on either side of that line.
+- **One voice in the library directory.** The server preloads the whole library
+  in the background, and 198 voices compete with what is being measured.
+
+`benchmarks/bench_ru.txt` is the default input and should stay unchanged; a new
+text starts a new series. Rows with `text=ward.txt` predate it and came from
+Oleg's own `test_tts.sh` on a file outside this repo.
+
 ## Measurement notes
 
 - Compare **ms/frame**, not wall time. Frame count varies run to run with

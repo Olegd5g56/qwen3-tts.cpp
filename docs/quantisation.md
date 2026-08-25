@@ -88,29 +88,48 @@ never a frame count or a waveform diff.
 
 ## Speed, and why the answer depends on the backend
 
-ms/frame, median of 3, same sentence and seed, 2026-08-25.
+Generation only, ms/frame, median of 3, same sentence and seed. Every build
+`GGML_NATIVE=ON` — a build directory configured after `063470c` defaults to OFF,
+and comparing two directories that disagree measures the flag, not the backend.
 
 | 0.6B | CUDA (1660S) | ROCm (6800 XT) | CPU 8t |
 |---|---|---|---|
-| `q8_0` | 23.1 | **17.3** | 39.4 |
-| `q6_k` | 21.9 | 17.7 | 29.5 |
-| `q5_k` | 20.7 | 18.8 | 24.8 |
-| `q4_k` | **20.0** | 18.7 | **20.2** |
-| `q4_0` | 20.0 | 17.8 | 21.5 |
+| `q8_0` | 23.1 | 18.2 | 39.0 |
+| `q6_k` | 21.8 | 18.5 | 29.4 |
+| `q5_k` | 21.1 | 19.6 | 24.9 |
+| `q4_k` | **20.3** | 19.3 | **20.2** |
+| `q4_0` | 20.3 | **18.5** | 21.3 |
+| `bf16` | 33.3 | 24.0 | 75.8 |
 
-| 1.7B | CUDA (1660S) | ROCm (6800 XT) |
-|---|---|---|
-| `bf16` | *OOM on 6 GB* | 28.4 |
-| `q8_0` | 27.0 | 20.3 |
-| `q6_k` | 25.6 | 20.1 |
-| `q5_k` | 23.4 | 20.9 |
-| `q4_k` | **22.5** | 20.1 |
-| `q4_0` | 22.9 | **19.7** |
+| 1.7B | CUDA (1660S) | ROCm (6800 XT) | CPU 8t |
+|---|---|---|---|
+| `q8_0` | 27.1 | 21.0 | 65.0 |
+| `q6_k` | 25.7 | 20.7 | 50.8 |
+| `q5_k` | 23.7 | 21.5 | 42.0 |
+| `q4_k` | **23.0** | 20.6 | **34.1** |
+| `q4_0` | 23.3 | **20.2** | 35.9 |
+| `bf16` | 39.5 | 28.9 | 124.8 |
 
-**On the CPU the weight type is the single biggest lever there is** - `q8_0` to
-`q4_k` is nearly 2x. On NVIDIA it is worth ~13%. On AMD it is worth nothing at
-all: everything lands within 1.5 ms and `q8_0` is the fastest of them on the
-0.6B. Do not carry a number from one backend to another.
+**On the CPU the weight type is the single biggest lever there is** — `q8_0` to
+`q4_k` is nearly 2x on the 1.7B. On NVIDIA it is worth ~15%. On AMD it is worth
+nothing at all: every quantised type lands within 1.4 ms of every other. Do not
+carry a number from one backend to another.
+
+`bf16` is the outlier everywhere and by a lot — 1.5x the cost of `q8_0` on the
+GPUs and nearly 2x on the CPU. It is for checking numerics against the
+checkpoint, not for running.
+
+### These are not whole-request numbers
+
+Generation is the part the weight type governs, which is why the table measures
+it. It is not what a request costs, and it is **not comparable across backends
+in general**: the vocoder is overlapped into generation on CUDA, ROCm and Metal
+but not on Vulkan or CPU (`pipeline_supported()` in `qwen3_tts.cpp`), so the
+same column means different things on either side of that line.
+
+For whole-request figures see `optimization.md`. The short version, warm server,
+1.7B Q8_0, a 100-word line: ROCm 6800 XT 11.7 s, Vulkan 6800 XT 14.5 s, CUDA
+1660 SUPER 17.5 s, Vulkan 1660 SUPER 26.9 s.
 
 ## Making one
 

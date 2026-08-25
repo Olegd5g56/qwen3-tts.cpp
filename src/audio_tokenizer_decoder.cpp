@@ -14,6 +14,35 @@
 
 namespace qwen3_tts {
 
+namespace {
+// Escape hatch for putting the vocoder back on the CPU, kept because working
+// out where it belongs took a day and the question will come back.
+//
+// The GPU is the right answer everywhere measured. On a 100-word line, whole
+// request, warm server, 1.7B Q8_0 (2026-08-25):
+//
+//     ROCm 6800 XT   GPU 29.2s   CPU 163.5s
+//     Vulkan 6800 XT GPU 32.5s   CPU 157.7s
+//
+// The CPU path is far worse than those numbers should allow - slower than
+// running the *entire* pipeline on the CPU - so something in it is broken as
+// well as slow, most likely the blanket GGML_PREC_F32 the audio models apply to
+// every matmul. Nobody has chased that down; do not read these numbers as "the
+// CPU vocoder is simply slow".
+//
+// This has to govern the weight buffer as well as the compute backend:
+// ggml_backend_sched pins a node to the buffer its weights live in, so leaving
+// the weights on the GPU would keep the graph there whatever backend we build.
+bool vocoder_wants_cpu() {
+    static const bool want = [] {
+        const char * env = std::getenv("QWEN3_TTS_VOCODER");
+        return env && (env[0] == 'c' || env[0] == 'C');
+    }();
+    return want;
+}
+}  // namespace
+
+
 // Index of the first non-finite decoded sample, or -1 when they are all finite.
 //
 // #14 was a numerical failure of exactly this conv tower - the whole 25-layer
@@ -303,7 +332,8 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_,
-                                     GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+                                     vocoder_wants_cpu() ? GGML_BACKEND_DEVICE_TYPE_CPU
+                                                         : GGML_BACKEND_DEVICE_TYPE_IGPU)) {
         return false;
     }
     
@@ -373,7 +403,16 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     // sharing its stream and its memory pool, and the CUDA pool asserts that
     // frees come in reverse order of allocations -- which two threads cannot
     // honour. This was invisible while the vocoder was stuck on the CPU.
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_, true);
+    // QWEN3_TTS_VOCODER=cpu keeps the vocoder off the GPU; see vocoder_wants_cpu().
+    if (vocoder_wants_cpu()) {
+        state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!state_.backend) {
+            error_msg_ = "Failed to initialize CPU backend for AudioTokenizerDecoder";
+            return false;
+        }
+    } else {
+        state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_, true);
+    }
     if (!state_.backend) {
         return false;
     }
