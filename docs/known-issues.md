@@ -369,13 +369,29 @@ treat *any* recorded seed here as valid only against the commit that recorded
 it: sampling follows the reduction order, so a perf change to attention
 reshuffles which seeds fail.
 
-**Is it numerics, like #16?** Open, but now tested continuously rather than
-argued about. Two things are known: the F16 KV cache — the one F16 surface left
-on a Q8_0 file — has a 460x margin (K/V peak at 141.7 against 65504), and the
-non-finite logit guard added in `06cd5fc` runs on every frame of every request.
-If a runaway ever happens without that guard firing, #11 is not a numerical
-blowup. The two failures also look nothing alike: #16 is noise from the first
-second, #11 speaks the whole text correctly and only then wanders.
+**Fresh reproducer** (valid against `ba68c83`, and only against it — see the
+warning above): same text, model and voice, **`--seed 20`**. Sweep of seeds
+7–21 on 2026-08-25:
+
+| | frames |
+|---|---|
+| 14 healthy seeds | 2684–3132 |
+| **seed 20** | **5820 = the budget (runaway)** |
+
+One runaway in 15 seeds — the same 1-in-15 rate this entry recorded on 19 Aug,
+so nothing about the failure's frequency has changed, only which seed hits it.
+
+**It is not a numerical blowup (settled 2026-08-25).** The non-finite logit
+guard from `06cd5fc` checked the talker's and the code predictor's logits on
+every one of seed 20's 5820 frames and never fired. Combined with the F16 KV
+cache having a 460x margin (K/V peak at 141.7 against a 65504 ceiling), the
+overflow mechanism behind #16 is ruled out here.
+
+Note what that does and does not say: it rules out inf/NaN — the overflow class
+— not gradual precision loss that stays finite. But it does close the specific
+question of whether #11 is #16 wearing a different hat. It is not, and the two
+never looked alike: #16 is noise from the first second, #11 speaks the whole
+text correctly and only then wanders.
 
 **What the failure actually looks like** (not what was first assumed):
 
