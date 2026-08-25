@@ -31,11 +31,12 @@
 #                     e.g. --env CUDA_VISIBLE_DEVICES=0
 #   --model PATH      talker gguf      (default: $TTS_MODEL)
 #   --vocoder PATH    vocoder gguf     (default: $TTS_VOCODER)
-#   --voice NAME      voice to use     (default: $TTS_BENCH_VOICE, else the
-#                     first in --voices-dir; it is recorded in the row, because
-#                     a different voice speaks at a different rate and so
-#                     produces a different number of frames for the same text)
-#   --voices-dir DIR  voice library    (default: $TTS_VOICES_DIR)
+#   --voice NAME      voice from --voices-dir to use instead of the built-in
+#                     benchmark voice. Recorded in the row: a different voice
+#                     speaks at a different rate, so the same text becomes a
+#                     different number of frames and a different number of
+#                     seconds.
+#   --voices-dir DIR  library to take --voice from (default: $TTS_VOICES_DIR)
 #   --text FILE       input text       (default: benchmarks/bench_ru.txt)
 #   --runs N          timed runs after the warm-up (default: 4)
 #   --port N          (default: 8099)
@@ -44,7 +45,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE=${TTS_BENCH_VOICE:-} VOICES_DIR=${TTS_VOICES_DIR:-}
+BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE= VOICES_DIR=${TTS_VOICES_DIR:-}
 TEXT="$ROOT/benchmarks/bench_ru.txt" RUNS=4 PORT=8099 OUT="$ROOT/benchmarks/speed.tsv" NOTE=
 declare -a EXTRA_ENV=()
 
@@ -74,15 +75,31 @@ die() { echo "bench_speed: $*" >&2; exit 1; }
 [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "--model / TTS_MODEL must point at a gguf"
 [ -n "$VOCODER" ] && [ -f "$VOCODER" ] || die "--vocoder / TTS_VOCODER must point at a gguf"
 [ -f "$TEXT" ] || die "text file not found: $TEXT"
-[ -n "$VOICES_DIR" ] && [ -d "$VOICES_DIR" ] || die "--voices-dir / TTS_VOICES_DIR must be a directory"
+[ -z "$VOICE" ] || [ -d "${VOICES_DIR:-}/$VOICE" ] || die "no voice '$VOICE' in '${VOICES_DIR:-<unset>}'"
 command -v jq   >/dev/null || die "jq is required"
 command -v curl >/dev/null || die "curl is required"
 
-# One voice only: the background library preload competes with the measurement.
-[ -n "$VOICE" ] || VOICE=$(ls "$VOICES_DIR" | head -1)
-[ -n "$VOICE" ] || die "no voice found in $VOICES_DIR"
+# The server is pointed at a directory holding exactly one voice. Two reasons:
+# the background preload of a real library competes with the measurement, and a
+# benchmark must not depend on a directory whose contents come and go.
+#
+# The default voice ships with the repo. It is 8.9 s of speech this model
+# generated itself from benchmarks/voice/sample.txt, so the transcript matches
+# the audio exactly - unlike examples/readme_clone_input.wav, whose 60 s do not
+# match the 8 s transcript beside it and which drives generation to the token
+# cap (known-issues.md). Without any reference at all the model is unconstrained
+# and useless to time: the same text came out 717 frames one run and 496 the
+# next, a 45% spread against ~5% with a voice.
 ONEVOICE=$(mktemp -d); trap 'rm -rf "$ONEVOICE"' EXIT
-ln -s "$VOICES_DIR/$VOICE" "$ONEVOICE/$VOICE" || die "cannot link voice $VOICE"
+if [ -n "$VOICE" ]; then
+    cp -rL "$VOICES_DIR/$VOICE" "$ONEVOICE/$VOICE" || die "cannot copy voice $VOICE"
+else
+    VOICE=bench
+    [ -f "$ROOT/benchmarks/voice/sample.mp3" ] || die "benchmarks/voice/sample.mp3 is missing"
+    mkdir -p "$ONEVOICE/$VOICE"
+    cp "$ROOT/benchmarks/voice/sample.mp3" "$ROOT/benchmarks/voice/sample.txt" "$ONEVOICE/$VOICE/" \
+        || die "cannot stage the built-in benchmark voice"
+fi
 
 cache() { grep -E "^$1:" "$BUILD/CMakeCache.txt" 2>/dev/null | cut -d= -f2- ; }
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)

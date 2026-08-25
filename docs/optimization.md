@@ -491,11 +491,25 @@ studied.**
 
 The voice belongs in that list because it changes the answer: different voices
 speak at different rates, so the same text becomes a different number of frames
-and therefore a different number of seconds. `--voice` (or `TTS_BENCH_VOICE`)
-pins it; the seeded rows use `ostro` for `bench_ru.txt` and
-`femaleuniquenocturnal` for the `ward.txt` series. A voice's `cache.bin` can
-also be re-encoded behind your back after a model-variant switch, which is one
-more reason to keep the voice fixed and named in the row. That is
+and therefore a different number of seconds.
+
+**The default voice ships with the repo** (`benchmarks/voice/`), and the script
+stages it into a temporary directory as the server's entire library. Nothing
+outside the repo is touched, because a voice library is a working directory that
+gains and loses voices — a benchmark cannot rest on one. It is 8.9 s this model
+generated from `benchmarks/voice/sample.txt`, so the transcript matches the
+audio exactly; `examples/readme_clone_input.wav` must not be used instead, its
+60 s do not match the 8 s transcript beside it and the pair drives generation to
+the token cap (`known-issues.md`).
+
+Running with no voice at all is not an option either: unreferenced, the model is
+unconstrained, and the same text came out 717 frames one run and 496 the next —
+a 45% spread, against ~6% with the benchmark voice. You cannot see a 10%
+regression through that.
+
+`--voice NAME --voices-dir DIR` still takes a library voice when a specific one
+is the point. Seeded rows named `ostro` and `femaleuniquenocturnal` are from
+before the built-in voice existed. That is
 not pedantry: on 2026-08-25 a full day of cross-backend work turned out to be
 measuring `GGML_NATIVE` differing between two build directories, because a cache
 made before `063470c` keeps `ON` and anything configured after it gets `OFF`.

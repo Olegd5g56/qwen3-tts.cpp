@@ -13,3 +13,7 @@ date	commit	label	model	text	voice	native	timing	mean_s	runs_s	note
 2026-08-25T18:05Z	62b2d6b	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	11.66	11.21,11.61,11.61,12.21	reproduction of Oleg's protocol
 2026-08-25T18:05Z	62b2d6b	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	14.47	14.21,14.22,15.62,13.82	reproduction of Oleg's protocol
 2026-08-25T18:05Z	62b2d6b	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	26.92	31.02,28.82,24.62,23.22	reproduction of Oleg's protocol
+2026-08-25T18:52Z	d72014c-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	16.16	15.61,16.41,15.81,16.81	baseline on the built-in benchmark voice
+2026-08-25T18:53Z	d72014c-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	11.21,10.81,11.01,10.01	baseline on the built-in benchmark voice
+2026-08-25T18:54Z	d72014c-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	12.11	12.41,12.21,12.01,11.81	baseline on the built-in benchmark voice
+2026-08-25T18:56Z	d72014c-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	22.37	22.62,22.42,22.22,22.22	baseline on the built-in benchmark voice
