@@ -341,7 +341,7 @@ There is no fallback. If the sampler never draws EOS, the loop runs to
 `max_len` = `MAX_AUDIO_TOKENS` = 6144 frames = **491 s of audio**, which is
 ~5 min of GPU time on the 1660 SUPER and ~8 min on slower paths.
 
-**Reproducer** (deterministic): `ward_max.txt` (4067 chars) + 1.7B Base +
+**Reproducer** (**stale — see below**): `ward_max.txt` (4067 chars) + 1.7B Base +
 voice `ostro`, `--seed 6`. Rate over a seed sweep:
 
 | text | chars | seeds | runaways |
@@ -351,6 +351,31 @@ voice `ostro`, `--seed 6`. Rate over a seed sweep:
 
 Length is the trigger, not the wording — the failure needs a long generation
 to occur at all.
+
+**The seed-6 reproducer no longer reproduces (checked 2026-08-25).** It now
+ends normally at 2851 frames, inside the healthy 2701–3088 band. Two things
+moved under it, both after this entry was written:
+
+- `f569cb0` (*attend only to the populated KV window*, 19 Aug) changed the
+  attention reduction order. Its own message says greedy decoding "can take a
+  different (equally valid) path" — so a seed no longer lands on the same
+  token trajectory it did when this was filed.
+- The `ostro` voice cache (`cache.bin`) was regenerated on 24 Aug, which
+  changes the speaker embedding the generation starts from.
+
+The bug is not fixed — its reproducer is. Do not read a clean seed 6 as
+evidence that #11 is gone; find a fresh runaway by sweeping seeds instead. And
+treat *any* recorded seed here as valid only against the commit that recorded
+it: sampling follows the reduction order, so a perf change to attention
+reshuffles which seeds fail.
+
+**Is it numerics, like #16?** Open, but now tested continuously rather than
+argued about. Two things are known: the F16 KV cache — the one F16 surface left
+on a Q8_0 file — has a 460x margin (K/V peak at 141.7 against 65504), and the
+non-finite logit guard added in `06cd5fc` runs on every frame of every request.
+If a runaway ever happens without that guard firing, #11 is not a numerical
+blowup. The two failures also look nothing alike: #16 is noise from the first
+second, #11 speaks the whole text correctly and only then wanders.
 
 **What the failure actually looks like** (not what was first assumed):
 
