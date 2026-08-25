@@ -485,8 +485,17 @@ scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" --env CUDA_VISIBL
 ```
 
 Every row carries the commit, the build's `GGML_NATIVE` and `QWEN3_TTS_TIMING`,
-the model, and the text with its byte count. **A comparison is only honest
-between rows where all of those match except the one being studied.** That is
+the model, the text with its byte count, and the **voice**. **A comparison is
+only honest between rows where all of those match except the one being
+studied.**
+
+The voice belongs in that list because it changes the answer: different voices
+speak at different rates, so the same text becomes a different number of frames
+and therefore a different number of seconds. `--voice` (or `TTS_BENCH_VOICE`)
+pins it; the seeded rows use `ostro` for `bench_ru.txt` and
+`femaleuniquenocturnal` for the `ward.txt` series. A voice's `cache.bin` can
+also be re-encoded behind your back after a model-variant switch, which is one
+more reason to keep the voice fixed and named in the row. That is
 not pedantry: on 2026-08-25 a full day of cross-backend work turned out to be
 measuring `GGML_NATIVE` differing between two build directories, because a cache
 made before `063470c` keeps `ON` and anything configured after it gets `OFF`.

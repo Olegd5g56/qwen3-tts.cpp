@@ -31,7 +31,10 @@
 #                     e.g. --env CUDA_VISIBLE_DEVICES=0
 #   --model PATH      talker gguf      (default: $TTS_MODEL)
 #   --vocoder PATH    vocoder gguf     (default: $TTS_VOCODER)
-#   --voice NAME      voice to use     (default: first in --voices-dir)
+#   --voice NAME      voice to use     (default: $TTS_BENCH_VOICE, else the
+#                     first in --voices-dir; it is recorded in the row, because
+#                     a different voice speaks at a different rate and so
+#                     produces a different number of frames for the same text)
 #   --voices-dir DIR  voice library    (default: $TTS_VOICES_DIR)
 #   --text FILE       input text       (default: benchmarks/bench_ru.txt)
 #   --runs N          timed runs after the warm-up (default: 4)
@@ -41,7 +44,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE= VOICES_DIR=${TTS_VOICES_DIR:-}
+BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE=${TTS_BENCH_VOICE:-} VOICES_DIR=${TTS_VOICES_DIR:-}
 TEXT="$ROOT/benchmarks/bench_ru.txt" RUNS=4 PORT=8099 OUT="$ROOT/benchmarks/speed.tsv" NOTE=
 declare -a EXTRA_ENV=()
 
@@ -109,7 +112,8 @@ request() {
         -H 'Content-Type: application/json' -d @-
 }
 
-printf 'bench_speed: %s  commit=%s native=%s timing=%s\n' "$LABEL" "$COMMIT" "${NATIVE:-?}" "${TIMING:-?}"
+printf 'bench_speed: %s  commit=%s voice=%s native=%s timing=%s\n' \
+    "$LABEL" "$COMMIT" "$VOICE" "${NATIVE:-?}" "${TIMING:-?}"
 request  # warm-up, discarded: it costs about double
 times=()
 for i in $(seq 1 "$RUNS"); do
@@ -119,9 +123,9 @@ for i in $(seq 1 "$RUNS"); do
 done
 mean=$(printf '%s\n' "${times[@]}" | LC_ALL=C awk '{s+=$1}END{printf "%.2f", s/NR}')
 
-[ -s "$OUT" ] || printf 'date\tcommit\tlabel\tmodel\ttext\tnative\ttiming\tmean_s\truns_s\tnote\n' > "$OUT"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%MZ)" "$COMMIT" "$LABEL" "$(basename "$MODEL")" "$TEXT_ID" \
+[ -s "$OUT" ] || printf 'date\tcommit\tlabel\tmodel\ttext\tvoice\tnative\ttiming\tmean_s\truns_s\tnote\n' > "$OUT"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%MZ)" "$COMMIT" "$LABEL" "$(basename "$MODEL")" "$TEXT_ID" "$VOICE" \
     "${NATIVE:-?}" "${TIMING:-?}" "$mean" "$(IFS=,; echo "${times[*]}")" "$NOTE" >> "$OUT"
 
 printf 'bench_speed: %s -> %s s  (appended to %s)\n' "$LABEL" "$mean" "${OUT#$ROOT/}"
