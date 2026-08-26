@@ -68,9 +68,14 @@ struct decoder_block {
     struct ggml_tensor * snake_alpha = nullptr;
     struct ggml_tensor * snake_beta = nullptr;
     
-    // Transposed convolution for upsampling
+    // Transposed convolution for upsampling.
+    // The GEMM path reshapes conv_t_w from [K, OC, IC] to [IC, K*OC], so the
+    // kernel width and output channel count are carried here rather than read
+    // back off the tensor.
     struct ggml_tensor * conv_t_w = nullptr;
     struct ggml_tensor * conv_t_b = nullptr;
+    int64_t conv_t_kernel = 0;
+    int64_t conv_t_out_ch = 0;
     
     // Residual blocks (3 per decoder block)
     residual_block res[3];
@@ -80,6 +85,8 @@ struct decoder_block {
 struct upsample_block {
     struct ggml_tensor * conv_w = nullptr;
     struct ggml_tensor * conv_b = nullptr;
+    int64_t conv_kernel = 0;
+    int64_t conv_out_ch = 0;
     struct ggml_tensor * dwconv_w = nullptr;
     struct ggml_tensor * dwconv_b = nullptr;
     struct ggml_tensor * norm_w = nullptr;
@@ -303,6 +310,9 @@ private:
     // Streaming mode flag consulted by build_graph to gate the KV-cache
     // and next_* output extensions.
     bool streaming_mode_ = false;
+    // conv_transpose runs as GEMM + col2im rather than ggml's own op; decided
+    // at load, because it changes how the weights are laid out.
+    bool conv_transpose_gemm_ = false;
 
     // Per-call streaming tail metadata, rebuilt by build_graph. next_node
     // points to the ggml_cont tensor that emits the last L frames and must

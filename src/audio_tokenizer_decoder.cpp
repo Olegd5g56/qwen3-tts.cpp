@@ -73,9 +73,43 @@ bool is_conv_transpose_weight(const std::string & name) {
 // same 1660 SUPER the Vulkan shader beats it 3x, and the CPU fallback beats it
 // 2.5x. Details and the upstream case in docs/optimization.md.
 //
+// The other way to get conv_transpose off the CPU, and it needs no GPU kernel
+// at all: a transposed convolution is a GEMM followed by a scatter-add of the
+// resulting columns back onto the signal, which is exactly what ggml's
+// `col2im_1d` op does. That routes the work through cuBLAS/rocBLAS instead of
+// ggml's hand-rolled conv_transpose kernel and keeps the weights F16.
+//
+// Costs a one-time repack of the six weights at load, from ggml's
+// [K, OC, IC] layout to the [IC, K*OC] a matmul contracts over.
+//
+// **On by default on every backend**, measured 2026-08-26, isolated vocoder
+// decode, 1.7B Q8_0, ms/frame -- against the best each backend could do before:
+//
+//   CUDA   1660S    10.0 (CPU)     -> 4.29
+//   HIP    6800XT    6.65 (CPU)    -> 1.49
+//   Vulkan 6800XT    3.82 (shader) -> 1.05
+//   Vulkan 1660S     8.44 (shader) -> 5.04
+//
+// Costs ~174 MB of intermediate at the 100-frame chunk. Output matches ggml's
+// own op at 67 dB SNR, which is F16 rounding, not a difference in the maths.
+//
+// QWEN3_TTS_CONV_T_GEMM=0/1. Takes precedence over CONV_T_F32, which is only
+// reachable with this off: this path never asks supports_op about
+// CONV_TRANSPOSE_1D at all.
+bool conv_transpose_wants_gemm() {
+    static const bool want = [] {
+        const char * env = std::getenv("QWEN3_TTS_CONV_T_GEMM");
+        return !env || !env[0] || env[0] != '0';
+    }();
+    return want;
+}
+
 // QWEN3_TTS_CONV_T_F32=0/1 forces it either way.
 bool conv_transpose_wants_f32() {
     static const bool want = [] {
+        if (conv_transpose_wants_gemm()) {
+            return false;
+        }
         const char * env = std::getenv("QWEN3_TTS_CONV_T_F32");
         if (env && env[0]) {
             return env[0] != '0';
@@ -199,6 +233,11 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     const bool promote_conv_t = conv_transpose_wants_f32();
     size_t promoted_bytes = 0;
     int    promoted_count = 0;
+
+    const bool gemm_conv_t = conv_transpose_wants_gemm();
+    conv_transpose_gemm_ = gemm_conv_t;
+    struct repack_entry { struct ggml_tensor * t; int64_t K, OC, IC; };
+    std::vector<repack_entry> repack;
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
@@ -216,8 +255,16 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         std::string sname(name);
 
         struct ggml_tensor * tensor = nullptr;
-        if (promote_conv_t && meta_tensor->type != GGML_TYPE_F32 &&
-            is_conv_transpose_weight(sname)) {
+        if (gemm_conv_t && is_conv_transpose_weight(sname)) {
+            // [K, OC, IC] -> [IC, K*OC]: same bytes, so the loader still fills
+            // it straight from the file and the permute happens below, once.
+            const int64_t K = meta_tensor->ne[0];
+            const int64_t OC = meta_tensor->ne[1];
+            const int64_t IC = meta_tensor->ne[2];
+            tensor = ggml_new_tensor_2d(model_.ctx, meta_tensor->type, IC, K * OC);
+            repack.push_back({ tensor, K, OC, IC });
+        } else if (promote_conv_t && meta_tensor->type != GGML_TYPE_F32 &&
+                   is_conv_transpose_weight(sname)) {
             tensor = ggml_new_tensor(model_.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, meta_tensor->ne);
             promoted_bytes += ggml_nbytes(tensor) - ggml_nbytes(meta_tensor);
             promoted_count++;
@@ -286,7 +333,11 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
             }
             else if (MATCH1S("tok_dec.upsample.%d.conv.%63s", blk_idx, suffix)) {
                 if (blk_idx >= 0 && blk_idx < 2) {
-                    if (strcmp(suffix, "weight") == 0) model_.upsample[blk_idx].conv_w = tensor;
+                    if (strcmp(suffix, "weight") == 0) {
+                        model_.upsample[blk_idx].conv_w      = tensor;
+                        model_.upsample[blk_idx].conv_kernel = meta_tensor->ne[0];
+                        model_.upsample[blk_idx].conv_out_ch = meta_tensor->ne[1];
+                    }
                     else if (strcmp(suffix, "bias") == 0) model_.upsample[blk_idx].conv_b = tensor;
                 }
             }
@@ -357,7 +408,11 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                 if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].snake_beta = tensor;
             }
             else if (MATCH1("tok_dec.dec.%d.conv_t.weight", blk_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].conv_t_w = tensor;
+                if (blk_idx >= 1 && blk_idx <= 4) {
+                    model_.dec_blocks[blk_idx-1].conv_t_w      = tensor;
+                    model_.dec_blocks[blk_idx-1].conv_t_kernel = meta_tensor->ne[0];
+                    model_.dec_blocks[blk_idx-1].conv_t_out_ch = meta_tensor->ne[1];
+                }
             }
             else if (MATCH1("tok_dec.dec.%d.conv_t.bias", blk_idx)) {
                 if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].conv_t_b = tensor;
@@ -421,6 +476,32 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         return false;
     }
     
+    // The loader wrote the file's bytes, which are still in ggml's
+    // [K, OC, IC] conv_transpose order. Permute them in place to the
+    // [IC, K*OC] a matmul contracts over: W2[c, oc*K + k] = W[k, oc, c].
+    if (!repack.empty()) {
+        std::vector<uint8_t> src_bytes, dst_bytes;
+        for (const repack_entry & e : repack) {
+            const size_t nb = ggml_nbytes(e.t);
+            const size_t ts = ggml_type_size(e.t->type);
+            src_bytes.resize(nb);
+            dst_bytes.resize(nb);
+            ggml_backend_tensor_get(e.t, src_bytes.data(), 0, nb);
+            for (int64_t c = 0; c < e.IC; ++c) {
+                for (int64_t oc = 0; oc < e.OC; ++oc) {
+                    for (int64_t k = 0; k < e.K; ++k) {
+                        const size_t from = (size_t) (k + e.K * (oc + e.OC * c)) * ts;
+                        const size_t to   = (size_t) (c + e.IC * (oc * e.K + k)) * ts;
+                        memcpy(dst_bytes.data() + to, src_bytes.data() + from, ts);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(e.t, dst_bytes.data(), 0, nb);
+        }
+        log_info("vocoder: %zu conv_transpose weights repacked for the GEMM path",
+                 repack.size());
+    }
+
     for (int i = 0; i < 4; ++i) {
         model_.dec_blocks[i].res[0].dilation = 1;
         model_.dec_blocks[i].res[1].dilation = 3;
@@ -430,11 +511,11 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     // extract per-block output channels from the transposed conv weights.
     // ggml conv_transpose_1d weight layout is [kernel, out_ch, in_ch], so
     // ne[1] is the output channel count. used by streaming decode for ring
-    // buffer sizing.
+    // buffer sizing. The GEMM path reshapes the weight, so this reads the count
+    // recorded at load rather than the tensor's current ne[1].
     for (int i = 0; i < 4; ++i) {
         if (model_.dec_blocks[i].conv_t_w) {
-            model_.config.dec_out_channels[i] =
-                (int32_t) model_.dec_blocks[i].conv_t_w->ne[1];
+            model_.config.dec_out_channels[i] = (int32_t) model_.dec_blocks[i].conv_t_out_ch;
         }
     }
     log_debug("AudioTokenizerDecoder dec_out_channels: [%d, %d, %d, %d]",
@@ -725,6 +806,26 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
     return ggml_add(ctx, residual, ffn_out);
 }
 
+// A transposed convolution, taken the other way round: one GEMM producing the
+// K*OC columns per input step, then `col2im_1d` scattering them back onto the
+// signal. Same result as ggml_conv_transpose_1d(w, x, s0, 0, 1), including the
+// uncropped length, so everything downstream is unchanged -- but the work goes
+// through the matmul kernels instead of ggml's conv_transpose kernel, and the
+// weights stay F16.
+//
+// `w_gemm` is [IC, K*OC], repacked at load. `x_2d` is [T_in, IC].
+static struct ggml_tensor * conv_transpose_1d_gemm(struct ggml_context * ctx,
+                                                   struct ggml_tensor * w_gemm,
+                                                   struct ggml_tensor * x_2d,
+                                                   int s0,
+                                                   int64_t out_channels) {
+    // mul_mat contracts over ne[0] of both operands, and the input arrives
+    // with time fastest, so it has to be flipped to [IC, T_in] first.
+    struct ggml_tensor * x_t = ggml_cont(ctx, ggml_transpose(ctx, x_2d));
+    struct ggml_tensor * col = ggml_mul_mat(ctx, w_gemm, x_t);   // [K*OC, T_in]
+    return ggml_col2im_1d(ctx, col, s0, (int) out_channels, 0);  // [T_out, OC]
+}
+
 struct ggml_tensor * AudioTokenizerDecoder::apply_upsample_block(struct ggml_context * ctx,
                                                                    struct ggml_tensor * x,
                                                                    const upsample_block & block,
@@ -733,7 +834,9 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_upsample_block(struct ggml_con
     int64_t channels = x->ne[1];
 
      struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, seq_len, channels);
-     x_2d = ggml_conv_transpose_1d(ctx, block.conv_w, x_2d, 2, 0, 1);
+     x_2d = conv_transpose_gemm_
+            ? conv_transpose_1d_gemm(ctx, block.conv_w, x_2d, 2, block.conv_out_ch)
+            : ggml_conv_transpose_1d(ctx, block.conv_w, x_2d, 2, 0, 1);
 
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, channels, 1);
@@ -830,11 +933,13 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
     
      int64_t seq_len = x->ne[0];
      int64_t in_channels = x->ne[1];
-     int64_t out_channels = block.conv_t_w->ne[1];
-     int kernel_size = block.conv_t_w->ne[0];
+     int64_t out_channels = block.conv_t_out_ch;
+     int kernel_size = (int) block.conv_t_kernel;
      
      struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, seq_len, in_channels);
-     x_2d = ggml_conv_transpose_1d(ctx, block.conv_t_w, x_2d, upsample_rate, 0, 1);
+     x_2d = conv_transpose_gemm_
+            ? conv_transpose_1d_gemm(ctx, block.conv_t_w, x_2d, upsample_rate, out_channels)
+            : ggml_conv_transpose_1d(ctx, block.conv_t_w, x_2d, upsample_rate, 0, 1);
      
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1);
