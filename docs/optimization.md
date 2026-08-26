@@ -465,6 +465,40 @@ the line. As a share that is **10.7% of a 26-character clause, 3% of a
 one-sentence line and 0.5% of a 42-second paragraph.** The original 16% was
 never there.
 
+### In the deployed stack
+
+The numbers above are the benchmark voice, whose reference transcript is 93
+characters. A real one from the 198-voice library is bigger and the reuse
+scales with it:
+
+```
+ICL layout: prefix=9 ref_text=66 new_text=24 eos=1 codec_bos=1 ref_frames=150 total=251
+```
+
+`ostro`, 196 characters of transcript, and its reference hits the 150-frame
+cap. The reusable head is **75 of 251 tokens** against 46 of 187 for the
+benchmark voice, and the reference block is 2400 device reads instead of 1792.
+Three identical requests through the stack's proxy, 1.7B Q8_0 on the 1660 SUPER:
+
+```
+[1635] ok 3.44s audio in 2472ms (prefill=479ms ...)   first request, cache miss
+[1636] ok 3.60s audio in 1497ms (prefill=291ms ...)   hit
+[1637] ok 3.68s audio in 1524ms (prefill=291ms ...)   hit
+```
+
+**479 → 291 ms, −39%** — the reuse is worth more here than on the benchmark
+voice because the head is longer. The totals are not comparable across those
+three lines (3.44 / 3.60 / 3.68 s of audio is a different frame count each
+time, and the first also pays warm-up).
+
+The cache holds 8 voices; the library has 198. That is deliberate and it costs
+nothing to be wrong about, because the startup preload never touches this
+cache — it only encodes each voice's embedding and reference codes, which is a
+different thing entirely. Only voices that are actually spoken take a slot. A
+workload that cycles through more than 8 speakers before repeating will thrash
+it; raise `QWEN3_TTS_PREFIX_CACHE` there, at about 7 MB of host memory per
+voice.
+
 ### Why the prefill is split even on a cache miss
 
 The head is prefilled as its own chunk whether or not it was cached. A head

@@ -306,7 +306,7 @@ spoken text, not just the timbre.
 | `QWEN3_TTS_VOCODER` | gpu | `cpu` moves the vocoder (weights and compute) off the accelerator. Much slower everywhere measured; it exists for diagnosis. |
 | `QWEN3_TTS_CONV_T_GEMM` | on | Run the vocoder's transposed convolutions as `mul_mat` + `col2im_1d` instead of ggml's `conv_transpose_1d`. 2.3–4.5x faster decode on every backend, +34 MB. `0` restores the op. |
 | `QWEN3_TTS_CONV_T_F32` | off | Only reachable with `QWEN3_TTS_CONV_T_GEMM=0`. Widens the six `conv_transpose` weights to F32 (+51 MB) so ggml's op is eligible on the GPU at all. Diagnostic; slower than both the default and the CPU fallback on CUDA and ROCm. |
-| `QWEN3_TTS_PREFIX_CACHE` | 8 | Voices whose reference block and prompt-head KV are kept for reuse across requests. About 7 MB of host memory per voice on the 1.7B, more for a longer reference transcript. `0` disables the reuse. |
+| `QWEN3_TTS_PREFIX_CACHE` | 8 | Voices whose reference block and prompt-head KV are kept for reuse across requests, evicted least-recently-used. About 7 MB of host memory per voice on the 1.7B, more for a longer reference transcript. Raise it if a workload cycles through more speakers than the cap before repeating; `0` disables the reuse. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
 
 ## Testing
