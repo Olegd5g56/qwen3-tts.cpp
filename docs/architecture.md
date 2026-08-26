@@ -127,8 +127,9 @@ The chain, in graph order:
 | `dec.6` | final conv1d to one channel | → waveform |
 
 The 15-way sum at the top is the add chain that RADV's fusion rule mishandles
-(`ggml-notes.md`). The six `conv_transpose_1d` nodes are 45–52% of decode and
-run on the CPU on every backend but Vulkan — see *Device placement* below.
+(`ggml-notes.md`). The six transposed convolutions used to be 45–52% of decode;
+they are now a GEMM pair instead of ggml's own op — see *Device placement*
+below.
 
 `set_active_codebooks()` lets both stages agree on how much of the RVQ chain is
 in play; the talker must not predict codebooks the vocoder will ignore, and the
@@ -158,15 +159,21 @@ half-precision accumulator and a deep tower loses ~30 dB. Applies to the vocoder
 and the speaker encoder. Talker graphs deliberately keep F16 accumulation
 (`known-issues.md` #14).
 
-**Six `conv_transpose_1d` nodes reach the GPU only on Vulkan, on purpose.**
-`supports_op` accepts `GGML_OP_CONV_TRANSPOSE_1D` only when both inputs are F32
-— in `ggml-cuda.cu:5142` and `ggml-vulkan.cpp:11549` alike — and the vocoder
-ships these weights as F16, so by default they are CPU convolutions with a GPU
-round trip either side. `QWEN3_TTS_CONV_T_F32` widens them at load (+51 MB) to
-make the op eligible; it defaults on for Vulkan (~10% end to end) and off for
-CUDA and ROCm, whose kernel is slower than the CPU doing the same convolution.
-This is also why `GGML_NATIVE` is worth 2.25x end to end on those backends: it
-governs exactly the CPU kernels these nodes land in. Measurements in
+**The six transposed convolutions do not use ggml's `conv_transpose_1d` op.**
+They are built as `mul_mat` + `col2im_1d` instead, which is the same
+mathematics — a GEMM producing `K*OC` columns per input step, then a
+scatter-add of those columns back onto the signal — and is 2.3-4.5x faster than
+the op on every backend measured. The weights are repacked once at load from
+ggml's `[K, OC, IC]` to the `[IC, K*OC]` a matmul contracts over, which is why
+`decoder_block` carries `conv_t_kernel` and `conv_t_out_ch` rather than reading
+them off the tensor.
+
+The op itself was never reaching the GPU anyway: `supports_op` accepts
+`GGML_OP_CONV_TRANSPOSE_1D` only when both inputs are F32 — `ggml-cuda.cu:5142`
+and `ggml-vulkan.cpp:11549` alike — and these weights ship as F16.
+`QWEN3_TTS_CONV_T_GEMM=0` restores the op, and only then does
+`QWEN3_TTS_CONV_T_F32` (widen the weights, make it GPU-eligible) do anything.
+Both are kept as the evidence behind the choice; the numbers are in
 `optimization.md`, *The conv_transpose experiment*.
 
 ---

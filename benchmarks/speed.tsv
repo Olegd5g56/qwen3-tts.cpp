@@ -25,3 +25,7 @@ date	commit	label	model	text	voice	native	timing	mean_s	runs_s	note
 2026-08-26T06:04Z	6a87081-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	25.82	24.82,26.62,25.82,26.02	conv_transpose forced onto the CUDA kernel - regression, kept as evidence
 2026-08-26T06:05Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	10.81,10.61,11.41,10.21	default unchanged: conv_transpose stays on CPU
 2026-08-26T06:07Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	14.41	14.01,14.61,14.01,15.01	conv_transpose forced onto the HIP kernel - regression, kept as evidence
+2026-08-26T06:33Z	f775bbf	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	15.96	16.01,15.81,16.01,16.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:34Z	f775bbf-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.51	10.21,11.01,10.81,10.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:35Z	f775bbf-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.01	10.41,10.21,9.61,9.81	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:36Z	f775bbf-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	19.01	18.81,19.01,19.21,19.01	conv_transpose as GEMM + col2im (new default)

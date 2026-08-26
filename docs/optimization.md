@@ -7,9 +7,9 @@ Performance characterization of this fork. Last updated **2026-08-26**.
 > current numbers come first; the August-20 sweep is kept at the end as history
 > because the relative wins it records are still real.
 >
-> The newest layer is *The conv_transpose experiment* (2026-08-26), which
-> settles that target: getting the op onto the GPU is a win on Vulkan and a
-> regression on CUDA and ROCm, because those backends' kernel loses to the CPU.
+> The newest layer is *The conv_transpose experiment* (2026-08-26), which closes
+> that target: rewritten as `mul_mat` + `col2im_1d`, vocoder decode is 2.3-4.5x
+> faster on every backend and generation is now the whole cost of a request.
 
 ## Current profile (where the time goes)
 
@@ -26,7 +26,14 @@ frames, in these numbers and in the older ones they are compared against; per
 | talker forward | 10.1 ms/frame | 7.1 ms/frame |
 | code predictor | **13.2 ms/frame** | **10.9 ms/frame** |
 | generate (total) | 25.1 ms/frame | 18.9 ms/frame |
-| vocoder decode | 12.9 ms/frame | 8.9 ms/frame |
+| vocoder decode | ~~12.9 ms/frame~~ | ~~8.9 ms/frame~~ |
+
+**The vocoder row is superseded.** `conv_transpose` moved to a GEMM +
+`col2im_1d` decomposition on 2026-08-26 and decode is now 4.29 ms/frame on
+CUDA/1660S and 1.49 on HIP/6800 XT — see *The conv_transpose experiment*. Those
+were measured on `bench_ru.txt` rather than the `ward.txt` this table uses, so
+they are not swapped into it; the generate rows are unaffected and still
+current. **Generation is now 5-7x the vocoder, not 2x.**
 | wall, pipeline off | 20 493 ms (539 fr) | 13 715 ms (494 fr) |
 | wall, pipeline on | 18 977 ms | 11 846 ms |
 
@@ -308,28 +315,71 @@ parallelises over output channels instead. See `ggml-notes.md`.
 reference PyTorch pipeline*). Vulkan on the 6800 XT now reaches 3.8, so the gap
 that remains is a kernel gap on one backend, not a structural one.
 
-**A third route exists and is untried.** ggml has `GGML_OP_COL2IM_1D`
-("scatter-add GEMM columns back to 1D signal"), with a CUDA kernel that already
-accepts F16/F32/BF16. A transposed convolution is a `mul_mat` followed by a
-`col2im_1d`, which would put the work through cuBLAS/rocBLAS instead of a
-hand-rolled kernel, keep the weights F16 (no +51 MB), need no ggml patch at
-all, and fold the causal crop into `col2im_1d`'s `p0`. It needs a one-time
-host-side repack of the weights from `[K, OC, IC]` to `[IC, K*OC]`, and it
-materialises a `[K*OC, T_in]` F32 intermediate — roughly 24 MB at the 16-frame
-chunk, ~150 MB at 100. Unmeasured.
+### The third route, and it wins on every backend
 
-**Worth reporting upstream**, and it is now a report with numbers: one backend's
-shader beating another's kernel 3x on the same card, and both of them measured
-against the CPU. Hold it together with the other two ggml findings — see
+Same day, and it makes the whole argument above a historical note.
+
+ggml already has `GGML_OP_COL2IM_1D` — "scatter-add GEMM columns back to 1D
+signal". A transposed convolution *is* a GEMM producing `K*OC` columns per input
+step followed by a scatter-add of those columns onto the signal, so the op can
+be written as `mul_mat` + `col2im_1d` and never touch `conv_transpose_1d` at
+all. That routes the work through cuBLAS/rocBLAS/the Vulkan matmul, keeps the
+weights F16, and needs no ggml patch.
+
+The six weights are repacked once at load, from ggml's `[K, OC, IC]` to the
+`[IC, K*OC]` a matmul contracts over. The op emits the same uncropped length as
+before, so every downstream crop and streaming overlap is untouched.
+`QWEN3_TTS_CONV_T_GEMM`, on by default.
+
+Isolated vocoder decode, `bench_ru.txt`, 1.7B Q8_0, `QWEN3_TTS_PIPELINE=0`,
+fixed seed, three runs — against the best each backend could previously do:
+
+| backend | card | best before | GEMM + col2im | |
+|---|---|---|---|---|
+| CUDA | 1660S | 10.0 (CPU fallback) | **4.29** | 2.3x |
+| HIP | 6800XT | 6.65 (CPU fallback) | **1.49** | 4.5x |
+| Vulkan | 6800XT | 3.82 (shader) | **1.05** | 3.6x |
+| Vulkan | 1660S | 8.44 (shader) | **5.04** | 1.7x |
+
+Whole request, `bench_speed.sh` protocol, against the original baseline:
+
+| config | baseline | GEMM + col2im | |
+|---|---|---|---|
+| CUDA 1660S | 16.71 s | **15.96 s** | −4.5% |
+| ROCm 6800XT | 10.76 s | **10.51 s** | −2.3% |
+| VK 6800XT | 13.16 s | **10.01 s** | **−24%** |
+| VK 1660S | 22.61 s | **19.01 s** | **−16%** |
+
+**Why the end-to-end gain is so uneven:** CUDA and ROCm overlap decode into
+generation, so most of the vocoder was already hidden behind the talker and
+shrinking it recovers only the exposed part. Vulkan cannot overlap
+(`pipeline_supported()`), so its vocoder time is fully on the critical path and
+the whole win shows up. **On the 6800 XT this flips the ranking: Vulkan at
+10.01 s now beats ROCm at 10.51 s.**
+
+Correctness: output matches ggml's own op at **67 dB SNR**, correlation
+0.9999999 — F16 rounding, not a difference in the maths. Streaming parity passes
+on CUDA, HIP and Vulkan. Cost is **+34 MB** at the shipping 16-frame chunk
+(+174 MB at the 100-frame sequential chunk), for the `[K*OC, T_in]` F32
+intermediate.
+
+Against the reference: PyTorch+cuDNN does this decode at 2.67 ms/frame on the
+1660 SUPER where we were at 9.60. At 4.29 the gap is 1.6x, down from 3.6x.
+
+**Still worth reporting upstream**, and now with a sharper point: ggml's
+`conv_transpose_1d` CUDA kernel is beaten 6x by a decomposition built out of
+ggml's own ops, and 2.5x by the CPU. Either the kernel should be rewritten or
+the frontend should lower `conv_transpose_1d` to `mul_mat` + `col2im_1d` where
+a backend has no good kernel. Hold it with the other two ggml findings — see
 `ggml-notes.md`.
 
 ## Remaining ideas (descending value)
 
-1. **`CONV_TRANSPOSE_1D` — resolved on Vulkan, and on CUDA the kernel is the
-   problem.** See *The conv_transpose experiment* above. Done: the weights are
-   widened at load, which is worth ~10% end to end on Vulkan and is a large
-   regression on CUDA and ROCm. What is left is a better CUDA/HIP kernel, and
-   ggml's own Vulkan shader is the existence proof that one is possible.
+1. **`CONV_TRANSPOSE_1D` — done.** Rewritten as `mul_mat` + `col2im_1d`; decode
+   is 2.3-4.5x faster on every backend and the vocoder is no longer a
+   meaningful share of a request. See *The conv_transpose experiment* above.
+   What is left here is an upstream report, not more local work.
+   **The vocoder is closed as a target; everything below is generation.**
 2. **The code predictor: only one lever left, and it is not a code change.**
    At 13.2 ms/frame it is the largest single line and no longer hidden, but it
    is ~70% weight traffic (see the ruled-out entry). Quantising it works and is

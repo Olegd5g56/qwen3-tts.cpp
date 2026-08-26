@@ -108,7 +108,7 @@ that isolates it.
 
 ---
 
-## `CONV_TRANSPOSE_1D` — the CUDA kernel loses to the CPU
+## `CONV_TRANSPOSE_1D` — the kernel is beaten 6x by ggml's own ops
 
 **Resolved 2026-08-26, and the kernel analysis below turns out to be the whole
 story.** Two corrections stacked here, so in order.
@@ -176,11 +176,25 @@ and that is where its 3x comes from.
 Unlike the conv1d gap below, this is ordinary optimisation of an existing kernel
 rather than adding a missing op, and it benefits every audio decoder on ggml.
 
-There is also a route that needs no new kernel. `GGML_OP_COL2IM_1D` already
-exists ("scatter-add GEMM columns back to 1D signal", `ggml.c:4584`) with a CUDA
-kernel that takes F16/F32/BF16. A transposed convolution is `mul_mat` followed
-by `col2im_1d`, which sends the work through cuBLAS instead of a hand-rolled
-kernel and keeps the weights F16. Untried; see `optimization.md`.
+**There is a route that needs no new kernel, and it wins everywhere.**
+`GGML_OP_COL2IM_1D` already exists ("scatter-add GEMM columns back to 1D
+signal", `ggml.c:4584`), implemented on CPU, CUDA, Vulkan and Metal. A
+transposed convolution *is* `mul_mat` followed by `col2im_1d`. Writing it that
+way in this fork's vocoder (2026-08-26) gave, in ms/frame of decode:
+
+| backend | card | conv_transpose_1d | mul_mat + col2im_1d |
+|---|---|---|---|
+| CUDA | 1660S | 25.5 | **4.29** |
+| HIP | 6800XT | 8.8 | **1.49** |
+| Vulkan | 6800XT | 3.8 | **1.05** |
+| Vulkan | 1660S | 8.5 | **5.04** |
+
+Even the good Vulkan shader is beaten 3.6x, and the CUDA kernel by 6x. So the
+upstream point is not only "this kernel is slow": **ggml's own ops compose into
+something faster than its dedicated op on every backend**, which suggests either
+rewriting the kernel or lowering `conv_transpose_1d` to that pair in the
+frontend where a backend has no good kernel. Output matches at 67 dB SNR.
+See `optimization.md` for the method and the whole-request numbers.
 
 ---
 
