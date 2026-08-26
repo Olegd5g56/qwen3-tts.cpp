@@ -785,41 +785,29 @@ there is one conversation rather than two.
 ## Open rough edges
 
 Not bugs, and none of them bite today. Kept so they are not rediscovered from
-scratch. Each was verified against the code on 2026-08-24.
+scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
 
 - **Sampling logic exists twice.** `predict_codes_autoregressive`'s
   `sample_or_argmax` lambda (`tts_transformer.cpp`) against the unrolled loop in
   `generate()`. They have already diverged: the suppression window and the
   repetition penalty are only in `generate()`. A change to sampling rules has to
   be made in both places and can silently be made in one.
-- **19 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, nine documented.
+- **20 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, ten documented.
   Several (`DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`) are
   diagnostics branched inline in hot loops. Tolerable; worth a config struct
   before the next handful arrives.
-- **No fast-fail when busy.** Synthesis is serialized and a second request just
-  waits. `synth_mutex.try_lock()` → 429 with `Retry-After` would stop clients
-  queueing. `/health` already reports `busy`.
 - **The C ABI (`qwen3tts_c_api`) lags the core**: no ICL/`ref_codes`, no
   streaming, and a different `max_audio_tokens` default. `top_p` is present but
   deliberately unused (kept for ABI stability, documented at the declaration —
   that part is fine). Either catch it up or mark the target experimental.
-- **`examples/` holds two wavs, no example source, and one of the wavs is a
-  trap.** `readme_clone_input.wav` is **60 s** long while `reference_text.txt`
-  next to it transcribes about eight seconds of speech. Nothing in the README
-  references either file any more. Feeding that pair to the reference PyTorch
-  pipeline as an ICL prompt makes generation run to the token cap (655 s of
-  audio) — it cost real time on 2026-08-24 before the mismatch was spotted.
-  Replace it with the model card's `clone.wav`, which is what the transcript
-  actually matches, or delete both and the stale transcript with them.
-  `benchmarks/voice/` is now the reference pair to reach for instead: 8.9 s of
-  audio this model generated from the transcript beside it, so the two match by
-  construction.
 - **`docs/model_inspection.txt`** is a raw metadata dump with no header saying
   which GGUF it came from or when.
-- **Two ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
+- **Three ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
   written up and reproducible; #17 (OOM segfault) is a one-line fix with a
-  verified repro. Both are upstream ggml, and #17 is deliberately held until
-  the `CONV_TRANSPOSE_1D` work goes the same way.
+  verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops compose into
+  something 6x faster than its dedicated CUDA kernel — is measured on four
+  backends. All three are upstream, all three go to `ggml-org/llama.cpp` rather
+  than to the ggml mirror, and the order to send them in is in `ggml-notes.md`.
 
 ### Dismissed after checking
 
@@ -991,3 +979,38 @@ the default and the only thing that fits everywhere.
 
 **Found only because the 1.7B was tested at all** — the 0.6B bf16 is 1.8 GB and
 fits anywhere, so nothing about it would have surfaced this.
+
+<a id="23"></a>
+## 23. A reference clip that did not match its transcript
+
+**Status:** fixed 2026-08-26 — both files deleted
+**Found:** 2026-08-24
+**Severity:** process — it wasted an afternoon and would have wasted more
+
+`examples/readme_clone_input.wav` was **60.000 s** of audio. The transcript
+that three scripts paired it with, `reference_text.txt`, covers about **eight
+seconds** of English speech. Fed to the reference PyTorch pipeline as an ICL
+prompt, that pair drives generation to the token cap — 655 s of audio out of a
+one-line request — because the model is being told the reference says something
+it does not say.
+
+Nothing in the README referenced either wav any more; the pairing survived only
+in two usage docstrings and one hardcoded path.
+
+**Deleted**, along with `examples/readme_example_clone.wav` (an output sample
+nothing referenced) and the now-empty directory. The three scripts point at
+`benchmarks/voice/` instead — 8.9 s of speech this model generated *from* the
+transcript beside it, so the two match by construction, and it is the same pair
+`bench_speed.sh` already uses.
+
+**`reference_text.txt` stays and is correct.** It is the transcript of the
+model card's `clone.wav`, which the reference-dump generators
+(`scripts/generate_reference_outputs.py`,
+`scripts/generate_deterministic_reference.py`) expect at the repository root and
+which is deliberately not committed. It only ever looked like an orphan because
+the wrong wav had been paired with it.
+
+**The rule worth keeping:** an ICL reference is a *pair*. A clip whose
+transcript does not match it is not a slightly worse reference, it is a broken
+one, and the failure mode is a request that runs for minutes rather than one
+that sounds off.

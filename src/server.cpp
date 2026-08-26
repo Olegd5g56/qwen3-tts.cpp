@@ -114,6 +114,14 @@ int main(int argc, char ** argv) {
     std::mutex synth_mutex;
     auto last_used = std::chrono::steady_clock::now();
 
+    // How many /v1/audio/speech requests are in flight, counting the one
+    // holding synth_mutex. Synthesis is serialized, so past sp.max_queue
+    // waiters the honest answer is 429 with Retry-After rather than a reply
+    // that arrives after the caller has given up. It is not a rate limit:
+    // one request in progress plus a short queue is the normal case and is
+    // still admitted.
+    std::atomic<int> synth_inflight{0};
+
     auto load_model_into = [&](Qwen3TTS & t) -> bool {
         if (!t.load_model_files(sp.model, sp.vocoder)) {
             log_error("model load failed: %s", t.get_error().c_str());
@@ -430,7 +438,7 @@ int main(int argc, char ** argv) {
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
         [&ensure_loaded, &cached_speaker_names, &last_used,
-         &synth_mutex, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
+         &synth_mutex, &synth_inflight, &sp, &voice_store](const httplib::Request & req, httplib::Response & res) {
 
         // Assign a per-request id so all events for this synth (entry,
         // synthesized/aborted, access log) share a tag.
@@ -534,6 +542,33 @@ int main(int argc, char ** argv) {
             }}};
             res.set_content(err.dump(), "application/json");
             return;
+        }
+
+        // Admission control. Everything above this point is parsing and
+        // validation, which is cheap and should answer even under load; from
+        // here on the request wants the single synthesis slot.
+        struct inflight_guard {
+            std::atomic<int> & n;
+            bool held = false;
+            ~inflight_guard() { if (held) n.fetch_sub(1, std::memory_order_relaxed); }
+        } inflight{synth_inflight};
+
+        if (sp.max_queue > 0) {
+            const int before = synth_inflight.fetch_add(1, std::memory_order_relaxed);
+            inflight.held = true;
+            if (before > sp.max_queue) {
+                log_req_warn(tls_req_id.c_str(),
+                             "busy: %d requests ahead, limit %d - 429",
+                             before, sp.max_queue);
+                res.status = 429;
+                // No estimate is honest here: the queue holds requests of
+                // unknown length. 2 s is roughly one short line, which is the
+                // shortest useful retry.
+                res.set_header("Retry-After", "2");
+                res.set_content(R"({"error":{"message":"server busy: too many requests queued for synthesis","type":"rate_limit_error"}})",
+                                "application/json");
+                return;
+            }
         }
 
         // resolve voice to speaker embedding (and optional ICL data)

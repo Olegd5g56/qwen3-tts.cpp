@@ -18,6 +18,11 @@ struct server_params {
     int         n_threads = 4;
     bool        verbose   = false;
     int         idle_timeout_sec   = 0;  // 0 = disabled (keep model loaded forever)
+    // Requests allowed to wait for the one synthesis slot. Synthesis is
+    // serialized, so without a cap a client that fires faster than the model
+    // can answer just piles up and every reply gets later. 0 = unbounded
+    // (the behaviour before this existed).
+    int         max_queue          = 2;
     float       temperature        = 0.9f;
     int         top_k              = 50;
     float       repetition_penalty = 1.05f;

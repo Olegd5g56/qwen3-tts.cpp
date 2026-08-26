@@ -170,13 +170,18 @@ All flags have matching `TTS_*` env vars (CLI > env > default).
 | `-j, --threads` | `TTS_THREADS` | `4` | compute threads |
 | `--voices-dir` | `TTS_VOICES_DIR` | — | voice library directory |
 | `--idle-timeout` | `TTS_IDLE_TIMEOUT` | `0` | unload model after N idle seconds (0 = off); reloads lazily, voice library survives |
+| `--max-queue` | `TTS_MAX_QUEUE` | `2` | requests allowed to wait for the synthesis slot; beyond that, `429` with `Retry-After` (0 = unbounded) |
 | `-V, --verbose` | `TTS_VERBOSE` | off | per-stage progress + timing logs |
 | `--temperature`, `--top-k`, `--repetition-penalty`, `--seed` | `TTS_*` | `0.9` / `50` / `1.05` / `-1` | sampling defaults |
 
 Notes:
 
 - **One request at a time.** A second request waits for the first (tens of
-  seconds on long text).
+  seconds on long text). One in progress plus `--max-queue` waiting is
+  admitted; past that the server answers `429` with `Retry-After` instead of
+  accepting work it will finish long after the caller has given up. Set
+  `--max-queue 0` for the old unbounded behaviour — do that if your client does
+  not retry, because a refused request is a lost one.
 - `--temperature 0` degenerates on this model. Use a low temperature with a
   fixed `--seed` for repeatable output.
 - The port opens before the voice library is warm. Voices encode on demand, so

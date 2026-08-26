@@ -813,9 +813,10 @@ stages it into a temporary directory as the server's entire library. Nothing
 outside the repo is touched, because a voice library is a working directory that
 gains and loses voices — a benchmark cannot rest on one. It is 8.9 s this model
 generated from `benchmarks/voice/sample.txt`, so the transcript matches the
-audio exactly; `examples/readme_clone_input.wav` must not be used instead, its
-60 s do not match the 8 s transcript beside it and the pair drives generation to
-the token cap (`known-issues.md`).
+audio exactly. That property is the requirement, not a detail: a reference
+paired with a transcript it does not match drives generation to the token cap,
+which is what `examples/readme_clone_input.wav` did before it was deleted
+(`known-issues.md` #23).
 
 Running with no voice at all is not an option either: unreferenced, the model is
 unconstrained, and the same text came out 717 frames one run and 496 the next —

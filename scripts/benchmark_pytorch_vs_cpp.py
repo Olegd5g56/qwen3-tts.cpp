@@ -33,7 +33,10 @@ DOCS_DIR = PROJECT_ROOT / "docs"
 MODELS_DIR = PROJECT_ROOT / "models"
 HF_MODEL_DIR = MODELS_DIR / "Qwen3-TTS-12Hz-0.6B-Base"
 CPP_CLI = PROJECT_ROOT / "build" / "qwen3-tts-cli"
-REF_AUDIO = PROJECT_ROOT / "examples" / "readme_clone_input.wav"
+# The repo's canonical reference pair, the same one bench_speed.sh uses:
+# 8.9 s of speech with a transcript beside it that matches by construction.
+# This script only takes the x-vector from it, so the transcript is unused.
+REF_AUDIO = PROJECT_ROOT / "benchmarks" / "voice" / "sample.mp3"
 
 # Keep benchmark prompts aligned with the known-good quickstart examples.
 BASIC_TEXT = "Hello from qwen3-tts.cpp running on macOS with CoreML by default."

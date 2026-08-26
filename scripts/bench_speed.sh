@@ -96,11 +96,12 @@ command -v curl >/dev/null || die "curl is required"
 #
 # The default voice ships with the repo. It is 8.9 s of speech this model
 # generated itself from benchmarks/voice/sample.txt, so the transcript matches
-# the audio exactly - unlike examples/readme_clone_input.wav, whose 60 s do not
-# match the 8 s transcript beside it and which drives generation to the token
-# cap (known-issues.md). Without any reference at all the model is unconstrained
-# and useless to time: the same text came out 717 frames one run and 496 the
-# next, a 45% spread against ~5% with a voice.
+# the audio exactly. That property is the point: a reference paired with a
+# transcript it does not match drives generation to the token cap, which is how
+# examples/readme_clone_input.wav wasted an afternoon before it was deleted
+# (known-issues.md #23). Without any reference at all the model is
+# unconstrained and useless to time: the same text came out 717 frames one run
+# and 496 the next, a 45% spread against ~5% with a voice.
 ONEVOICE=$(mktemp -d); trap 'rm -rf "$ONEVOICE"' EXIT
 if [ -n "$VOICE" ]; then
     cp -rL "$VOICES_DIR/$VOICE" "$ONEVOICE/$VOICE" || die "cannot copy voice $VOICE"

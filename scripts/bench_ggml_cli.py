@@ -12,8 +12,8 @@ Usage:
         --model /path/to/Qwen3-TTS-12Hz-0.6B-Base-Q8_0.gguf \
         --vocoder /path/to/Qwen3-TTS-Tokenizer-12Hz-F16.gguf \
         --text /storage/neocortex/AI/tts_test/ward.txt \
-        --ref-audio examples/readme_clone_input.wav \
-        --ref-text reference_text.txt \
+        --ref-audio benchmarks/voice/sample.mp3 \
+        --ref-text "$(cat benchmarks/voice/sample.txt)" \
         --language ru --json out.json
 """
 

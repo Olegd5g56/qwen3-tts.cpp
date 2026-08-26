@@ -18,8 +18,8 @@ Usage:
     .venv/bin/python scripts/bench_torch_vs_ggml.py \
         --model models/Qwen3-TTS-12Hz-0.6B-Base \
         --text /storage/neocortex/AI/tts_test/ward.txt \
-        --ref-audio examples/readme_clone_input.wav \
-        --ref-text reference_text.txt \
+        --ref-audio benchmarks/voice/sample.mp3 \
+        --ref-text "$(cat benchmarks/voice/sample.txt)" \
         --language russian --dtype float16 --json out.json
 """
 

@@ -101,6 +101,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
     fprintf(stderr, "       --voices-dir <dir>          persistent voice library dir (default: ./voices)\n");
     fprintf(stderr, "       --idle-timeout <sec>        unload model after N seconds idle, reload on demand (default: 0 = off)\n");
+    fprintf(stderr, "       --max-queue <n>             requests allowed to wait for the synthesis slot; over that, 429 (default: 2, 0 = unbounded)\n");
     fprintf(stderr, "  -V,  --verbose                  print per-stage progress and timing\n");
     fprintf(stderr, "       --temperature <f>           sampling temperature default (default: 0.9)\n");
     fprintf(stderr, "       --top-k <n>                 top-k sampling default (default: 50)\n");
@@ -112,7 +113,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  TTS_MODEL, TTS_VOCODER\n");
     fprintf(stderr, "  TTS_HF_REPO, TTS_HF_FILE, TTS_HF_REPO_V, TTS_HF_FILE_V\n");
     fprintf(stderr, "  TTS_HOST, TTS_PORT, TTS_THREADS, TTS_VERBOSE\n");
-    fprintf(stderr, "  TTS_VOICES_DIR, TTS_IDLE_TIMEOUT\n");
+    fprintf(stderr, "  TTS_VOICES_DIR, TTS_IDLE_TIMEOUT, TTS_MAX_QUEUE\n");
     fprintf(stderr, "  TTS_TEMPERATURE, TTS_TOP_K, TTS_REPETITION_PENALTY, TTS_SEED\n");
 }
 
@@ -169,6 +170,7 @@ bool load_env(server_params & sp) {
     if (!get_int  ("TTS_PORT",               sp.port))               return false;
     if (!get_int  ("TTS_THREADS",            sp.n_threads))          return false;
     if (!get_int  ("TTS_IDLE_TIMEOUT",       sp.idle_timeout_sec))   return false;
+    if (!get_int  ("TTS_MAX_QUEUE",          sp.max_queue))          return false;
     if (!get_float("TTS_TEMPERATURE",        sp.temperature))        return false;
     if (!get_int  ("TTS_TOP_K",              sp.top_k))              return false;
     if (!get_float("TTS_REPETITION_PENALTY", sp.repetition_penalty)) return false;
@@ -246,6 +248,9 @@ bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--idle-timeout") {
             if (++i >= argc) { fprintf(stderr, "error: missing idle-timeout\n"); return false; }
             if (!arg_to_int("--idle-timeout", argv[i], sp.idle_timeout_sec)) return false;
+        } else if (arg == "--max-queue") {
+            if (++i >= argc) { fprintf(stderr, "error: missing max-queue\n"); return false; }
+            if (!arg_to_int("--max-queue", argv[i], sp.max_queue)) return false;
         } else if (arg == "-V" || arg == "--verbose") {
             sp.verbose = true;
         } else if (arg == "-hf" || arg == "--hf-repo") {
