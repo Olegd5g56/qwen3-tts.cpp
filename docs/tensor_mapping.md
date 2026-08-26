@@ -3,6 +3,11 @@
 This document describes the tensor name mapping from HuggingFace format to GGML/GGUF format
 for the Qwen3-TTS model conversion.
 
+To dump every tensor name, shape and dtype from a local HuggingFace checkpoint —
+the raw material this mapping was built from, and the thing to check a new
+checkpoint against — run `scripts/inspect_models.py`. Its output is derived
+data and is deliberately not committed; this file is the maintained summary.
+
 ## Model Architecture Overview
 
 ```

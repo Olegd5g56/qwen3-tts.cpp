@@ -139,22 +139,6 @@ else
 fi
 log ""
 
-log "--- Test 1.4: Decoder ---"
-if [[ -x "./build/test_decoder" ]]; then
-    output=$(timeout 180 ./build/test_decoder --tokenizer models/qwen3-tts-tokenizer-f16.gguf --codes reference/speech_codes.bin --reference reference/decoded_audio.bin 2>&1)
-    rc=$?
-    if [[ $rc -eq 0 ]] && echo "$output" | grep -q "Decoded.*samples"; then
-        samples=$(echo "$output" | grep "PASS: Decoded" | sed 's/.*Decoded \([0-9]*\) samples.*/\1/')
-        pass "Decoder test (produces $samples samples)"
-    else
-        fail "Decoder test (exit code: $rc)"
-        log_output_tail "$output"
-    fi
-else
-    skip "Decoder test (binary not found)"
-fi
-log ""
-
 log "============================================"
 log "SECTION 2: CLI Tests with F16 Model"
 log "============================================"

@@ -270,15 +270,6 @@ target_link_libraries(test_transformer PRIVATE
     Threads::Threads
 )
 
-# Test executable for audio decoder
-add_executable(test_decoder
-    tests/test_decoder.cpp
-)
-target_link_libraries(test_decoder PRIVATE
-    audio_tokenizer_decoder
-    Threads::Threads
-)
-
 # Streaming-vs-oneshot parity test for the audio decoder
 add_executable(test_streaming_parity
     tests/test_streaming_parity.cpp
@@ -350,10 +341,6 @@ add_test(NAME transformer_test
     COMMAND test_transformer
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_test(NAME decoder_test
-    COMMAND test_decoder
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
 add_test(NAME streaming_parity_test
     COMMAND test_streaming_parity
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -365,6 +352,6 @@ add_test(NAME streaming_parity_test
 # still means something. Set QWEN3_TTS_TEST_MODEL / QWEN3_TTS_TEST_VOCODER to
 # local ggufs to run the ones that need only a model.
 set_tests_properties(
-    encoder_test transformer_test decoder_test streaming_parity_test
+    encoder_test transformer_test streaming_parity_test
     PROPERTIES SKIP_RETURN_CODE 77
 )

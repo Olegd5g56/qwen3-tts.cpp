@@ -800,8 +800,6 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   streaming, and a different `max_audio_tokens` default. `top_p` is present but
   deliberately unused (kept for ABI stability, documented at the declaration —
   that part is fine). Either catch it up or mark the target experimental.
-- **`docs/model_inspection.txt`** is a raw metadata dump with no header saying
-  which GGUF it came from or when.
 - **Three ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
   written up and reproducible; #17 (OOM segfault) is a one-line fix with a
   verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops compose into
@@ -870,17 +868,16 @@ codes*, before any generated audio, which is the earliest point it could.
 
 `decode()`, the one-shot path, is called only from `tests/`; production always
 goes through `stream_decode` (chunked decode is mandatory, ~15 MiB/frame). Its
-guard is the same three lines but was not exercised: `test_decoder` cannot run
-here at all, because it needs `reference/speech_codes.bin` and
-`reference/decoded_audio.bin`, which are not in the repository. That gap
-predates this change and is worth its own entry.
+guard is the same three lines. At the time of writing the only test that
+exercised it could not run — see #20, which ends with that test deleted and
+`test_streaming_parity` established as the thing that does exercise `decode()`.
 
 <a id="20"></a>
 ## 20. The decoder tests cannot run — their reference dumps are not in the repo
 
-**Status:** open
+**Status:** fixed 2026-08-26 — the test was deleted, not repaired
 **Found:** 2026-08-25 (while verifying #19)
-**Severity:** process — a whole test binary is dead weight
+**Severity:** process — a whole test binary was dead weight
 
 `tests/test_decoder.cpp` reads `reference/speech_codes.bin` and
 `reference/decoded_audio.bin`. Neither is in the repository, and `reference/`
@@ -893,13 +890,23 @@ who did not generate those dumps themselves. It surfaced while verifying #19:
 the one-shot `decode()` guard could not be exercised, because the only caller
 of that path is a test that cannot start.
 
-**What the fix looks like:** either a script that regenerates the dumps from a
-local model (they are derived data, so they need not be committed), or commit a
-small enough pair to be checked in. The first is better - the dumps depend on
-the vocoder file, and a stale committed dump would be worse than none.
+**Deleted instead of repaired**, with the reasoning worth keeping:
 
-Not urgent: `test_streaming_parity` covers the decoder's production path and
-does run. But it means the one-shot path has no automated cover at all.
+* The path it uniquely covered turns out not to be unique. `test_streaming_parity`
+  generates its own codes, calls the one-shot `decode()` as the reference for the
+  streaming comparison, and needs no dumps — so `decode()` breaking does turn a
+  test red today.
+* What `test_decoder` added beyond that was a golden-audio comparison, and that
+  is the most brittle shape available here. It would have gone red twice in
+  August alone on *correct* changes — the `conv_transpose` rewrite and the
+  prefill split — each time demanding a regenerated reference, which is a test
+  that asks for maintenance without asserting anything.
+* A target that builds, appears in the test list, and has never run for anyone
+  is worse than no target: it reads as coverage.
+
+If absolute correctness cover is ever wanted for the vocoder, the shape that
+has actually caught bugs here is SNR against ggml's own op or against the
+PyTorch pipeline, run as a script — not a committed binary dump.
 
 <a id="21"></a>
 ## 21. 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU
@@ -1014,3 +1021,48 @@ the wrong wav had been paired with it.
 transcript does not match it is not a slightly worse reference, it is a broken
 one, and the failure mode is a request that runs for minutes rather than one
 that sounds off.
+
+<a id="24"></a>
+## 24. Upstream leftovers: a build plan, three manifests, two dead scripts
+
+**Status:** fixed 2026-08-26
+**Found:** 2026-08-26
+**Severity:** process — none of it did harm, all of it read as current
+
+A sweep for material inherited from before this fork, all of it dated at the
+import and none of it referenced by anything still alive:
+
+* **`.sisyphus/`** — the plan an agent wrote to build this project, before the
+  project existed. "Estimated Effort: XL", task checkboxes, a file tree listing
+  `test_decoder.cpp`. Referenced by nothing but two `.gitignore` lines for its
+  own scratch directories, which went with it.
+* **`reference/*.json`** — three manifests describing binary dumps, recorded on
+  `/Users/andyye/dev/qwen3-tts.cpp/` with paths to a `clone.wav` and a model
+  directory nobody here has. The dumps they describe were never committed, and
+  both generator scripts rewrite these files on every run, so the committed
+  copies were stale output from someone else's machine. `reference/` is now
+  gitignored whole.
+* **`scripts/benchmark_pytorch_vs_cpp.py`** — macOS-only (`/usr/bin/time -l`,
+  CoreML, a `build/` path this repo does not use), superseded by the pair
+  `bench_torch_vs_ggml.py` + `bench_ggml_cli.py` that `optimization.md`
+  actually cites.
+* **`scripts/debug_decoder.py`** — a bring-up aid for dumping intermediate
+  decoder tensors, from the era when the decoder was being written.
+* **`docs/model_inspection.txt`** — a 2226-line tensor dump of the 0.6B with no
+  header saying which checkpoint it came from or when, written for a GGUF
+  conversion that finished long ago. `docs/tensor_mapping.md` is the maintained
+  summary of the same knowledge and now points at `scripts/inspect_models.py`,
+  which regenerates the dump in one command against whatever checkpoint is
+  actually on disk.
+* **`scripts/setup_pipeline_models.py`** — a one-shot downloader/converter that
+  wrote into a `models/` layout this repo no longer uses, overlapping the
+  README's two documented paths (`--hf-repo` auto-download, or
+  `scripts/convert_tts_to_gguf.py`).
+
+**One near-miss worth recording.** `scripts/debug_speaker_encoder.py` looked
+identically dead — nothing in any `.md`, `.sh` or `.py` mentions it. It is
+called out from `tests/test_encoder.cpp:318`, which tells the reader to run it
+to produce `reference/debug/audio_resampled.bin`. It was deleted and restored.
+**When deciding whether a script is dead, grep the C++ too**; a `git grep` over
+the whole tree is the cheap version of this and would have caught it first
+time.
