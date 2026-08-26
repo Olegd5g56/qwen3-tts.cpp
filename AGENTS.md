@@ -52,6 +52,8 @@ qwen3-tts.cpp/
   voices/                       # Default --voices-dir, per-id sample.{wav,mp3,txt}
                                 # + cache.bin (encoded embedding + ref codes)
   docs/                         # Design notes (streaming, optimization, tensors)
+                                # + architecture.md: the pipeline end to end,
+                                #   read this first
                                 # + known-issues.md: running bug log, append to it
                                 # + quantisation.md: which weight type works, and why
                                 # + ggml-notes.md: upstream ggml bugs/gaps
