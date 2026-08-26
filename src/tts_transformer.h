@@ -374,7 +374,66 @@ private:
                              const int32_t * ref_text_tokens = nullptr,
                              int32_t n_ref_text_tokens = 0,
                              const int32_t * ref_codes = nullptr,
-                             int32_t n_ref_frames = 0);
+                             int32_t n_ref_frames = 0,
+                             int32_t * reusable_prefix_len = nullptr);
+
+    // ── Per-voice prefill reuse ──────────────────────────────────────
+    //
+    // Two parts of an ICL prefill depend on the voice alone and are rebuilt
+    // from scratch on every request otherwise:
+    //
+    //   * the reference block the prompt feeds the model - one summed row per
+    //     reference frame over all 16 codebooks, plus the reference
+    //     transcript's projection. Pure host-side assembly, and the codebook
+    //     sums cost one device read per codebook per frame.
+    //   * the KV of the prompt's head: instructions, role tokens, the codec
+    //     overlay and the reference transcript.
+    //
+    // What is deliberately NOT in the second cache: the reference frames.
+    // They sit at the *end* of the prompt, after the line being spoken (see
+    // build_prefill_graph), so every layer above the first mixes the target
+    // text into their K and V. Their KV is different for every request and
+    // reusing it would be wrong, not merely stale. Only the head - everything
+    // up to and including the reference transcript - is position- and
+    // content-stable, which is 46 of 171 tokens on the benchmark voice.
+    //
+    // Both caches are capped and evicted least-recently-used: a library of
+    // 198 voices must not be able to pin a gigabyte. QWEN3_TTS_PREFIX_CACHE
+    // sets the cap in voices; 0 disables both.
+    struct voice_prefix_entry {
+        uint64_t             key = 0;
+        std::vector<int32_t> ref_codes;      // re-checked on hit, not just hashed
+        std::vector<int32_t> ref_text;       //   "
+        std::vector<float>   codec_section;  // (1 + n_ref_frames) * hidden_size
+        std::vector<float>   ref_text_proj;  // n_ref_text * hidden_size
+    };
+
+    struct prefix_kv_entry {
+        uint64_t             key = 0;
+        int32_t              n_tokens = 0;
+        std::vector<float>   embd;           // re-checked on hit, not just hashed
+        std::vector<uint8_t> k;              // n_layers * n_tokens * row bytes
+        std::vector<uint8_t> v;
+    };
+
+    // Cap in voices, read once from QWEN3_TTS_PREFIX_CACHE.
+    int32_t prefix_cache_cap() const;
+
+    // Both return nullptr when the cache is disabled or the entry is absent.
+    voice_prefix_entry * voice_prefix_find(uint64_t key,
+                                           const int32_t * ref_codes, size_t n_ref_codes,
+                                           const int32_t * ref_text,  size_t n_ref_text);
+    voice_prefix_entry * voice_prefix_insert(voice_prefix_entry entry);
+
+    // Snapshot / restore KV rows [0, n_tokens) of the talker cache. The token
+    // index is the cache tensors' slowest axis, so a prefix is one contiguous
+    // byte range per layer and survives a change of n_ctx untouched.
+    bool prefix_kv_save(uint64_t key, const float * embd, int32_t n_tokens);
+    bool prefix_kv_load(uint64_t key, const float * embd, int32_t n_tokens);
+
+    std::vector<voice_prefix_entry> voice_prefix_cache_;  // front = most recent
+    std::vector<prefix_kv_entry>    prefix_kv_cache_;     // front = most recent
+    mutable int32_t                 prefix_cache_cap_ = -1;
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 

@@ -386,6 +386,105 @@ the frontend should lower `conv_transpose_1d` to `mul_mat` + `col2im_1d` where
 a backend has no good kernel. Hold it with the other two ggml findings — see
 `ggml-notes.md`.
 
+## Per-voice prefill reuse
+
+The idea was "cache the voice's KV and stop re-deriving the reference on every
+request". What it is actually worth turns entirely on **where the reference
+sits in the prompt**, and that had never been checked. The layout, logged by
+`build_prefill_graph` (1.7B, the benchmark voice, a 73-character line):
+
+```
+ICL layout: prefix=9 ref_text=37 new_text=27 eos=1 codec_bos=1 ref_frames=112 total=187
+```
+
+Read it in order: role tokens and codec overlay, the **reference transcript**,
+the **line being spoken**, then the **112 reference frames**. The frames are
+last. Attention is causal, so from the second layer up their K and V mix in the
+target text — a different text every request. **The 112 frames, 60% of the
+prompt and the whole reason the idea looked big, are not reusable at all.**
+
+What is reusable is the head: `prefix + ref_text`, **46 of 187 tokens**. That
+is what shipped, together with a second cache that has nothing to do with KV.
+
+### The two caches
+
+**The reference block** (`voice_prefix_entry`). Assembling the prompt's
+reference section sums 16 codebook rows per frame — 1792 single-row device
+reads for a 112-frame voice — and projects the reference transcript. Both
+depend on the voice alone. Cached whole.
+
+**The prompt head's KV** (`prefix_kv_entry`). The talker's K/V tensors are
+`[head_dim, n_kv_heads, n_ctx]` with the token index on the slowest axis, so a
+prefix is one contiguous byte range per layer and survives a change of `n_ctx`
+untouched — snapshot with one `tensor_get` per layer, restore with one
+`tensor_set`.
+
+Both are capped in voices by `QWEN3_TTS_PREFIX_CACHE` (default 8) and evicted
+least-recently-used, ~7 MB of host memory per voice on the 1.7B.
+
+### Measured
+
+Fixed seed, so the request is bit-identical run to run and the only variance
+left is timing noise. Medians, 1.7B Q8_0, warm server, the benchmark voice;
+`bench_ru_short.txt` (73 chars) and `bench_ru.txt` (570 chars):
+
+| | | prefill before | prefill after | decode loop before | after |
+|---|---|---|---|---|---|
+| CUDA 1660S | short | 310 ms | **247 ms** | 26.76 ms/frame | 26.79 |
+| CUDA 1660S | long  | 617 ms | **533 ms** | 29.23 ms/frame | 29.48 |
+| ROCm 6800XT | short | 81 ms | **30 ms** | 19.95 ms/frame | 19.73 |
+| ROCm 6800XT | long  | 112 ms | **60 ms** | 20.11 ms/frame | 20.05 |
+
+The decode-loop column is the control: generation is untouched and does not
+move. **Whole-request wall time cannot resolve this change** and is not quoted
+here — a changed last bit sends the sampler down a different path, so before
+and after generate a different number of frames (503 vs 533 on the long line)
+and the totals are not comparable. That is the same trap as *Measurement notes*
+below.
+
+The split of the saving differs by card, which is the interesting part:
+
+| | build (reference block) | forward (KV) |
+|---|---|---|
+| CUDA 1660S | 24 → 1 ms | 288 → 245 ms |
+| ROCm 6800XT | 47 → 1 ms | 38 → 33 ms |
+
+On the 6800 XT prefill *forward* is only 38 ms, and the 1792 device reads cost
+more than the entire transformer pass. The cache that matters there is the
+cheap one. On the 1660 SUPER the two contribute about equally.
+
+In request terms: **a fixed ~65 ms off a short line and ~85 ms off a long one**
+on CUDA, ~50 ms on ROCm. On a one-sentence request that is 3-11% depending on
+how short the sentence is; on a 42-second paragraph it is 0.5%. The original
+16% was never there.
+
+### Why the prefill is split even on a cache miss
+
+The head is prefilled as its own chunk whether or not it was cached. A head
+computed in a batch of 46 and the same head computed inside a batch of 187 are
+the same mathematics but not the same last bits, and without the split the
+first request for a voice would sound different from every request after it.
+With it, **hit and miss are byte-identical** — verified by md5 of the returned
+WAV. The cost is one extra graph launch on the first request per voice
+(forward 305 → 343 ms, once).
+
+The reference transcript is projected on its own for the same reason: batched
+together with the line, its rows would shift with the line's length and the KV
+cache would miss on bytes that are mathematically identical.
+
+### Correctness
+
+Everything below is byte-exact comparison of the returned WAV, fixed seed:
+
+* cache on == cache off (`QWEN3_TTS_PREFIX_CACHE=0`), short and long.
+* first request for a voice (miss) == every request after it (hit).
+* Three voices built to be adversarial — same audio with a different
+  transcript, and the same transcript with different audio — interleaved
+  `a,b,c,a,b,c,c,a` on one server, each matching the output of a server that
+  only ever saw that one voice. Repeated with `QWEN3_TTS_PREFIX_CACHE=1`, so
+  every voice switch evicts.
+* The non-ICL path (no reference at all) does not use either cache.
+
 ## Remaining ideas (descending value)
 
 1. **`CONV_TRANSPOSE_1D` — done.** Rewritten as `mul_mat` + `col2im_1d`; decode
@@ -407,23 +506,15 @@ a backend has no good kernel. Hold it with the other two ggml findings — see
    pipeline overlapped two different pieces of hardware; now both stages want
    the same GPU and it recovers only part of the decode (CUDA 20 493 → 18 977
    ms, ROCm 13 715 → 11 846). Still worth keeping on, no longer a big lever.
-4. **Cache the reference prefix's KV per voice.** Prefill is 793 ms on the 1.7B
-   and is dominated by the 150 ICL reference frames — **and it is recomputed on
-   every request**, though for a fixed voice that prefix is byte-identical every
-   time. The server log shows the bill directly:
-   `ok 5.20s audio ... (prefill=401ms gen=2111ms decode=328ms)` — **16% of that
-   request spent re-deriving something that never changes.** The share grows as
-   the line gets shorter, and short lines are most of what a TTS server does.
-
-   This is ordinary prefix-KV reuse from LLM serving, and it fits: the voice is
-   already a cached object on disk (`VoiceStore`), so the KV joins the embedding
-   and the ref codes.
-
-   **Design it with the cost in mind from the start.** The KV for 150 frames is
-   held per cached voice; one or two voices is nothing, 198 is not. It wants an
-   explicit cap with LRU eviction, decided up front rather than bolted on. The
-   existing shortening advice — pick a shorter reference — treats the symptom;
-   pick a reference for prosody and cache its KV instead.
+4. **Per-voice prefill reuse — done, and three times smaller than this entry
+   used to claim.** The old text said prefill was "dominated by the 150 ICL
+   reference frames — and it is recomputed on every request, though for a fixed
+   voice that prefix is byte-identical every time", and priced that at 16% of a
+   request. **The premise was wrong.** The reference frames are byte-identical
+   as *input embeddings*, but they sit at the **end** of the prompt, after the
+   line being spoken, so their KV is different for every request and can never
+   be reused. Only the head is reusable. See *Per-voice prefill reuse* below for
+   what that is worth and what shipped.
 5. **The streaming vocoder's host round-trip — mostly bounded, never timed
    directly.** `stream_decode` pulls the conv tails and KV device→host after
    every chunk and pushes them back before the next, a fixed cost per chunk.

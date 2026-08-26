@@ -89,6 +89,13 @@ void TTSTransformer::unload_model() {
     state_.compute_meta.clear();
     last_hidden_.clear();
     embd_row_fp16_scratch_.clear();
+
+    // Both caches hold bytes shaped by this model's hidden size and KV
+    // geometry. A different model must not inherit them.
+    voice_prefix_cache_.clear();
+    voice_prefix_cache_.shrink_to_fit();
+    prefix_kv_cache_.clear();
+    prefix_kv_cache_.shrink_to_fit();
 }
 
 bool TTSTransformer::load_model(const std::string & model_path) {
@@ -1165,6 +1172,144 @@ bool TTSTransformer::project_text_tokens(const int32_t * text_tokens, int32_t n_
     return true;
 }
 
+// FNV-1a over 64-bit words. Used only to find a cache candidate; every hit is
+// confirmed by comparing the bytes themselves, so a collision costs a memcmp,
+// never a wrong voice.
+static uint64_t hash_bytes(const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+int32_t TTSTransformer::prefix_cache_cap() const {
+    if (prefix_cache_cap_ >= 0) {
+        return prefix_cache_cap_;
+    }
+    // Eight voices is a few tens of megabytes of host memory on the 1.7B and
+    // covers the "a handful of narrators" case the server is actually used
+    // for. The whole library is deliberately not the default.
+    int32_t cap = 8;
+    if (const char * env = std::getenv("QWEN3_TTS_PREFIX_CACHE")) {
+        cap = (int32_t) strtol(env, nullptr, 10);
+        if (cap < 0) cap = 0;
+    }
+    prefix_cache_cap_ = cap;
+    return cap;
+}
+
+TTSTransformer::voice_prefix_entry * TTSTransformer::voice_prefix_find(
+        uint64_t key,
+        const int32_t * ref_codes, size_t n_ref_codes,
+        const int32_t * ref_text,  size_t n_ref_text) {
+    if (prefix_cache_cap() <= 0) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < voice_prefix_cache_.size(); ++i) {
+        voice_prefix_entry & e = voice_prefix_cache_[i];
+        if (e.key != key) continue;
+        if (e.ref_codes.size() != n_ref_codes || e.ref_text.size() != n_ref_text) continue;
+        if (n_ref_codes && memcmp(e.ref_codes.data(), ref_codes, n_ref_codes * sizeof(int32_t)) != 0) continue;
+        if (n_ref_text  && memcmp(e.ref_text.data(),  ref_text,  n_ref_text  * sizeof(int32_t)) != 0) continue;
+        if (i != 0) {
+            std::rotate(voice_prefix_cache_.begin(), voice_prefix_cache_.begin() + i,
+                        voice_prefix_cache_.begin() + i + 1);
+        }
+        return &voice_prefix_cache_[0];
+    }
+    return nullptr;
+}
+
+TTSTransformer::voice_prefix_entry * TTSTransformer::voice_prefix_insert(voice_prefix_entry entry) {
+    const int32_t cap = prefix_cache_cap();
+    if (cap <= 0) {
+        return nullptr;
+    }
+    voice_prefix_cache_.insert(voice_prefix_cache_.begin(), std::move(entry));
+    if ((int32_t) voice_prefix_cache_.size() > cap) {
+        voice_prefix_cache_.resize(cap);
+    }
+    return &voice_prefix_cache_[0];
+}
+
+bool TTSTransformer::prefix_kv_save(uint64_t key, const float * embd, int32_t n_tokens) {
+    const int32_t cap = prefix_cache_cap();
+    if (cap <= 0 || n_tokens <= 0) {
+        return false;
+    }
+    const auto & kv = state_.cache;
+    if (kv.k_cache.empty() || n_tokens > kv.n_ctx) {
+        return false;
+    }
+
+    const size_t row   = kv.k_cache[0]->nb[2];   // bytes per token, per layer
+    const size_t bytes = row * (size_t) n_tokens;
+    const size_t n_layers = kv.k_cache.size();
+
+    prefix_kv_entry e;
+    e.key      = key;
+    e.n_tokens = n_tokens;
+    e.embd.assign(embd, embd + (size_t) n_tokens * model_.config.hidden_size);
+    e.k.resize(bytes * n_layers);
+    e.v.resize(bytes * n_layers);
+
+    for (size_t il = 0; il < n_layers; ++il) {
+        ggml_backend_tensor_get(kv.k_cache[il], e.k.data() + il * bytes, 0, bytes);
+        ggml_backend_tensor_get(kv.v_cache[il], e.v.data() + il * bytes, 0, bytes);
+    }
+
+    prefix_kv_cache_.insert(prefix_kv_cache_.begin(), std::move(e));
+    if ((int32_t) prefix_kv_cache_.size() > cap) {
+        prefix_kv_cache_.resize(cap);
+    }
+    return true;
+}
+
+bool TTSTransformer::prefix_kv_load(uint64_t key, const float * embd, int32_t n_tokens) {
+    if (prefix_cache_cap() <= 0 || n_tokens <= 0) {
+        return false;
+    }
+    const auto & kv = state_.cache;
+    if (kv.k_cache.empty() || n_tokens > kv.n_ctx) {
+        return false;
+    }
+
+    const size_t row      = kv.k_cache[0]->nb[2];
+    const size_t bytes    = row * (size_t) n_tokens;
+    const size_t n_layers = kv.k_cache.size();
+    const size_t n_embd   = (size_t) n_tokens * model_.config.hidden_size;
+
+    for (size_t i = 0; i < prefix_kv_cache_.size(); ++i) {
+        prefix_kv_entry & e = prefix_kv_cache_[i];
+        if (e.key != key || e.n_tokens != n_tokens) continue;
+        if (e.embd.size() != n_embd) continue;
+        if (memcmp(e.embd.data(), embd, n_embd * sizeof(float)) != 0) continue;
+        // A cache built under a different model or head geometry cannot be
+        // reinterpreted; sizes are the only thing that could still match.
+        if (e.k.size() != bytes * n_layers || e.v.size() != bytes * n_layers) continue;
+
+        for (size_t il = 0; il < n_layers; ++il) {
+            ggml_backend_tensor_set(kv.k_cache[il], e.k.data() + il * bytes, 0, bytes);
+            ggml_backend_tensor_set(kv.v_cache[il], e.v.data() + il * bytes, 0, bytes);
+        }
+        if (i != 0) {
+            std::rotate(prefix_kv_cache_.begin(), prefix_kv_cache_.begin() + i,
+                        prefix_kv_cache_.begin() + i + 1);
+        }
+        return true;
+    }
+    return false;
+}
+
 bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
                                          const float * speaker_embd, int32_t language_id,
                                          std::vector<float> & prefill_embd,
@@ -1175,7 +1320,11 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                                          const int32_t * ref_text_tokens,
                                          int32_t n_ref_text_tokens,
                                          const int32_t * ref_codes,
-                                         int32_t n_ref_frames) {
+                                         int32_t n_ref_frames,
+                                         int32_t * reusable_prefix_len) {
+    if (reusable_prefix_len) {
+        *reusable_prefix_len = 0;
+    }
     if (!text_tokens) {
         error_msg_ = "text_tokens is null";
         return false;
@@ -1302,29 +1451,51 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         // ICL text section: ref_text + new_text projected, overlaid with codec_pad_embed
         // ICL codec section: codec_bos + ref_code embeddings, overlaid with tts_pad_embed
         // trailing: just tts_pad_embed (1 token)
+        //
+        // Note the order: the reference *codes* come last, after the line
+        // being spoken. Everything up to and including ref_text is the same
+        // bytes for every request with this voice; nothing after it is.
 
         // extract new text content tokens (skip 3 role tokens, skip 5 suffix tokens)
         const int32_t new_text_content_count = std::max(0, n_tokens - 8);
         const int32_t * new_text_content = text_tokens + 3;
 
-        // project ref_text + new_text together
-        std::vector<int32_t> combined_text(n_ref_text_tokens + new_text_content_count);
-        if (n_ref_text_tokens > 0) {
-            memcpy(combined_text.data(), ref_text_tokens, n_ref_text_tokens * sizeof(int32_t));
-        }
-        if (new_text_content_count > 0) {
-            memcpy(combined_text.data() + n_ref_text_tokens, new_text_content,
-                   new_text_content_count * sizeof(int32_t));
-        }
+        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
+        const size_t n_ref_codes  = (size_t) n_ref_frames * cfg.n_codebooks;
 
-        std::vector<float> text_proj;
-        if (!combined_text.empty()) {
-            if (!project_text_tokens(combined_text.data(), (int32_t)combined_text.size(), text_proj)) {
+        uint64_t voice_key = hash_bytes(ref_codes, n_ref_codes * sizeof(int32_t));
+        voice_key ^= hash_bytes(ref_text_tokens, (size_t) n_ref_text_tokens * sizeof(int32_t))
+                     * 0x9e3779b97f4a7c15ull;
+
+        voice_prefix_entry * cached = skip_ref_codes
+            ? nullptr
+            : voice_prefix_find(voice_key, ref_codes, n_ref_codes,
+                                ref_text_tokens, (size_t) n_ref_text_tokens);
+
+        // The reference transcript is projected on its own, not batched with
+        // the line being spoken. Two reasons: it is identical every request so
+        // it can be cached, and a projection whose batch size changes with the
+        // line is not bit-stable, which would make the KV cache miss every
+        // time on bytes that are mathematically the same.
+        std::vector<float> ref_text_proj_own;
+        const std::vector<float> * ref_text_proj = &ref_text_proj_own;
+        if (cached) {
+            ref_text_proj = &cached->ref_text_proj;
+        } else if (n_ref_text_tokens > 0) {
+            if (!project_text_tokens(ref_text_tokens, n_ref_text_tokens, ref_text_proj_own)) {
                 return false;
             }
         }
 
-        const int32_t text_len = (int32_t)combined_text.size() + 1; // +1 for tts_eos
+        std::vector<float> new_text_proj;
+        if (new_text_content_count > 0) {
+            if (!project_text_tokens(new_text_content, new_text_content_count, new_text_proj)) {
+                return false;
+            }
+        }
+
+        const int32_t combined_count = n_ref_text_tokens + new_text_content_count;
+        const int32_t text_len = combined_count + 1; // +1 for tts_eos
         std::vector<float> icl_text_section((size_t)text_len * hidden_size);
 
         // text tokens overlaid with codec_pad_embed
@@ -1339,9 +1510,11 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
             memcpy(codec_pad_embed.data(), tmp.data(), hidden_size * sizeof(float));
         }
 
-        for (int32_t t = 0; t < (int32_t)combined_text.size(); ++t) {
+        for (int32_t t = 0; t < combined_count; ++t) {
             float * dst = icl_text_section.data() + (size_t)t * hidden_size;
-            const float * text_row = text_proj.data() + (size_t)t * hidden_size;
+            const float * text_row = (t < n_ref_text_tokens)
+                ? ref_text_proj->data() + (size_t)t * hidden_size
+                : new_text_proj.data() + (size_t)(t - n_ref_text_tokens) * hidden_size;
             for (int32_t h = 0; h < hidden_size; ++h) {
                 dst[h] = text_row[h] + codec_pad_embed[h];
             }
@@ -1357,55 +1530,64 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         // embed ref_codes: for each frame, sum codebook embeddings across all codebooks
         // codebook 0: model_.codec_embd
         // codebooks 1-15: model_.code_pred_embd[cb-1]
+        //
+        // n_ref_frames * n_codebooks single-row device reads - 1792 of them
+        // for a 112-frame reference - and the answer only depends on the
+        // voice, so it is cached whole.
         const int32_t codec_section_len = 1 + n_ref_frames; // codec_bos + ref_codes
-        std::vector<float> icl_codec_section((size_t)codec_section_len * hidden_size, 0.0f);
+        std::vector<float> icl_codec_section_own;
+        const std::vector<float> * icl_codec_section = &icl_codec_section_own;
 
-        // codec_bos overlaid with tts_pad
-        {
-            int32_t bos_tok = cfg.codec_bos_id;
-            std::vector<float> bos_emb;
-            if (!lookup_embedding_rows(model_.codec_embd, &bos_tok, 1,
-                                       "inp_icl_codec_bos", "icl_codec_bos_emb", bos_emb)) {
-                return false;
-            }
-            float * dst = icl_codec_section.data();
-            for (int32_t h = 0; h < hidden_size; ++h) {
-                dst[h] = bos_emb[h] + tts_pad_embed[h];
-            }
-        }
+        if (cached) {
+            icl_codec_section = &cached->codec_section;
+        } else {
+            icl_codec_section_own.assign((size_t)codec_section_len * hidden_size, 0.0f);
 
-        // ref_code embeddings: sum across codebooks, overlay with tts_pad
-        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
-        std::vector<float> embd_row(hidden_size);
-        for (int32_t f = 0; f < n_ref_frames; ++f) {
-            if (skip_ref_codes) {
-                float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
-                for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
-                continue;
-            }
-            float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
-
-            // sum codebook embeddings for this frame
-            for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
-                int32_t code = ref_codes[f * cfg.n_codebooks + cb];
-                if (cb == 0) {
-                    if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
-                        return false;
-                    }
-                } else {
-                    if ((int)model_.code_pred_embd.size() < cb) continue;
-                    if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
-                        return false;
-                    }
+            // codec_bos overlaid with tts_pad
+            {
+                int32_t bos_tok = cfg.codec_bos_id;
+                std::vector<float> bos_emb;
+                if (!lookup_embedding_rows(model_.codec_embd, &bos_tok, 1,
+                                           "inp_icl_codec_bos", "icl_codec_bos_emb", bos_emb)) {
+                    return false;
                 }
+                float * dst = icl_codec_section_own.data();
                 for (int32_t h = 0; h < hidden_size; ++h) {
-                    dst[h] += embd_row[h];
+                    dst[h] = bos_emb[h] + tts_pad_embed[h];
                 }
             }
 
-            // overlay with tts_pad_embed
-            for (int32_t h = 0; h < hidden_size; ++h) {
-                dst[h] += tts_pad_embed[h];
+            // ref_code embeddings: sum across codebooks, overlay with tts_pad
+            std::vector<float> embd_row(hidden_size);
+            for (int32_t f = 0; f < n_ref_frames; ++f) {
+                float * dst = icl_codec_section_own.data() + (size_t)(1 + f) * hidden_size;
+                if (skip_ref_codes) {
+                    for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
+                    continue;
+                }
+
+                // sum codebook embeddings for this frame
+                for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                    int32_t code = ref_codes[f * cfg.n_codebooks + cb];
+                    if (cb == 0) {
+                        if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
+                            return false;
+                        }
+                    } else {
+                        if ((int)model_.code_pred_embd.size() < cb) continue;
+                        if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
+                            return false;
+                        }
+                    }
+                    for (int32_t h = 0; h < hidden_size; ++h) {
+                        dst[h] += embd_row[h];
+                    }
+                }
+
+                // overlay with tts_pad_embed
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    dst[h] += tts_pad_embed[h];
+                }
             }
         }
 
@@ -1425,7 +1607,29 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         memcpy(prefill_embd.data() + (size_t)prefix_len * hidden_size,
                icl_text_section.data(), icl_text_section.size() * sizeof(float));
         memcpy(prefill_embd.data() + (size_t)(prefix_len + text_len) * hidden_size,
-               icl_codec_section.data(), icl_codec_section.size() * sizeof(float));
+               icl_codec_section->data(), icl_codec_section->size() * sizeof(float));
+
+        // Everything up to and including the reference transcript is a
+        // function of the voice alone: its KV can be reused across requests.
+        if (reusable_prefix_len && !skip_ref_codes) {
+            *reusable_prefix_len = prefix_len + n_ref_text_tokens;
+        }
+
+        if (!cached && !skip_ref_codes) {
+            voice_prefix_entry e;
+            e.key = voice_key;
+            e.ref_codes.assign(ref_codes, ref_codes + n_ref_codes);
+            e.ref_text.assign(ref_text_tokens, ref_text_tokens + n_ref_text_tokens);
+            e.codec_section = std::move(icl_codec_section_own);
+            e.ref_text_proj = std::move(ref_text_proj_own);
+            voice_prefix_insert(std::move(e));
+        }
+
+        if (verbose_) {
+            log_info("ICL layout: prefix=%d ref_text=%d new_text=%d eos=1 codec_bos=1 ref_frames=%d total=%d (voice cache %s)",
+                     prefix_len, n_ref_text_tokens, new_text_content_count, n_ref_frames, prefill_len,
+                     cached ? "hit" : "miss");
+        }
 
         // in ICL mode, trailing is just tts_pad_embed (all text already in prefill)
         trailing_text_hidden.resize(hidden_size);
@@ -3082,11 +3286,12 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int64_t t_gen_start_ms = verbose_now_ms();
     int64_t t_prefill_end_ms = t_gen_start_ms;
     int64_t t_prefill_build_start = verbose_ ? verbose_now_ms() : 0;
+    int32_t reusable_prefix = 0;
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
                              instruct_tokens, n_instruct_tokens,
                              ref_text_tokens, n_ref_text_tokens,
-                             ref_codes, n_ref_frames)) {
+                             ref_codes, n_ref_frames, &reusable_prefix)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -3116,16 +3321,41 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> hidden_out;
     std::vector<float> logits;
 
+    // The head of the prompt is prefilled as its own chunk whenever one is
+    // reusable - on a cache miss too, not only on a hit. The split has to
+    // happen either way: a head computed in a batch of 46 and the same head
+    // computed inside a batch of 171 are the same mathematics but not the same
+    // last bits, and the first request for a voice must not sound different
+    // from the ones after it. The extra graph launch costs about a
+    // millisecond.
+    int32_t prefix_n = (reusable_prefix > 0 && reusable_prefix < prefill_len)
+                     ? reusable_prefix : 0;
+    uint64_t prefix_key = 0;
+    bool     prefix_hit = false;
+    if (prefix_n > 0) {
+        prefix_key = hash_bytes(prefill_embd.data(),
+                                (size_t) prefix_n * cfg.hidden_size * sizeof(float));
+        prefix_hit = prefix_kv_load(prefix_key, prefill_embd.data(), prefix_n);
+    }
+
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
     int64_t t_prefill_fwd_start = verbose_ ? verbose_now_ms() : 0;
-    if (!forward_prefill(prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
+    if (prefix_n > 0 && !prefix_hit) {
+        if (!forward_prefill(prefill_embd.data(), prefix_n, 0, hidden_out, nullptr)) {
+            return false;
+        }
+        prefix_kv_save(prefix_key, prefill_embd.data(), prefix_n);
+    }
+    if (!forward_prefill(prefill_embd.data() + (size_t) prefix_n * cfg.hidden_size,
+                         prefill_len - prefix_n, prefix_n, hidden_out, &logits)) {
         return false;
     }
     if (verbose_) {
-        log_info("prefill forward: %lld ms",
-                 (long long)(verbose_now_ms() - t_prefill_fwd_start));
+        log_info("prefill forward: %lld ms (%d of %d tokens from cache)",
+                 (long long)(verbose_now_ms() - t_prefill_fwd_start),
+                 prefix_hit ? prefix_n : 0, prefill_len);
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();

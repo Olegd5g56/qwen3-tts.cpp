@@ -180,8 +180,17 @@ This structure must mirror the Python pipeline exactly. Verified against
 Two variations it does not show: with `language_id < 0` the codec prefill is
 `[nothink, think_bos, think_eos]` instead of `[think, think_bos, language,
 think_eos]`, one position shorter; and ICL mode assembles a different prompt
-entirely (reference text and codes interleaved — see the comment on
-`icl_mode`).
+entirely:
+
+```
+[instructions?] [role x3] [codec overlay] [ref_text] [target text] [tts_eos] [codec_bos] [ref_codes]
+```
+
+The reference **codes come last, after the target text** — not interleaved with
+it. That ordering is load-bearing: everything up to the end of `ref_text` is the
+same bytes for every request with a given voice and its KV is cached across
+requests, while the reference codes see the target text through causal attention
+and must be recomputed. See `docs/optimization.md`, *Per-voice prefill reuse*.
 
 ### Special Token IDs
 

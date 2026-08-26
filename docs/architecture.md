@@ -101,10 +101,14 @@ The prefill embedding is a fixed structure (10 positions for the thinking path,
 one shorter without a language id, different again for ICL). The exact layout
 is in `AGENTS.md`; it must mirror the Python pipeline position for position.
 
-**ICL prefill is the expensive one.** With a reference voice, the reference
-codes are prefilled ahead of the text — 150 frames is typical — and this is
-**recomputed on every request** even though the prefix is byte-identical for a
-fixed voice. See `optimization.md`, remaining idea 4.
+**ICL prefill is the expensive one.** With a reference voice the prompt runs
+`[role + codec overlay, reference transcript, the line to speak, the reference
+codes]` — note the order: the reference **codes come last**, 112 frames for the
+benchmark voice, after the text. That ordering decides what can be reused. The
+head (role + transcript) is the same bytes for every request with that voice
+and its KV is cached; the reference codes are behind the target text in a causal
+stack, so their KV is different every request and is rebuilt every time. See
+`optimization.md`, *Per-voice prefill reuse*.
 
 Generation ends on `tts_eos`, on the per-request frame budget, or on abort.
 
@@ -219,10 +223,11 @@ doubles the weight bytes and the 1.7B then does not fit in 6 GB
 | loaded weights | one backend buffer per component | process lifetime, minus the idle watchdog |
 | talker KV | `tts_transformer` | one request |
 | `pre_tfm` KV, conv tails, transpose overlaps | `audio_tokenizer_decoder` | one request, across its chunks |
-| **ICL reference prefix KV** | *nowhere* | **recomputed every request** |
+| ICL prompt-head KV + reference block | `tts_transformer`, capped in voices by `QWEN3_TTS_PREFIX_CACHE` | across requests, LRU; dropped on model unload |
+| ICL reference codes' KV | *nowhere* | recomputed every request, and necessarily so |
 
-That last row is the one open architectural gap. Everything else about a voice
-is already cached; its prefix KV is not.
+The last row is not a gap. Those rows sit behind the target text in a causal
+stack, so their KV genuinely differs per request.
 
 ---
 
