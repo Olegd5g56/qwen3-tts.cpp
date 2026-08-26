@@ -22,6 +22,17 @@
 #   * One voice in the voices directory. The server preloads the whole library
 #     in the background and 198 voices compete with what is being measured.
 #
+# Two things this cannot do, learned the hard way:
+#
+#   * It cannot resolve a change worth less than ~100 ms. The seed is random,
+#     so every run draws a different number of frames; a 73-character line
+#     scattered 1.81-2.81 s across five runs of identical code. For a change
+#     that only moves prefill, measure prefill directly with a fixed seed -
+#     see optimization.md, "Per-voice prefill reuse".
+#   * The commit it records goes "-dirty" as soon as the first row is appended,
+#     because that dirties this history file. A run of several rows will show
+#     the first clean and the rest dirty on the same code.
+#
 # Usage:
 #   scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" [options]
 #

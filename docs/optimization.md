@@ -425,22 +425,28 @@ least-recently-used, ~7 MB of host memory per voice on the 1.7B.
 ### Measured
 
 Fixed seed, so the request is bit-identical run to run and the only variance
-left is timing noise. Medians, 1.7B Q8_0, warm server, the benchmark voice;
-`bench_ru_short.txt` (73 chars) and `bench_ru.txt` (570 chars):
+left is timing noise. Medians of 10 (short) and 5 (long), 1.7B Q8_0, warm
+server, the benchmark voice. Three line lengths: a 26-character clause, then
+`bench_ru_short.txt` (73 chars) and `bench_ru.txt` (570 chars).
 
-| | | prefill before | prefill after | decode loop before | after |
+| | line | prefill before | prefill after | decode loop before | after |
 |---|---|---|---|---|---|
-| CUDA 1660S | short | 310 ms | **247 ms** | 26.76 ms/frame | 26.79 |
-| CUDA 1660S | long  | 617 ms | **533 ms** | 29.23 ms/frame | 29.48 |
-| ROCm 6800XT | short | 81 ms | **30 ms** | 19.95 ms/frame | 19.73 |
-| ROCm 6800XT | long  | 112 ms | **60 ms** | 20.11 ms/frame | 20.05 |
+| CUDA 1660S | 26 ch | 310 ms | **201 ms** | 25.90 ms/frame | 26.04 |
+| CUDA 1660S | 73 ch | 310 ms | **249 ms** | 27.16 ms/frame | 27.04 |
+| CUDA 1660S | 570 ch | 617 ms | **533 ms** | 29.23 ms/frame | 29.48 |
+| ROCm 6800XT | 73 ch | 81 ms | **30 ms** | 19.95 ms/frame | 19.73 |
+| ROCm 6800XT | 570 ch | 112 ms | **60 ms** | 20.11 ms/frame | 20.05 |
 
 The decode-loop column is the control: generation is untouched and does not
-move. **Whole-request wall time cannot resolve this change** and is not quoted
-here — a changed last bit sends the sampler down a different path, so before
-and after generate a different number of frames (503 vs 533 on the long line)
-and the totals are not comparable. That is the same trap as *Measurement notes*
-below.
+move.
+
+**Whole-request wall time usually cannot resolve this change**, because a
+changed last bit sends the sampler down a different path and the two runs
+generate a different number of frames — 503 vs 533 on the long line, and no
+comparison survives that. The 26-character line is the exception worth having:
+it came out at **24.0 frames on both sides**, so its totals are directly
+comparable — **986 → 880 ms, −10.7%**. That is the best case, and it is the
+one a TTS server hits most often.
 
 The split of the saving differs by card, which is the interesting part:
 
@@ -453,10 +459,11 @@ On the 6800 XT prefill *forward* is only 38 ms, and the 1792 device reads cost
 more than the entire transformer pass. The cache that matters there is the
 cheap one. On the 1660 SUPER the two contribute about equally.
 
-In request terms: **a fixed ~65 ms off a short line and ~85 ms off a long one**
-on CUDA, ~50 ms on ROCm. On a one-sentence request that is 3-11% depending on
-how short the sentence is; on a 42-second paragraph it is 0.5%. The original
-16% was never there.
+In request terms: **60-110 ms off a request on CUDA, ~50 ms on ROCm**, near
+enough fixed — it is the same 46 tokens and the same reference block whatever
+the line. As a share that is **10.7% of a 26-character clause, 3% of a
+one-sentence line and 0.5% of a 42-second paragraph.** The original 16% was
+never there.
 
 ### Why the prefill is split even on a cache miss
 
