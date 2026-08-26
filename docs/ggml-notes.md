@@ -30,6 +30,17 @@ on `qwen3-tts`, then move the submodule pointer in the parent repo.
 Nothing here has been sent upstream yet; that is a deliberate hold, not an
 oversight. See `known-issues.md` #17 for the reasoning.
 
+**Send it to `ggml-org/llama.cpp`, not to `ggml-org/ggml`.** The ggml repo is a
+mirror: read its log and nearly every commit is tagged `(llama/NNNNN)`, arriving
+in periodic `sync : llama.cpp` merges. Backend and kernel work is developed in
+llama.cpp and reaches ggml afterwards, so a PR opened against ggml is opened
+against the wrong tree.
+
+Order to go in, cheapest first: the `ggml_gallocr_reserve_n` one-liner (a real
+patch, and the neighbouring function in the same file already does the check —
+so it is a consistency fix, not a new convention), then RADV multi-add as an
+issue with no code, then `CONV_TRANSPOSE_1D`.
+
 ---
 
 ## Worth reporting upstream
@@ -191,10 +202,19 @@ way in this fork's vocoder (2026-08-26) gave, in ms/frame of decode:
 
 Even the good Vulkan shader is beaten 3.6x, and the CUDA kernel by 6x. So the
 upstream point is not only "this kernel is slow": **ggml's own ops compose into
-something faster than its dedicated op on every backend**, which suggests either
-rewriting the kernel or lowering `conv_transpose_1d` to that pair in the
-frontend where a backend has no good kernel. Output matches at 67 dB SNR.
-See `optimization.md` for the method and the whole-request numbers.
+something faster than its dedicated op on every backend**. Output matches at
+67 dB SNR. See `optimization.md` for the method and the whole-request numbers.
+
+**But the trick does not transplant directly into `ggml_conv_transpose_1d`, and
+that is the thing to have straight before writing the report.** It works here
+because the weights are repacked from `[K, OC, IC]` to `[IC, K*OC]` **once, at
+model load**. A lowering inside the frontend would have to permute them on
+every call, and ggml has no notion of "this operand is a constant weight" to
+hang a one-time repack on — so the win would be spent on the permute. What can
+actually go upstream is therefore one of: a rewritten (tiled, shared-memory)
+kernel; a public helper taking pre-packed weights, leaving the packing to the
+model author; or just the measurements, so other audio frontends know to do
+what this one does.
 
 ---
 
