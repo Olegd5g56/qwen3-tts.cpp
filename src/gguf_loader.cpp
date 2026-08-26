@@ -239,6 +239,7 @@ bool load_tensor_data_from_file(
     const size_t data_offset = gguf_get_data_offset(ctx);
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::vector<uint8_t> read_buf;
+    std::vector<float>   conv_buf;   // only used when a tensor is widened to F32
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
@@ -250,9 +251,17 @@ bool load_tensor_data_from_file(
         }
         
         struct ggml_tensor * tensor = it->second;
-        size_t nbytes = ggml_nbytes(tensor);
-        
-        read_buf.resize(nbytes);
+        const enum ggml_type src_type = gguf_get_tensor_type(ctx, i);
+
+        // The caller may deliberately have created a tensor in a type the file
+        // does not use -- the vocoder promotes its conv_transpose weights to
+        // F32 so the GPU backends will accept the op at all. Read the file's
+        // bytes in the file's type and widen them here.
+        const size_t src_bytes = (src_type == tensor->type)
+                                 ? ggml_nbytes(tensor)
+                                 : gguf_get_tensor_size(ctx, i);
+
+        read_buf.resize(src_bytes);
         
         if (fseek(f, (long)(data_offset + offset), SEEK_SET) != 0) {
             error_msg = "Failed to seek to tensor data: " + std::string(name);
@@ -261,14 +270,40 @@ bool load_tensor_data_from_file(
             return false;
         }
         
-        if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
+        if (fread(read_buf.data(), 1, src_bytes, f) != src_bytes) {
             error_msg = "Failed to read tensor data: " + std::string(name);
             fclose(f);
             ggml_backend_free(backend);
             return false;
         }
-        
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+
+        if (src_type == tensor->type) {
+            ggml_backend_tensor_set(tensor, read_buf.data(), 0, src_bytes);
+            continue;
+        }
+
+        if (tensor->type != GGML_TYPE_F32) {
+            error_msg = "Unsupported tensor conversion for " + std::string(name) +
+                        ": " + ggml_type_name(src_type) + " -> " +
+                        ggml_type_name(tensor->type);
+            fclose(f);
+            ggml_backend_free(backend);
+            return false;
+        }
+
+        const struct ggml_type_traits * traits = ggml_get_type_traits(src_type);
+        if (!traits || !traits->to_float) {
+            error_msg = "No dequantiser for tensor " + std::string(name) +
+                        " of type " + ggml_type_name(src_type);
+            fclose(f);
+            ggml_backend_free(backend);
+            return false;
+        }
+
+        const int64_t nelem = ggml_nelements(tensor);
+        conv_buf.resize((size_t) nelem);
+        traits->to_float(read_buf.data(), conv_buf.data(), nelem);
+        ggml_backend_tensor_set(tensor, conv_buf.data(), 0, ggml_nbytes(tensor));
     }
     
     fclose(f);

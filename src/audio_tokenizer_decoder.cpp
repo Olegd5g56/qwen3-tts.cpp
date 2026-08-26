@@ -40,6 +40,72 @@ bool vocoder_wants_cpu() {
     }();
     return want;
 }
+
+// The six conv_transpose_1d weights of the vocoder. Named out in full rather
+// than pattern-matched: the block counts are hardcoded everywhere else in this
+// file too (4 decoder blocks, 2 upsample blocks), and sscanf's "%d" happily
+// reports a match on a name whose tail then differs.
+bool is_conv_transpose_weight(const std::string & name) {
+    return name == "tok_dec.upsample.0.conv.weight" ||
+           name == "tok_dec.upsample.1.conv.weight" ||
+           name == "tok_dec.dec.1.conv_t.weight"    ||
+           name == "tok_dec.dec.2.conv_t.weight"    ||
+           name == "tok_dec.dec.3.conv_t.weight"    ||
+           name == "tok_dec.dec.4.conv_t.weight";
+}
+
+// CONV_TRANSPOSE_1D reaches a GPU backend only when both its inputs are F32:
+// `supports_op` says so in ggml-cuda.cu and ggml-vulkan.cpp alike, and the
+// vocoder ships these weights as F16, so today the op runs as a CPU
+// convolution with a GPU round trip either side. Widening the weights at load
+// (+51 MB) makes it eligible on the card.
+//
+// **Whether that is a win depends entirely on the backend's kernel**, measured
+// 2026-08-26, isolated vocoder decode, 1.7B Q8_0, ms/frame:
+//
+//   CUDA   1660S    10.0 -> 25.5   2.5x WORSE
+//   HIP    6800XT    6.8 ->  8.8   1.3x worse
+//   Vulkan 6800XT    7.0 ->  3.8   1.8x better
+//   Vulkan 1660S    11.0 ->  8.5   1.3x better
+//
+// So the default is on for Vulkan and off everywhere else. ggml's CUDA/HIP
+// kernel is one thread per output element with no tiling and no reuse; on the
+// same 1660 SUPER the Vulkan shader beats it 3x, and the CPU fallback beats it
+// 2.5x. Details and the upstream case in docs/optimization.md.
+//
+// QWEN3_TTS_CONV_T_F32=0/1 forces it either way.
+bool conv_transpose_wants_f32() {
+    static const bool want = [] {
+        const char * env = std::getenv("QWEN3_TTS_CONV_T_F32");
+        if (env && env[0]) {
+            return env[0] != '0';
+        }
+        if (vocoder_wants_cpu()) {
+            return false;
+        }
+        // The weights are created before any backend is initialised, so this
+        // cannot ask the loaded decoder its name -- it has to walk the same
+        // ladder load_tensor_data_from_file() will walk.
+        static const enum ggml_backend_dev_type ladder[] = {
+            GGML_BACKEND_DEVICE_TYPE_IGPU,
+            GGML_BACKEND_DEVICE_TYPE_GPU,
+            GGML_BACKEND_DEVICE_TYPE_ACCEL,
+        };
+        for (enum ggml_backend_dev_type want_type : ladder) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != want_type) {
+                    continue;
+                }
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                return name && strncmp(name, "Vulkan", 6) == 0;
+            }
+        }
+        return false;
+    }();
+    return want;
+}
 }  // namespace
 
 
@@ -129,6 +195,10 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     
     struct gguf_context * gguf_ctx = loader.get_ctx();
     struct ggml_context * meta_ctx = loader.get_meta_ctx();
+
+    const bool promote_conv_t = conv_transpose_wants_f32();
+    size_t promoted_bytes = 0;
+    int    promoted_count = 0;
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
@@ -143,12 +213,20 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
             continue;
         }
         
-        struct ggml_tensor * tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        std::string sname(name);
+
+        struct ggml_tensor * tensor = nullptr;
+        if (promote_conv_t && meta_tensor->type != GGML_TYPE_F32 &&
+            is_conv_transpose_weight(sname)) {
+            tensor = ggml_new_tensor(model_.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, meta_tensor->ne);
+            promoted_bytes += ggml_nbytes(tensor) - ggml_nbytes(meta_tensor);
+            promoted_count++;
+        } else {
+            tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        }
         ggml_set_name(tensor, name);
         
         model_.tensors[name] = tensor;
-        
-        std::string sname(name);
         
         if (sname == "tok_dec.vq_first.input_proj.weight") model_.vq_first_input_proj = tensor;
         else if (sname == "tok_dec.vq_first.output_proj.weight") model_.vq_first_output_proj = tensor;
@@ -330,6 +408,12 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
+    if (promoted_count > 0) {
+        log_info("vocoder: %d conv_transpose weights widened to F32 (+%.1f MB) "
+                 "so the op is eligible on the GPU",
+                 promoted_count, (double) promoted_bytes / (1024.0 * 1024.0));
+    }
+
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_,
                                      vocoder_wants_cpu() ? GGML_BACKEND_DEVICE_TYPE_CPU
