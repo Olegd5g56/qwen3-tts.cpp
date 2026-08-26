@@ -28,10 +28,10 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 | `--type` | works | notes |
 |---|---|---|
 | **`q8_0`** | everywhere | **the default.** Cheapest to be sure about. |
-| `q4_k` | everywhere | same bytes as `q4_0`, less error - see below |
+| `q4_k` | everywhere | same bytes as `q4_0`, less *weight* error - but see *One case where the rms ranking inverts* before choosing it over `q4_0` |
 | `q5_k` `q6_k` | everywhere | the middle of the ladder |
 | `bf16` | everywhere with VRAM | bit-identical to the checkpoint |
-| `q4_0` | everywhere | **superseded by `q4_k`**, kept only for old files |
+| `q4_0` | everywhere | more weight error than `q4_k`, and on the one line where the two were compared by transcription it was the one that stayed correct. Not superseded; not obviously worse either |
 | `f32` | everywhere | 2x bytes for nothing; no reason left to use it |
 | `f16` | **nowhere** | accepted so #16 stays reproducible; warns |
 
@@ -90,6 +90,15 @@ listening test compares one draw from each type, not the types.
 
 So: `--verify` for ranking, ears for whether the winner is good enough, and
 never a frame count or a waveform diff.
+
+**What does work is many draws, scored by something that is not an ear.** One
+draw is a lottery ticket; twenty draws is a rate, and a rate has a confidence
+interval. Give the same line to every type with seeds 1..20, transcribe all of
+it with `whisper` — the stack already runs one — and score whether the words
+came back. That turns "it sounded wrong" into 3/20 against 20/20, which is a
+finding. It is how *One case where the rms ranking inverts* below was measured,
+and it is the only ears-free test here that has caught something `--verify`
+could not see.
 
 ## The embedding tables are 36% of the file, and skipping them was never measured
 
@@ -162,10 +171,11 @@ the safe one.
 
 ### What was NOT settled
 
-* **Nobody has listened.** This measures the model's computation up to the
-  first frame. It is the same bar the `conv_transpose` rewrite was held to, and
-  it is the only bar available above — see *Why generated audio cannot rank any
-  of this*. It is not a substitute for an ear on a long clip.
+* **Nobody has listened, and that turned out to matter.** This measures the
+  model's computation up to the first frame. The section after this one shows
+  a case the measurement is blind to: two files it cannot tell apart differ
+  3/20 against 8/20 on reading a number back correctly. Treat the prefill
+  metric as a way to rule a change out, not to clear it.
 * **The other kept tables are a separate question.** `code_pred.codec_embd.*`
   isolated the same way gives 1.3 – 2.6% / 39.8 – 45.0 dB — larger than
   `text_embd` but still an order of magnitude under the body, and worth
@@ -181,6 +191,78 @@ the safe one.
 qwen3-tts-quantize 1.7B-bf16.gguf 1.7B-q4k-small.gguf q4_k \
     --tensor-type talker.text_embd=q4_k
 ```
+
+## One case where the rms ranking inverts — and what that costs the metric above
+
+Measured 2026-08-26, after an ear on a q4_k clip reported that "числа
+запоролись". The question was whether that was the seed or the type. It was the
+type, and the answer is more specific and more awkward than expected.
+
+All seven files quantised from the same `1.7B-bf16.gguf` with the same build of
+`qwen3-tts-quantize`. Same voice, same line, **20 seeds each**, output
+transcribed by `whisper large-v3-turbo` and scored on whether each number came
+back. Whisper is a noisy judge, but it is the same judge for every row.
+
+Line: `В 2026 году цена выросла на 17,5 процента, до 3480 рублей за штуку.`
+
+| weights | MiB | `2026` | `17,5` | 95% CI on `17,5` | `3480` |
+|---|---|---|---|---|---|
+| bf16 | 3679 | 20/20 | **20/20** | 84 – 100% | 14/20 |
+| `q8_0` | 2344 | 20/20 | 19/20 | 76 – 99% | 13/20 |
+| `q6_k` | 1998 | 20/20 | 19/20 | 76 – 99% | 14/20 |
+| `q5_k` | 1809 | 20/20 | **20/20** | 84 – 100% | 12/20 |
+| `q4_k` | 1630 | 20/20 | **3/20** | **5 – 36%** | 15/20 |
+| `q4_k` + `text_embd` | 1203 | 20/20 | 8/20 | 22 – 61% | 5/20 |
+| `q4_0` | 1630 | 20/20 | **20/20** | 84 – 100% | 14/20 |
+
+`q4_k` says "семьдесят пять процентов" in 15 of 20 draws. It does not mangle a
+digit — it **drops a whole word**. `q4_0`, the same 4.5 bits per weight and a
+*worse* relative rms error (8.82% against 7.26%), never does it once.
+
+### What this does and does not license
+
+**It is not a seed lottery.** 3/20 against 20/20 across the same twenty seeds
+settles that much.
+
+**It does not generalise to "q4_k breaks numbers."** A second line —
+`Заказ номер 482 весит 6,3 килограмма и стоит 1250 рублей.` — was run the same
+way, and there every type is bad and the confidence intervals sit on top of one
+another: bf16 8/20 all-three, `q5_k` 10/20, `q4_k` 4/20, `q4_0` 3/20. bf16
+itself returns "4082" for "482" in three draws of twenty. **Numbers are
+unreliable in this model at any precision**, which is the larger fact, and the
+`17,5` collapse is one construct on top of it. Note that the second line's
+`6,3` — also a decimal with a comma — survives `q4_k` 19/20, so it is not
+decimals as a class either.
+
+**It does invalidate a recommendation.** *What to use* above said `q4_k`
+supersedes `q4_0` because it has less relative rms error at the same size. That
+ranking is real but it is not a ranking of behaviour: here is a line where the
+type with less weight error is the one that loses a word, 85% of the time,
+against a type with more. Both are listed at 4-bit now with this caveat.
+
+**It puts a ceiling on the prefill metric.** The section above establishes that
+quantising `text_embd` is invisible in the prefill's hidden state and logits.
+That measurement is still correct — and it is blind to this. `q4_k` and
+`q4_k` + `text_embd` were indistinguishable there (22–28% rel. rms, both) and
+are 3/20 against 8/20 here. **The prefill metric measures how far the
+computation is perturbed, not how the model then behaves.** Use it to rule out
+a change that should be numerically neutral; do not use it to clear a change
+for release.
+
+### Consequences
+
+* Publish `q8_0`, `q6_k`, `q5_k` without qualification — all three are 19/20 or
+  20/20 on the construct that separates them.
+* Do not present `q4_k` as strictly better than `q4_0`. At 4 bits, whatever is
+  chosen, say that numeric content is where this model is least reliable.
+* **The `text_embd` default is not being changed on the strength of the prefill
+  measurement alone.** That measurement says it is numerically free; this
+  section says numerical freedom is not the whole question. What it would take
+  is this same 20-seed transcription test run against a construct where the
+  base type is *not* already broken.
+
+Not yet checked: whether the `17,5` collapse reproduces on the 0.6B, and
+whether any other construct shows it. One line is one line.
 
 ## Speed, and why the answer depends on the backend
 
