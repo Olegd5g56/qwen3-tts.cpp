@@ -304,6 +304,7 @@ spoken text, not just the timbre.
 | `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
 | `QWEN3_TTS_FORCE_CPU` | off | `1` keeps everything on the CPU. |
 | `QWEN3_TTS_VOCODER` | gpu | `cpu` moves the vocoder (weights and compute) off the accelerator. Much slower everywhere measured; it exists for diagnosis. |
+| `QWEN3_TTS_CONV_T_F32` | on for Vulkan, off elsewhere | Widen the vocoder's six `conv_transpose` weights to F32 at load (+51 MB) so the op is eligible on the GPU at all. Worth ~10% end to end on Vulkan; a large regression on CUDA and ROCm, whose kernel loses to the CPU. `1`/`0` forces it. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
 
 ## Testing

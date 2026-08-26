@@ -127,9 +127,8 @@ The chain, in graph order:
 | `dec.6` | final conv1d to one channel | → waveform |
 
 The 15-way sum at the top is the add chain that RADV's fusion rule mishandles
-(`ggml-notes.md`). The six `conv_transpose_1d` nodes are the ones that dominate
-decode time and **fall back to the CPU on every GPU backend** — see *Device
-placement* below.
+(`ggml-notes.md`). The six `conv_transpose_1d` nodes are 45–52% of decode and
+run on the CPU on every backend but Vulkan — see *Device placement* below.
 
 `set_active_codebooks()` lets both stages agree on how much of the RVQ chain is
 in play; the talker must not predict codebooks the vocoder will ignore, and the
@@ -159,14 +158,16 @@ half-precision accumulator and a deep tower loses ~30 dB. Applies to the vocoder
 and the speaker encoder. Talker graphs deliberately keep F16 accumulation
 (`known-issues.md` #14).
 
-**Six `conv_transpose_1d` nodes never reach the GPU.** `supports_op` accepts
-`GGML_OP_CONV_TRANSPOSE_1D` only when both inputs are F32 — in
-`ggml-cuda.cu:5142` and in `ggml-vulkan.cpp:11549` alike — and the vocoder
-stores its conv weights as F16. Each node is therefore a CPU convolution with a
-GPU round trip on either side, on CUDA, HIP and Vulkan builds. It is ~45–52% of
-decode. This also explains why `GGML_NATIVE` is worth 2.25x end to end: that
-flag governs exactly the CPU kernels these nodes land in. Options and the
-number to aim at are in `optimization.md`, remaining idea 1.
+**Six `conv_transpose_1d` nodes reach the GPU only on Vulkan, on purpose.**
+`supports_op` accepts `GGML_OP_CONV_TRANSPOSE_1D` only when both inputs are F32
+— in `ggml-cuda.cu:5142` and `ggml-vulkan.cpp:11549` alike — and the vocoder
+ships these weights as F16, so by default they are CPU convolutions with a GPU
+round trip either side. `QWEN3_TTS_CONV_T_F32` widens them at load (+51 MB) to
+make the op eligible; it defaults on for Vulkan (~10% end to end) and off for
+CUDA and ROCm, whose kernel is slower than the CPU doing the same convolution.
+This is also why `GGML_NATIVE` is worth 2.25x end to end on those backends: it
+governs exactly the CPU kernels these nodes land in. Measurements in
+`optimization.md`, *The conv_transpose experiment*.
 
 ---
 

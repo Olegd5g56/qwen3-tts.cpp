@@ -108,26 +108,42 @@ that isolates it.
 
 ---
 
-## `CONV_TRANSPOSE_1D` — the real target, and it is not reaching the GPU
+## `CONV_TRANSPOSE_1D` — the CUDA kernel loses to the CPU
 
-**Correction, 2026-08-25.** The kernel analysis below is sound but it is not
-what has been running. `GGML_SCHED_DEBUG=2` shows seven `CONV_TRANS` splits per
-graph executing on the **CPU**, on the CUDA build and the HIP build alike:
-`supports_op` in `ggml-cuda.cu` accepts this op only when both inputs are F32,
-and the vocoder stores its conv weights as F16. So the timings below are CPU
-convolutions with a GPU round trip either side, filed under a "CUDA" op because
-the profiler times the gap between scheduler callbacks and never asks which
-device did the work.
+**Resolved 2026-08-26, and the kernel analysis below turns out to be the whole
+story.** Two corrections stacked here, so in order.
 
-The first fix is therefore not a better kernel — it is making the op eligible at
-all, by converting the vocoder's conv weights to F32 at load or by teaching the
-kernel to take F16. Only then does the analysis below start to apply. See
-`optimization.md`.
+*2026-08-25:* the op was not running on the GPU at all. `supports_op` accepts
+`CONV_TRANSPOSE_1D` only when both inputs are F32 (`ggml-cuda.cu:5142`), and the
+vocoder stores its conv weights as F16, so every node was a CPU convolution with
+a GPU round trip either side — filed under a "CUDA" op because the profiler
+times the gap between scheduler callbacks and never asks which device did the
+work. **The same gate exists in `ggml-vulkan.cpp:11549`**, which that correction
+missed: Vulkan was affected identically.
 
-Re-profiling after the vocoder reached the GPU (`known-issues.md` #13) put
-**52% of decode in `CONV_TRANSPOSE_1D`**, against 1.7% in `IM2COL`. The biggest
-single entry costs **71 ms per call** for a `[520, 768]` output — 400k elements,
-so this is roughly three orders of magnitude off what the hardware can do.
+*2026-08-26:* the weights were widened to F32 at load and the op measured on
+each backend. Isolated vocoder decode, 1.7B Q8_0, ms/frame:
+
+| backend | card | CPU fallback | GPU kernel |
+|---|---|---|---|
+| CUDA | 1660S | 10.0 | **25.5** |
+| HIP | 6800XT | 6.8 | **8.8** |
+| Vulkan | 6800XT | 7.0 | **3.8** |
+| Vulkan | 1660S | 11.0 | **8.5** |
+
+**On the same GTX 1660 SUPER, ggml's Vulkan shader beats its CUDA kernel by 3x,
+and the CPU beats the CUDA kernel by 2.5x.** Per-op totals over one workload,
+everything else in the graph within 1%: `CONV_TRANSPOSE_1D` 3365 ms on the CPU
+against 14203 ms on the CUDA kernel.
+
+That is the report to send: not "this kernel looks naive" but "this kernel is
+4.2x slower than a CPU doing the same convolution, and your own Vulkan backend
+is 3x faster on the same card". The analysis below is the why.
+
+The op is 45–52% of decode against 1.7% in `IM2COL`, so it is the whole cost of
+this stage. On the CUDA kernel the biggest single entry costs **488 ms per
+call** for a `[64004, 192]` output, which is what a kernel with no reuse does to
+12M elements.
 
 `ggml/src/ggml-cuda/conv-transpose-1d.cu` shows why. One thread per output
 element; each thread loops over every input channel and the entire kernel width,
@@ -153,8 +169,18 @@ the loop trip count is a multiple of the useful work. Neighbouring output
 elements read almost the same inputs and the exact same weights, which is what a
 tiled kernel exists to exploit.
 
+The Vulkan shader takes the other decomposition — it parallelises over output
+channels (`elements = {src0->ne[1], 1, 1}`) rather than over output elements —
+and that is where its 3x comes from.
+
 Unlike the conv1d gap below, this is ordinary optimisation of an existing kernel
 rather than adding a missing op, and it benefits every audio decoder on ggml.
+
+There is also a route that needs no new kernel. `GGML_OP_COL2IM_1D` already
+exists ("scatter-add GEMM columns back to 1D signal", `ggml.c:4584`) with a CUDA
+kernel that takes F16/F32/BF16. A transposed convolution is `mul_mat` followed
+by `col2im_1d`, which sends the work through cuBLAS instead of a hand-rolled
+kernel and keeps the weights F16. Untried; see `optimization.md`.
 
 ---
 

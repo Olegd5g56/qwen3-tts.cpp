@@ -17,3 +17,11 @@ date	commit	label	model	text	voice	native	timing	mean_s	runs_s	note
 2026-08-25T18:53Z	d72014c-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	11.21,10.81,11.01,10.01	baseline on the built-in benchmark voice
 2026-08-25T18:54Z	d72014c-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	12.11	12.41,12.21,12.01,11.81	baseline on the built-in benchmark voice
 2026-08-25T18:56Z	d72014c-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	22.37	22.62,22.42,22.22,22.22	baseline on the built-in benchmark voice
+2026-08-26T05:56Z	6a87081	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	13.16	13.41,13.21,13.01,13.01	control: conv_transpose on CPU fallback
+2026-08-26T05:57Z	6a87081-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	11.51	11.41,11.81,11.61,11.21	conv_transpose on GPU (new default for Vulkan)
+2026-08-26T05:59Z	6a87081-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	22.61	22.41,22.41,22.41,23.22	control: conv_transpose on CPU fallback
+2026-08-26T06:01Z	6a87081-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	20.32	20.21,19.41,21.02,20.62	conv_transpose on GPU (new default for Vulkan)
+2026-08-26T06:02Z	6a87081-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	16.71	16.41,16.61,16.81,17.01	default unchanged: conv_transpose stays on CPU
+2026-08-26T06:04Z	6a87081-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	25.82	24.82,26.62,25.82,26.02	conv_transpose forced onto the CUDA kernel - regression, kept as evidence
+2026-08-26T06:05Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	10.81,10.61,11.41,10.21	default unchanged: conv_transpose stays on CPU
+2026-08-26T06:07Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	14.41	14.01,14.61,14.01,15.01	conv_transpose forced onto the HIP kernel - regression, kept as evidence

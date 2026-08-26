@@ -1,15 +1,15 @@
 # Qwen3-TTS GGML Optimization Report
 
-Performance characterization of this fork. Last updated **2026-08-24**.
+Performance characterization of this fork. Last updated **2026-08-26**.
 
 > Everything measured before **2026-08-24** described a build whose vocoder was
 > silently running on the CPU (`known-issues.md` #13). Sections are ordered so
 > current numbers come first; the August-20 sweep is kept at the end as history
 > because the relative wins it records are still real.
 >
-> The newest layer is the head-to-head against the reference PyTorch pipeline.
-> It confirms `CONV_TRANSPOSE_1D` as the one target and closes the adjacent
-> "make one-shot decode fit" idea with a negative result.
+> The newest layer is *The conv_transpose experiment* (2026-08-26), which
+> settles that target: getting the op onto the GPU is a win on Vulkan and a
+> regression on CUDA and ROCm, because those backends' kernel loses to the CPU.
 
 ## Current profile (where the time goes)
 
@@ -237,33 +237,99 @@ One forward-looking note: the 0.6B's advantage is capped by the size-invariant
 stages, so **it grows if the code predictor gets faster** — the two items are
 related, not independent.
 
+## The conv_transpose experiment
+
+Measured **2026-08-26**. This section replaces the older "two ways in, neither
+tried" plan, which assumed getting the op onto the GPU was the win and the
+kernel's quality a later argument. It is the other way round.
+
+### What was wrong
+
+`CONV_TRANSPOSE_1D` is 45–52% of vocoder decode and **had never run on a GPU**.
+`supports_op` accepts the op only when both inputs are F32, and the vocoder
+ships its six conv_transpose weights as F16:
+
+- `ggml-cuda.cu:5142`
+- `ggml-vulkan.cpp:11549` — **so Vulkan was affected too**, which the previous
+  revision of this file recorded as a CUDA/HIP-only problem.
+
+Six nodes: `tok_dec.upsample.{0,1}.conv.weight` (stride 2) and
+`tok_dec.dec.{1,2,3,4}.conv_t.weight` (strides 8, 5, 4, 3). Each was a CPU
+convolution with a GPU round trip either side. This is also why `GGML_NATIVE` is
+worth 2.25x end to end: it governs exactly the CPU kernels these six land in.
+
+### The fix, and what it cost
+
+Widening those six weights to F32 at load makes the op eligible. **+51 MB**, not
+the ~36 MB the old entry estimated from `dec.1` alone. `QWEN3_TTS_CONV_T_F32`.
+
+Isolated vocoder decode, `bench_ru.txt`, 1.7B Q8_0, `QWEN3_TTS_PIPELINE=0`,
+fixed seed so the frame count is identical across the pair, three runs:
+
+| backend | card | CPU fallback | on the GPU | |
+|---|---|---|---|---|
+| CUDA | 1660S | 10.0 ms/frame | **25.5** | 2.5x worse |
+| HIP | 6800XT | 6.8 ms/frame | **8.8** | 1.3x worse |
+| Vulkan | 6800XT | 7.0 ms/frame | **3.8** | 1.8x better |
+| Vulkan | 1660S | 11.0 ms/frame | **8.5** | 1.3x better |
+
+Whole request, the `bench_speed.sh` protocol, rows in `benchmarks/speed.tsv`:
+
+| config | control | conv_transpose on GPU |
+|---|---|---|
+| VK 6800XT | 13.16 s | **11.51 s** |
+| VK 1660S | 22.61 s | **20.32 s** |
+| CUDA 1660S | **16.71 s** | 25.82 s |
+| ROCm 6800XT | **10.76 s** | 14.41 s |
+
+So it defaults on for Vulkan and off everywhere else.
+
+### What that says
+
+**The CUDA kernel, not the placement, is the bottleneck.** Two controls make
+this hard to argue with. On the *same* GTX 1660 SUPER, ggml's Vulkan shader
+does the op at 8.5 ms/frame where its CUDA kernel takes 25.5 — **3x** — and the
+threaded AVX2 CPU fallback takes 10.0, so the CUDA kernel loses to the CPU by
+2.5x. Per-op totals over the same workload, profiler on, everything else in the
+graph within 1% between the two runs:
+
+| | CONV_TRANSPOSE_1D total |
+|---|---|
+| CPU fallback | 3365 ms |
+| CUDA kernel | 14203 ms |
+
+`ggml/src/ggml-cuda/conv-transpose-1d.cu` explains it: one thread per output
+element, each looping over every input channel and the whole kernel width,
+reading straight from global memory with no tiling and no reuse, and
+`continue`-ing out of roughly `s0-1` of every `s0` iterations. The Vulkan shader
+parallelises over output channels instead. See `ggml-notes.md`.
+
+**The ceiling is still cuDNN's 2.67 ms/frame** on the 1660 SUPER (*Against the
+reference PyTorch pipeline*). Vulkan on the 6800 XT now reaches 3.8, so the gap
+that remains is a kernel gap on one backend, not a structural one.
+
+**A third route exists and is untried.** ggml has `GGML_OP_COL2IM_1D`
+("scatter-add GEMM columns back to 1D signal"), with a CUDA kernel that already
+accepts F16/F32/BF16. A transposed convolution is a `mul_mat` followed by a
+`col2im_1d`, which would put the work through cuBLAS/rocBLAS instead of a
+hand-rolled kernel, keep the weights F16 (no +51 MB), need no ggml patch at
+all, and fold the causal crop into `col2im_1d`'s `p0`. It needs a one-time
+host-side repack of the weights from `[K, OC, IC]` to `[IC, K*OC]`, and it
+materialises a `[K*OC, T_in]` F32 intermediate — roughly 24 MB at the 16-frame
+chunk, ~150 MB at 100. Unmeasured.
+
+**Worth reporting upstream**, and it is now a report with numbers: one backend's
+shader beating another's kernel 3x on the same card, and both of them measured
+against the CPU. Hold it together with the other two ggml findings — see
+`ggml-notes.md`.
+
 ## Remaining ideas (descending value)
 
-1. **`CONV_TRANSPOSE_1D` — and the first step is not a kernel at all.**
-   45-52% of decode, and **it never reaches the GPU**. Verified 2026-08-25 with
-   `GGML_SCHED_DEBUG=2`: seven splits per graph run on the CPU, on the CUDA
-   build *and* the HIP build, every one a `CONV_TRANS` node in the vocoder
-   (`tok_dec.upsample.*`, `tok_dec.dec.*.conv_t`). `supports_op` in
-   `ggml-cuda.cu` returns true only when both inputs are F32; the vocoder stores
-   its conv weights as F16. Each node is therefore a CPU convolution with a GPU
-   round trip either side.
-
-   This supersedes the older entry here, which said the cost was ggml's naive
-   CUDA kernel. That kernel may well be naive — it has simply not been running.
-   The op profiler times the gap between scheduler callbacks and does not care
-   which device did the work, which is how CPU time got filed under a "CUDA" op.
-   It also explains why `GGML_NATIVE` is worth 2.25x end-to-end: that flag
-   governs exactly the CPU kernels these seven nodes land in.
-
-   **Two ways in, neither tried.** Convert the vocoder's conv weights to F32 at
-   load so `supports_op` accepts them — costs VRAM, `tok_dec.dec.1.conv_t.weight`
-   alone is ~36 MB — or teach the CUDA/HIP kernel to take F16 inputs. Only after
-   one of those is the kernel's quality worth arguing about.
-
-   **There is a number to aim at.** cuDNN does this vocoder at 2.67 ms/frame on
-   the same 1660 SUPER where we take 9.60 — see *Against the reference PyTorch
-   pipeline*. Worth ~26% end-to-end. Measure before and after with
-   `scripts/bench_speed.sh`, and put both rows in `benchmarks/speed.tsv`.
+1. **`CONV_TRANSPOSE_1D` — resolved on Vulkan, and on CUDA the kernel is the
+   problem.** See *The conv_transpose experiment* above. Done: the weights are
+   widened at load, which is worth ~10% end to end on Vulkan and is a large
+   regression on CUDA and ROCm. What is left is a better CUDA/HIP kernel, and
+   ggml's own Vulkan shader is the existence proof that one is possible.
 2. **The code predictor: only one lever left, and it is not a code change.**
    At 13.2 ms/frame it is the largest single line and no longer hidden, but it
    is ~70% weight traffic (see the ruled-out entry). Quantising it works and is
