@@ -3361,6 +3361,23 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     t1 = clk::now();
     timing.t_prefill_forward_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
+    // QWEN3_TTS_DUMP_PREFILL=<path> writes the prefill's two outputs as raw
+    // f32: the last token's hidden state, then its logits. Everything after
+    // this point is autoregressive and diverges on a changed last bit, so this
+    // is the last place two builds can be compared number to number. It is how
+    // "did this change the maths" gets answered without listening to anything.
+    if (const char * dump_path = std::getenv("QWEN3_TTS_DUMP_PREFILL")) {
+        if (FILE * f = fopen(dump_path, "wb")) {
+            fwrite(last_hidden_.data(), sizeof(float), last_hidden_.size(), f);
+            fwrite(logits.data(),       sizeof(float), logits.size(),       f);
+            fclose(f);
+            log_info("prefill dump: %zu hidden + %zu logits -> %s",
+                     last_hidden_.size(), logits.size(), dump_path);
+        } else {
+            log_warn("prefill dump: cannot open %s", dump_path);
+        }
+    }
+
     // prefill is complete: build_prefill_graph + forward_prefill. decode loop
     // begins next.
     t_prefill_end_ms = verbose_now_ms();

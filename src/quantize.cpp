@@ -237,15 +237,23 @@ int main(int argc, char ** argv) {
         bytes_in += ggml_nbytes(t);
 
         enum ggml_type want = target;
+        bool named_explicitly = false;
         for (const auto & r : overrides) {
-            if (strstr(name, r.substr.c_str()) != nullptr) want = r.type;
+            if (strstr(name, r.substr.c_str()) != nullptr) {
+                want = r.type;
+                named_explicitly = true;
+            }
         }
 
         const char * skip = nullptr;
         if (ggml_n_dims(t) < 2) {
             skip = "1-D";                      // norms and biases: F32, leave them
             n_skipped_dims++;
-        } else if (!keep_all && !should_quantize_name(name)) {
+        } else if (!keep_all && !named_explicitly && !should_quantize_name(name)) {
+            // The name list is a blanket policy; --tensor-type is the operator
+            // saying they mean this one. Explicit beats implicit, or there is
+            // no way to ask a single kept tensor to be quantised without
+            // --keep-all taking every other one with it.
             skip = "kept by name";
             n_skipped_name++;
         } else if (t->ne[0] % ggml_blck_size(want) != 0) {

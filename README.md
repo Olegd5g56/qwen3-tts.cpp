@@ -152,8 +152,10 @@ build/qwen3-tts-quantize talker-bf16.gguf talker-q4_k.gguf q4_k --verify
 ```
 
 `--verify` prints how much each tensor lost. `--tensor-type SUBSTR=TYPE`
-overrides individual tensors. See `docs/quantisation.md` for which type to pick
-— the answer is not the usual llama.cpp answer.
+overrides individual tensors, and beats the built-in skip list — which is how
+you quantise the embedding table, worth 26% of a 1.7B `q4_k` file and 42% of a
+0.6B one. See `docs/quantisation.md` for which type to pick — the answer is not
+the usual llama.cpp answer.
 
 ## Server
 
@@ -312,6 +314,7 @@ spoken text, not just the timbre.
 | `QWEN3_TTS_CONV_T_GEMM` | on | Run the vocoder's transposed convolutions as `mul_mat` + `col2im_1d` instead of ggml's `conv_transpose_1d`. 2.3–4.5x faster decode on every backend, +34 MB. `0` restores the op. |
 | `QWEN3_TTS_CONV_T_F32` | off | Only reachable with `QWEN3_TTS_CONV_T_GEMM=0`. Widens the six `conv_transpose` weights to F32 (+51 MB) so ggml's op is eligible on the GPU at all. Diagnostic; slower than both the default and the CPU fallback on CUDA and ROCm. |
 | `QWEN3_TTS_PREFIX_CACHE` | 8 | Voices whose reference block and prompt-head KV are kept for reuse across requests, evicted least-recently-used. About 7 MB of host memory per voice on the 1.7B, more for a longer reference transcript. Raise it if a workload cycles through more speakers than the cap before repeating; `0` disables the reuse. |
+| `QWEN3_TTS_DUMP_PREFILL` | off | Path to write the prefill's last hidden state and logits as raw f32. Prefill is deterministic, so this is where two builds can be compared number to number before the sampler diverges. |
 | `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
 
 ## Testing

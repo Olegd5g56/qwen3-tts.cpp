@@ -38,6 +38,11 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 K-quants need `qwen3-tts-quantize` (see below); the Python converter cannot
 write them.
 
+Every one of these keeps the embedding tables at the source type, which is
+**36% of the file** and was never measured. See *The embedding tables* below —
+quantising `talker.text_embd` costs nothing detectable and takes 26% off a
+1.7B `q4_k`, 42% off a 0.6B one.
+
 ## How much each one throws away
 
 `qwen3-tts-quantize --verify` reports `rms(dequantised - original) / rms(original)`
@@ -85,6 +90,97 @@ listening test compares one draw from each type, not the types.
 
 So: `--verify` for ranking, ears for whether the winner is good enough, and
 never a frame count or a waveform diff.
+
+## The embedding tables are 36% of the file, and skipping them was never measured
+
+`_should_quantize()` in the Python converter, mirrored by `should_quantize_name()`
+in `qwen3-tts-quantize`, keeps every tensor whose name contains `_embd`,
+`codebook`, `_norm`, `lm_head`, `codec_head` or ends in `.bias` at the source
+type. The comment under it says only "Tensors to keep in F16 for quality".
+No measurement was ever recorded for that.
+
+It costs more than it looks. Broken down by tensor type, 1.7B:
+
+| | q8_0 | q4_k |
+|---|---|---|
+| quantised | 1518 MiB | **804 MiB** |
+| BF16, kept by name | 820 MiB | **820 MiB** |
+| F32 (norms) | 0.6 MiB | 0.6 MiB |
+| **total** | **2339 MiB** | **1625 MiB** |
+
+The quantised part shrinks by exactly 1.888x, which is 8.5/4.5 bits — the
+arithmetic is doing what it should. The kept block is a fixed 820 MiB floor,
+and it is why `q4_k` is only 1.44x smaller than `q8_0` instead of the ~1.9x
+the bit widths promise.
+
+**593.5 MiB of that 820 is a single tensor**: `talker.text_embd.weight`,
+2048 x 151936 — the Qwen vocabulary. It alone is 36% of the file.
+`code_pred.codec_embd.*` (fifteen tables) is 180 MiB more, `spk_enc` 23 MiB.
+
+### What quantising it actually costs
+
+Measured 2026-08-26. The autoregressive rollout diverges on a changed last bit,
+so the last place two builds can be compared number to number is the prefill:
+`QWEN3_TTS_DUMP_PREFILL=<path>` writes the last token's hidden state and its
+logits as raw f32. Prefill is deterministic, so these are exact values, not
+samples. Every row below is against the **bf16** model on the same text, same
+voice, same backend (HIP, 6800 XT), with the voice's embedding and reference
+codes frozen in `cache.bin` so only the talker's weights differ.
+
+1.7B, four texts (short Russian, a 570-character paragraph, English, one full
+of digits):
+
+| | rel. rms of hidden | logit SNR | file |
+|---|---|---|---|
+| `q8_0`, standard skips | 3.4% | 36.5 dB | 2345 MiB |
+| `q4_k`, standard skips | 22.1 – 27.3% | 16.4 – 19.1 dB | 1631 MiB |
+| `q4_k` + `text_embd` at `q4_k` | 22.4 – 27.8% | 16.9 – 19.5 dB | **1204 MiB** |
+
+The two `q4_k` rows are the same model to within the spread across texts, and
+the logit SNR is *higher* with the embedding quantised in all four. **427 MiB
+for nothing.**
+
+Why: quantise `text_embd` **alone**, leaving everything else bf16, and its own
+contribution is **0.61 – 1.29%** rel. rms, 42.8 – 50.9 dB. Errors from
+independent sources add in quadrature, so 25% and 1% combine to 25.02%. It is
+not that the embedding is noise-free; it is that it is twenty-five times
+quieter than the body of the model it sits next to.
+
+Both model sizes agree, and the smaller one gains more because the vocabulary
+is the same 151936 rows either way:
+
+| 0.6B | rel. rms | logit SNR | file |
+|---|---|---|---|
+| `q4_k`, standard skips | 22.5 – 23.0% | 18.5 – 19.0 dB | 1025 MiB |
+| `q4_k` + `text_embd` at `q4_k` | 22.0 – 23.4% | 18.2 – 19.0 dB | **598 MiB** |
+
+**−26% on the 1.7B, −42% on the 0.6B.**
+
+For reference, llama.cpp quantises `token_embd` in all of its standard quant
+mixes. Keeping the whole table at source precision is the unusual choice, not
+the safe one.
+
+### What was NOT settled
+
+* **Nobody has listened.** This measures the model's computation up to the
+  first frame. It is the same bar the `conv_transpose` rewrite was held to, and
+  it is the only bar available above — see *Why generated audio cannot rank any
+  of this*. It is not a substitute for an ear on a long clip.
+* **The other kept tables are a separate question.** `code_pred.codec_embd.*`
+  isolated the same way gives 1.3 – 2.6% / 39.8 – 45.0 dB — larger than
+  `text_embd` but still an order of magnitude under the body, and worth
+  another 152 MiB. But their main use is inside the code predictor's fifteen
+  sequential passes, which the prefill dump does not reach at all, and the
+  code predictor is the one place where 4-bit was *heard* (see below). Do not
+  move those on this evidence.
+* **The default has not been changed.** `should_quantize_name()` still skips
+  `text_embd`. What changed is that `--tensor-type` now beats the skip list, so
+  the choice can be made per file:
+
+```
+qwen3-tts-quantize 1.7B-bf16.gguf 1.7B-q4k-small.gguf q4_k \
+    --tensor-type talker.text_embd=q4_k
+```
 
 ## Speed, and why the answer depends on the backend
 
@@ -152,8 +248,14 @@ run; ours by hand.
 qwen3-tts-quantize in.gguf out.gguf q4_k --tensor-type ffn_down=q6_k --tensor-type attn_v=q6_k
 ```
 
-It leaves the same tensors alone the converter does (embeddings, norms, biases,
-heads), plus any row that is not a whole number of blocks - 38 speaker-encoder
+A tensor named explicitly by `--tensor-type` is quantised even if the skip
+list would otherwise keep it: the list is a blanket policy, naming a tensor is
+the operator overriding it. That is how the `text_embd` measurement above was
+made, and without it `--keep-all` was the only escape and it takes every other
+kept tensor with it.
+
+Otherwise it leaves the same tensors alone the converter does (embeddings,
+norms, biases, heads), plus any row that is not a whole number of blocks - 38 speaker-encoder
 convolutions, which K-quants skip far more often than Q8_0 because they need
 rows divisible by 256 rather than 32.
 
