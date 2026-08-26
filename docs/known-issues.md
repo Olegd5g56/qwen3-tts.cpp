@@ -792,7 +792,7 @@ scratch. Each was verified against the code on 2026-08-24.
   `generate()`. They have already diverged: the suppression window and the
   repetition penalty are only in `generate()`. A change to sampling rules has to
   be made in both places and can silently be made in one.
-- **19 `QWEN3_TTS_*` env vars read by `getenv()` from 8 files**, eight documented.
+- **19 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, nine documented.
   Several (`DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`) are
   diagnostics branched inline in hot loops. Tolerable; worth a config struct
   before the next handful arrives.

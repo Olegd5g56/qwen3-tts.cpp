@@ -262,8 +262,21 @@ ships its six conv_transpose weights as F16:
 
 Six nodes: `tok_dec.upsample.{0,1}.conv.weight` (stride 2) and
 `tok_dec.dec.{1,2,3,4}.conv_t.weight` (strides 8, 5, 4, 3). Each was a CPU
-convolution with a GPU round trip either side. This is also why `GGML_NATIVE` is
-worth 2.25x end to end: it governs exactly the CPU kernels these six land in.
+convolution with a GPU round trip either side.
+
+> **A retraction that belongs here.** This paragraph used to continue: *"which
+> is also why `GGML_NATIVE` is worth 2.25x end to end — it governs exactly the
+> CPU kernels these six land in."* Both halves are wrong. Re-measured
+> 2026-08-26 against purpose-built `NATIVE=OFF` build directories, the flag has
+> **no measurable effect** on either backend, with the GEMM vocoder *or* with
+> the CPU fallback forced back on (four rows in `speed.tsv`, all within noise).
+> And `NATIVE=OFF` does not strip AVX2 or FMA as was claimed — it only drops
+> `-march=native`; ggml still builds its explicit ISA variants. What the
+> original 26.67-vs-11.86 s measurement actually captured is unknown; it was
+> taken on the same day two build directories were found to disagree, so a
+> second uncontrolled difference is likely. Keep grepping `CMakeCache.txt`
+> before comparing build dirs — but do not attribute a difference to this flag
+> without measuring it.
 
 ### The fix, and what it cost
 

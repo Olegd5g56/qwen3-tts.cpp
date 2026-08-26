@@ -121,9 +121,9 @@ The chain, in graph order:
 | RVQ lookup | codebook 0 through `vq_first`, codebooks 1–15 through `vq_rest`, all projected and **summed** | `[n_frames, hidden]` |
 | `pre_conv` | causal conv1d, kernel 7 | — |
 | `pre_tfm` | 8 transformer layers with their own KV cache and causal mask | — |
-| `upsample.0/1` | `conv_transpose_1d` **stride 2**, then depthwise conv + pointwise FFN | ×2 each |
+| `upsample.0/1` | transposed conv **stride 2** (as GEMM + `col2im_1d`), then depthwise conv + pointwise FFN | ×2 each |
 | `dec.0` | causal conv1d | — |
-| `dec.1..4` | snake activation, then `conv_transpose_1d` at **stride 8, 5, 4, 3**, each with three dilated residual blocks (dilation 1, 3, 9) | ×8 ×5 ×4 ×3 |
+| `dec.1..4` | snake activation, then transposed conv at **stride 8, 5, 4, 3** (same GEMM pair), each with three dilated residual blocks (dilation 1, 3, 9) | ×8 ×5 ×4 ×3 |
 | `dec.6` | final conv1d to one channel | → waveform |
 
 The 15-way sum at the top is the add chain that RADV's fusion rule mishandles
@@ -202,8 +202,10 @@ doubles the weight bytes and the 1.7B then does not fit in 6 GB
   the vocoder on a worker thread: the per-frame callback batches codes and hands
   them over while the talker keeps going. Gated per backend — on Vulkan two
   instances cannot coexist and it must stay off. `QWEN3_TTS_PIPELINE=1/0`
-  overrides. Worth ~7% now that both stages want the same GPU; it was worth far
-  more when it overlapped a GPU talker with a CPU vocoder.
+  overrides. It was worth ~25-40% when it overlapped a GPU talker with a CPU
+  vocoder, ~7% once both wanted the same GPU, and **less again now that decode
+  is 4.29 ms/frame against generation's 25** — there is not much left to hide.
+  That last share has not been re-measured.
 - **Synthesis is serialized.** The server holds one `synth_mutex`; a second
   request waits rather than failing fast.
 - **Lock order is `map_mutex` before `synth_mutex`**, and `VoiceStore` locks per

@@ -1,12 +1,20 @@
 # streaming vocoder plan
 
-status: draft — implementation design for task #14 (phase 3b). covers
-tasks #20–#25.
+status: **historical — fully implemented.** Every phase below is marked
+landed. This is kept as the derivation of how streaming decode works and why
+each piece of carried state exists; it is not a to-do list any more.
 
-this document is written to be followed by a single engineer without
-further design work. every phase names a concrete file, function, and
-line range to touch, and every state tensor is sized explicitly against
-the current 1.7B-base config.
+**Two warnings before using it as a map.** The line numbers throughout are from
+June 2026 and have rotted badly — `apply_upsample_block` is quoted at 486 and is
+now at 829. Navigate by function name, not by line. And the transposed
+convolutions no longer go through `ggml_conv_transpose_1d` at all: since
+2026-08-26 they are `mul_mat` + `col2im_1d`, which emits the same uncropped
+length, so every overlap-add and trim described here still applies unchanged.
+See `architecture.md` and `optimization.md`.
+
+Written originally to be followed by a single engineer without further design
+work, which is why every phase names a concrete file, function and line range,
+and every state tensor is sized explicitly against the 1.7B-base config.
 
 ---
 
@@ -244,9 +252,11 @@ store as F16 to halve memory; each ring is `L` frames × `C` channels
 | dec6 conv                       | 6   | 96                            | 1152        |
 
 **total**: 15 ring buffers, ~265 KiB aggregate at F16. channel counts
-are populated at load time into `config.dec_out_channels[4]` from the
-`conv_t.weight` `ne[1]` of each decoder block (phase A1, landed).
-observed for 1.7B-base: `[768, 384, 192, 96]`.
+are populated at load time into `config.dec_out_channels[4]` (phase A1, landed).
+observed for 1.7B-base: `[768, 384, 192, 96]`. **they no longer come from
+`conv_t.weight` `ne[1]`** — the GEMM path reshapes that weight to `[IC, K*OC]`,
+so the count is recorded into `decoder_block::conv_t_out_ch` at load, while the
+original shape is still known.
 
 **C. decoder_block transpose conv.** the transpose itself has no state
 (stride = kernel/2, left and right trim equal `stride`). once we have

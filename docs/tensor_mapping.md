@@ -219,11 +219,32 @@ decoder.layers.{n}.mlp.fc1.weight                   → tok_dec.blk.{n}.ffn_up.w
 decoder.layers.{n}.mlp.fc2.weight                   → tok_dec.blk.{n}.ffn_down.weight
 
 # Upsampling ConvNet (vocoder)
-decoder.upsample.{n}.conv.weight                    → tok_dec.upsample.{n}.weight
-decoder.upsample.{n}.conv.bias                      → tok_dec.upsample.{n}.bias
-decoder.conv_out.weight                             → tok_dec.conv_out.weight
-decoder.conv_out.bias                               → tok_dec.conv_out.bias
+decoder.upsample.{n}.0.conv.weight                  → tok_dec.upsample.{n}.conv.weight
+decoder.upsample.{n}.0.conv.bias                    → tok_dec.upsample.{n}.conv.bias
+decoder.upsample.{n}.1.dwconv.conv.weight           → tok_dec.upsample.{n}.dwconv.weight
+decoder.upsample.{n}.1.norm.weight                  → tok_dec.upsample.{n}.norm.weight
+decoder.upsample.{n}.1.gamma                        → tok_dec.upsample.{n}.gamma
+
+# Decoder blocks (vocoder) — 0 and 6 are plain convs, 1-4 carry the
+# transposed conv plus three residual blocks, 5 is the final snake
+decoder.decoder.0.conv.weight                       → tok_dec.dec.0.conv.weight
+decoder.decoder.{n}.block.1.conv.weight             → tok_dec.dec.{n}.conv_t.weight
+decoder.decoder.{n}.block.{m}.conv1.conv.weight     → tok_dec.dec.{n}.res.{m}.conv1.weight
+decoder.decoder.5.alpha                             → tok_dec.dec.5.snake.alpha
+decoder.decoder.6.conv.weight                       → tok_dec.dec.6.conv.weight
 ```
+
+**Corrected 2026-08-26.** This block previously named
+`tok_dec.upsample.{n}.weight` and a `tok_dec.conv_out.*` pair; neither exists in
+any GGUF this repo produces or loads. Verified against
+`Qwen3-TTS-Tokenizer-12Hz-F16.gguf` (448 tensors) and
+`scripts/convert_tokenizer_to_gguf.py`, which is the authority — the vocoder
+mapping lives there, not in `convert_tts_to_gguf.py`.
+
+Note that `tok_dec.dec.{1..4}.conv_t.weight` and
+`tok_dec.upsample.{0,1}.conv.weight` are **reshaped in memory after loading**
+from `[K, OC, IC]` to `[IC, K*OC]` — the file's layout is what is written
+above. See `architecture.md`.
 
 ## Tensor Count Summary
 

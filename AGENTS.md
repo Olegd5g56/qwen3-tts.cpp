@@ -258,22 +258,30 @@ timed apart with `QWEN3_TTS_PIPELINE=0`:
 | talker | 10.1 |
 | code predictor | 13.2 |
 | generate total | 25.1 |
-| vocoder decode | 12.9 |
+| ~~vocoder decode~~ | ~~12.9~~ → **4.29** (2026-08-26) |
 
 RTF 0.44 (2.3x realtime) end to end with the pipeline on; 0.30 on ROCm/6800 XT.
+Both predate the vocoder change below.
 
-- **Generation is now ~2x the vocoder**, and the code predictor is the largest
+- **Generation is now 5-7x the vocoder**, and the code predictor is the largest
   single line. It costs the same on the 0.6B and the 1.7B — 15 sequential
   5-layer passes over weights that do not scale with the talker — and it is
   ~70% weight-read bandwidth, not arithmetic. Quantising it works and was
-  rejected on audible quality.
-- Inside the vocoder, `CONV_TRANSPOSE_1D` is 52% of decode and `IM2COL` is 1.7%.
-  Anything premised on avoiding im2col is not worth doing for this model.
+  rejected on audible quality. **Every remaining speed question is a generation
+  question.**
+- **The vocoder's transposed convolutions do not use `ggml_conv_transpose_1d`.**
+  They are `mul_mat` + `col2im_1d`, with the weights repacked at load from
+  `[K, OC, IC]` to `[IC, K*OC]` — 2.3-4.5x faster than the op on every backend
+  measured, and the op never reached the GPU anyway (`supports_op` wants F32 on
+  both inputs, the weights are F16). Do not "simplify" it back to the op.
+  `QWEN3_TTS_CONV_T_GEMM=0` restores it for comparison.
+- `IM2COL` is 1.7% of decode, so anything premised on avoiding im2col is not
+  worth doing for this model.
 - Vocoder decode runs on a worker thread concurrently with generation
-  (`decode_pipeline` in `qwen3_tts.cpp`), gated per backend. Worth ~7% now that
-  both stages share the GPU; it was worth far more when it overlapped a GPU
-  talker with a CPU vocoder. On Vulkan two instances cannot run at once and it
-  must stay off. `QWEN3_TTS_PIPELINE=1/0` overrides.
+  (`decode_pipeline` in `qwen3_tts.cpp`), gated per backend. It was worth ~7%
+  when decode was 12.9 ms/frame; at 4.29 there is much less left to hide, and
+  that share has not been re-measured. On Vulkan two instances cannot run at
+  once and it must stay off. `QWEN3_TTS_PIPELINE=1/0` overrides.
 - Attention graphs view only the populated part of the KV cache
   (`QWEN3_TTS_KV_STEP` granularity). Viewing the full `MAX_AUDIO_TOKENS`-sized
   cache used to make flash-attn 31% of generation.

@@ -29,3 +29,7 @@ date	commit	label	model	text	voice	native	timing	mean_s	runs_s	note
 2026-08-26T06:34Z	f775bbf-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.51	10.21,11.01,10.81,10.01	conv_transpose as GEMM + col2im (new default)
 2026-08-26T06:35Z	f775bbf-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.01	10.41,10.21,9.61,9.81	conv_transpose as GEMM + col2im (new default)
 2026-08-26T06:36Z	f775bbf-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	19.01	18.81,19.01,19.21,19.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T07:13Z	a10b036-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	15.86	15.41,17.01,15.61,15.41	GGML_NATIVE=OFF control, GEMM vocoder
+2026-08-26T07:14Z	a10b036-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	16.31	16.81,15.61,16.41,16.41	GGML_NATIVE=OFF, conv_transpose back on the CPU fallback
+2026-08-26T07:17Z	a10b036-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	10.71	10.61,11.01,11.01,10.21	GGML_NATIVE=OFF control, GEMM vocoder
+2026-08-26T07:18Z	a10b036-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	10.66	10.41,10.81,10.41,11.01	GGML_NATIVE=OFF, conv_transpose back on the CPU fallback
