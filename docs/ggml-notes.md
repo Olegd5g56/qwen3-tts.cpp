@@ -38,17 +38,28 @@ against the wrong tree.
 
 Order to go in, cheapest first: the `ggml_gallocr_reserve_n` one-liner (a real
 patch, and the neighbouring function in the same file already does the check —
-so it is a consistency fix, not a new convention), then RADV multi-add as an
-issue with no code, then `CONV_TRANSPOSE_1D`.
+so it is a consistency fix, not a new convention), then `CONV_TRANSPOSE_1D`.
+**RADV multi-add has been withdrawn** — it was mesa, not ggml; see below.
 
 ---
 
 ## Worth reporting upstream
 
-### multi-add fusion is pathological on RADV / RDNA2
+### ~~multi-add fusion is pathological on RADV / RDNA2~~ — WITHDRAWN 2026-08-27
+
+**Do not report this.** It was a mesa regression, not a ggml bug. Re-measured
+under the pinned-seed protocol on mesa 26.2.1: `GGML_VK_DISABLE_MULTI_ADD=1`
+changes the median by nothing at all (10.21 s either way, 19.659 ms/frame
+either way), while disabling *all* fusion costs 10% — so the fusion is running
+and earning its keep. The 25.0.7 that `Dockerfile.vulkan` ships never had the
+pathology either, so the workaround set there is dead weight on both sides of
+the version it was written for. Full numbers in `known-issues.md` #8.
+
+The original finding is kept below because the shape of it — a fusion rule that
+collapses on one driver — is worth recognising if it ever comes back.
 
 Chained `ggml_add` over large tensors gets fused, and on RADV the fused path
-collapses. This fork's vocoder sums 15 residual codebook projections
+collapsed. This fork's vocoder sums 15 residual codebook projections
 (192000 x 96, F32) as an add chain:
 
 | build | RTF, long clip, RX 6800 XT |

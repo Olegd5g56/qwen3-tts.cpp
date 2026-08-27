@@ -915,11 +915,19 @@ sending 357 MB. Now excluded.
 Not bugs, and none of them bite today. Kept so they are not rediscovered from
 scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
 
-- **Sampling logic exists twice.** `predict_codes_autoregressive`'s
-  `sample_or_argmax` lambda (`tts_transformer.cpp`) against the unrolled loop in
-  `generate()`. They have already diverged: the suppression window and the
-  repetition penalty are only in `generate()`. A change to sampling rules has to
-  be made in both places and can silently be made in one.
+- ~~**Sampling logic exists twice.**~~ **Fixed 2026-08-27** — it existed three
+  times, in fact: `generate()`, `predict_codes_autoregressive` and the CoreML
+  path each carried the same temperature → top-k → softmax → multinomial draw.
+  All three now call `TTSTransformer::sample_token`. Verified as a pure
+  refactor: same seed, same voice, byte-identical WAV before and after on both
+  benchmark texts.
+
+  **The divergence this entry worried about turned out to be correct and is
+  kept.** The suppression window and the repetition penalty stay in
+  `generate()` alone, because that is where the reference puts them — they ride
+  in `talker_kwargs`, while `code_predictor.generate()` is given only
+  do_sample/top_k/top_p/temperature (`modeling_qwen3_tts.py`, the `talker_kwargs`
+  dict). Both call sites now say so, so the asymmetry does not read as a bug.
 - **21 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, 11 documented
   in the README (counted 2026-08-26). The ten undocumented ones are diagnostics
   — `DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`,
@@ -930,12 +938,16 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   streaming, and a different `max_audio_tokens` default. `top_p` is present but
   deliberately unused (kept for ABI stability, documented at the declaration —
   that part is fine). Either catch it up or mark the target experimental.
-- **Three ggml findings are sitting unreported.** #8 (RADV multi-add fusion) is
-  written up and reproducible; #17 (OOM segfault) is a one-line fix with a
-  verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops compose into
-  something 6x faster than its dedicated CUDA kernel — is measured on four
-  backends. All three are upstream, all three go to `ggml-org/llama.cpp` rather
-  than to the ggml mirror, and the order to send them in is in `ggml-notes.md`.
+- **Two ggml findings are sitting unreported.** #17 (OOM segfault) is a
+  one-line fix with a verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops
+  compose into something 6x faster than its dedicated CUDA kernel — is measured
+  on four backends. Both go to `ggml-org/llama.cpp` rather than to the ggml
+  mirror, and the order to send them in is in `ggml-notes.md`.
+
+  **#8 (RADV multi-add) is no longer one of them.** It was a mesa regression,
+  not a ggml bug: gone in mesa 26.2.1, never present in the 25.0.7 the container
+  ships, and our `GGML_VK_DISABLE_MULTI_ADD=1` workaround is now a measured
+  no-op. Nothing to report; see #8's 2026-08-27 update.
 
 ### Dismissed after checking
 

@@ -2809,6 +2809,50 @@ static int32_t argmax(const float * data, int32_t n) {
     return max_idx;
 }
 
+// Temperature -> top-k -> softmax -> multinomial draw. See the declaration in
+// tts_transformer.h for what is deliberately not in here.
+int32_t TTSTransformer::sample_token(float * logits, int32_t vocab_size,
+                                     float temperature, int32_t top_k,
+                                     std::vector<float> & probs) {
+    if (temperature <= 0.0f) {
+        return argmax(logits, vocab_size);
+    }
+
+    for (int32_t i = 0; i < vocab_size; ++i) {
+        logits[i] /= temperature;
+    }
+
+    if (top_k > 0 && top_k < vocab_size) {
+        std::vector<std::pair<float, int32_t>> scored(vocab_size);
+        for (int32_t i = 0; i < vocab_size; ++i) {
+            scored[i] = {logits[i], i};
+        }
+        std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+            [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                return a.first > b.first;
+            });
+        const float threshold = scored[top_k - 1].first;
+        for (int32_t i = 0; i < vocab_size; ++i) {
+            if (logits[i] < threshold) {
+                logits[i] = -INFINITY;
+            }
+        }
+    }
+
+    const float max_logit = *std::max_element(logits, logits + vocab_size);
+    double sum = 0.0;
+    for (int32_t i = 0; i < vocab_size; ++i) {
+        probs[i] = expf(logits[i] - max_logit);
+        sum += probs[i];
+    }
+    for (int32_t i = 0; i < vocab_size; ++i) {
+        probs[i] = (float)(probs[i] / sum);
+    }
+
+    std::discrete_distribution<int32_t> dist(probs.begin(), probs.begin() + vocab_size);
+    return dist(rng_);
+}
+
 bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
                                                          int32_t codebook_0_token,
                                                          std::vector<int32_t> & output,
@@ -2832,45 +2876,9 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
     auto t0 = clk::now(), t1 = t0;
 #endif
 
-    auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
-            return argmax(logits_ptr, vocab_size);
-        }
-
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            logits_ptr[i] /= temperature;
-        }
-
-        if (top_k > 0 && top_k < vocab_size) {
-            std::vector<std::pair<float, int32_t>> scored(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                scored[i] = {logits_ptr[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                    return a.first > b.first;
-                });
-            float threshold = scored[top_k - 1].first;
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                if (logits_ptr[i] < threshold) {
-                    logits_ptr[i] = -INFINITY;
-                }
-            }
-        }
-
-        float max_logit = *std::max_element(logits_ptr, logits_ptr + vocab_size);
-        double sum = 0.0;
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = expf(logits_ptr[i] - max_logit);
-            sum += code_probs[i];
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = (float)(code_probs[i] / sum);
-        }
-
-        std::discrete_distribution<int32_t> dist(code_probs.begin(), code_probs.begin() + vocab_size);
-        return dist(rng_);
-    };
+    // The code predictor samples with temperature and top-k only - no
+    // suppression window, no repetition penalty. That matches the reference,
+    // where those two are talker-only.
 
     memcpy(seq_embd.data(), hidden, (size_t)cfg.hidden_size * sizeof(float));
     if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token,
@@ -2916,7 +2924,8 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
             log_error("%s", error_msg_.c_str());
             return false;
         }
-        output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
+        output[step] = sample_token(logits_data.data(), cfg.code_pred_vocab_size,
+                                    temperature, top_k, code_probs);
 
 #ifdef QWEN3_TTS_TIMING
         if (timing_) {
@@ -2978,46 +2987,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     
     std::vector<float> code_probs(cfg.code_pred_vocab_size);
     
-    // Helper lambda: temperature + top-k sampling (or greedy if temperature <= 0)
-    auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
-            return argmax(logits_ptr, vocab_size);
-        }
-        // Temperature scaling
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            logits_ptr[i] /= temperature;
-        }
-        // Top-k filtering
-        if (top_k > 0 && top_k < vocab_size) {
-            std::vector<std::pair<float, int32_t>> scored(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                scored[i] = {logits_ptr[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                    return a.first > b.first;
-                });
-            float threshold = scored[top_k - 1].first;
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                if (logits_ptr[i] < threshold) {
-                    logits_ptr[i] = -INFINITY;
-                }
-            }
-        }
-        // Softmax
-        float max_logit = *std::max_element(logits_ptr, logits_ptr + vocab_size);
-        double sum = 0.0;
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = expf(logits_ptr[i] - max_logit);
-            sum += code_probs[i];
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = (float)(code_probs[i] / sum);
-        }
-        // Sample
-        std::discrete_distribution<int32_t> dist(code_probs.begin(), code_probs.begin() + vocab_size);
-        return dist(rng_);
-    };
+    // The code predictor samples with temperature and top-k only - no
+    // suppression window, no repetition penalty. That matches the reference,
+    // where those two are talker-only.
     
     std::vector<float> cb0_embd(cfg.hidden_size);
     if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token, cb0_embd.data())) {
@@ -3111,7 +3083,8 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             log_error("%s", error_msg_.c_str());
             return false;
         }
-        output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
+        output[0] = sample_token(logits_data.data(), cfg.code_pred_vocab_size,
+                                 temperature, top_k, code_probs);
         
         ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
@@ -3213,7 +3186,8 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             log_error("%s", error_msg_.c_str());
             return false;
         }
-        output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
+        output[step] = sample_token(logits_data.data(), cfg.code_pred_vocab_size,
+                                    temperature, top_k, code_probs);
         
         ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
@@ -3467,44 +3441,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             }
         }
 
-        int32_t next_token;
-        if (temperature <= 0.0f) {
-            next_token = argmax(logits.data(), cfg.codec_vocab_size);
-        } else {
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                logits[i] /= temperature;
-            }
-
-            if (top_k > 0 && top_k < cfg.codec_vocab_size) {
-                std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    scored[i] = {logits[i], i};
-                }
-                std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                    [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                        return a.first > b.first;
-                    });
-                float threshold = scored[top_k - 1].first;
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    if (logits[i] < threshold) {
-                        logits[i] = -INFINITY;
-                    }
-                }
-            }
-
-            float max_logit = *std::max_element(logits.data(), logits.data() + cfg.codec_vocab_size);
-            double sum = 0.0;
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = expf(logits[i] - max_logit);
-                sum += probs[i];
-            }
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = (float)(probs[i] / sum);
-            }
-
-            std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
-            next_token = dist(rng_);
-        }
+        // The two steps above are the talker's alone; the draw itself is the
+        // same one the code predictor uses.
+        const int32_t next_token = sample_token(logits.data(), cfg.codec_vocab_size,
+                                                temperature, top_k, probs);
         
         if (next_token == cfg.codec_eos_id) {
             break;

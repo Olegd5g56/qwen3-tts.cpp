@@ -358,6 +358,26 @@ public:
                             std::vector<float> & output);
     
 private:
+    // The one sampler. Temperature, then top-k, then softmax, then a
+    // multinomial draw from rng_; temperature <= 0 means greedy. Called by the
+    // talker's loop in generate() and by both code-predictor paths, which used
+    // to carry three byte-identical copies of it.
+    //
+    // What deliberately stays OUTSIDE it: the talker also suppresses the top
+    // 1024 codec ids (except end-of-speech) and applies a repetition penalty
+    // over the codebook-0 tokens it has already emitted. Those two belong to
+    // the talker alone - in the reference implementation they are passed in
+    // `talker_kwargs` while `code_predictor.generate()` gets only
+    // do_sample/top_k/top_p/temperature - so generate() applies them to the
+    // logits before calling this. Do not "fix" that asymmetry by moving them
+    // in here; it is the model's, not ours.
+    //
+    // `probs` is caller-owned scratch, sized >= vocab_size, so the hot loop
+    // does not allocate per frame.
+    int32_t sample_token(float * logits, int32_t vocab_size,
+                         float temperature, int32_t top_k,
+                         std::vector<float> & probs);
+
     bool try_init_coreml_code_predictor(const std::string & model_path);
     bool predict_codes_autoregressive_coreml(const float * hidden, int32_t codebook_0_token,
                                              std::vector<int32_t> & output,
