@@ -712,9 +712,14 @@ see §7.
 
 file: `tests/test_streaming_parity.cpp`.
 
+> Written as a plan; what was built differs. The test takes no ICL repro
+> inputs — it needs a vocoder and nothing else (`test_streaming_parity.cpp:37`)
+> — and it skips rather than fails when the model files are absent, via
+> `tests/test_fixtures.h`. The line below once pointed into a private notes
+> file that is not part of this repo and does not exist.
+
 ```cpp
-// 1. load model and canonical ICL repro inputs (see
-//    memory/project_canonical_repro.md).
+// 1. load the vocoder; fixtures_present() skips the test if it is absent.
 // 2. run synthesize() one-shot → baseline pcm.
 // 3. for each batch_size in {1, 4, 8, 32}:
 //      stream via Qwen3TTS::synthesize(..., streaming_opts{
