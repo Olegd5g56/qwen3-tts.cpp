@@ -15,23 +15,48 @@
 #     streams.
 #   * One warm-up request, discarded. It costs about double (2026-08-25: 79.9
 #     vs ~32 ms/frame on CUDA).
-#   * Four timed requests, averaged, all of them recorded.
-#   * Whole request wall time. Do NOT compare backends by generation ms/frame:
-#     the vocoder is overlapped into generation on CUDA/ROCm/Metal and not on
-#     Vulkan/CPU, so that number means different things on either side.
+#   * A FIXED SEED, which is the single thing that makes this measurable. The
+#     headline is whole-request wall time, and wall time is dominated by how
+#     much audio the model chose to generate. With a random seed every run
+#     draws a different length and the number wanders far more than any change
+#     worth measuring. Measured 2026-08-27, ROCm 6800XT, bench_ru.txt, 12 runs
+#     each:
+#
+#         random seed   audio 38.72-44.88 s (14.7%)   wall 9.81-11.01 s (11.5%)
+#         fixed seed    audio 39.44 s every run (0%)  wall  9.61-10.01 s (4.2%)
+#
+#     The audio length is bit-identical across runs, so what is left is the
+#     machine, not the draw.
+#   * Nine timed requests, all recorded, and the MEDIAN reported - not the
+#     mean. On this machine roughly every fourth request runs ~300 ms slower
+#     (~3%), entirely inside the generation loop, on a period of about 38 s.
+#     A mean of four gives that hiccup a quarter of the weight; a median of
+#     nine ignores it.
+#   * The audio duration of every run is recorded and checked. If it moves
+#     while the seed is pinned, the run is not reproducible and the wall times
+#     in it compare nothing - the script says so instead of averaging them.
 #   * One voice in the voices directory. The server preloads the whole library
 #     in the background and 198 voices compete with what is being measured.
 #
-# Two things this cannot do, learned the hard way:
+# Comparing two rows, which is where this gets misused:
 #
-#   * It cannot resolve a change worth less than ~100 ms. The seed is random,
-#     so every run draws a different number of frames; a 73-character line
-#     scattered 1.81-2.81 s across five runs of identical code. For a change
-#     that only moves prefill, measure prefill directly with a fixed seed -
+#   * Same backend, same model, a change that does not touch numerics: compare
+#     median_s directly. The audio_s column must match; if it does not, the
+#     change moved the token stream and seconds are not comparable.
+#   * Different backend, different weight type, anything that changes the
+#     tokens: the audio lengths differ by construction, so seconds are
+#     meaningless. Compare ms_per_frame, which is whole-request wall time
+#     divided by the frames it produced - still an end-to-end number, just
+#     normalised by how much came out. It is NOT the server's own generation
+#     ms/frame, which is not comparable across backends because the vocoder is
+#     overlapped into generation on CUDA/ROCm/Metal and not on Vulkan/CPU.
+#
+# What this still cannot do:
+#
+#   * Resolve a change worth less than ~1% of the request. The floor is now
+#     the ~3% hiccup above, and the median only hides it, it does not remove
+#     it. For a change that only moves prefill, measure prefill directly -
 #     see optimization.md, "Per-voice prefill reuse".
-#   * The commit it records goes "-dirty" as soon as the first row is appended,
-#     because that dirties this history file. A run of several rows will show
-#     the first clean and the rest dirty on the same code.
 #
 # Usage:
 #   scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" [options]
@@ -49,7 +74,11 @@
 #                     seconds.
 #   --voices-dir DIR  library to take --voice from (default: $TTS_VOICES_DIR)
 #   --text FILE       input text       (default: benchmarks/bench_ru.txt)
-#   --runs N          timed runs after the warm-up (default: 4)
+#   --runs N          timed runs after the warm-up (default: 9)
+#   --seed N          sampling seed, pinned so every run generates the same
+#                     audio (default: 1234). "--seed random" restores the old
+#                     unpinned behaviour, which is only useful for measuring
+#                     the spread itself.
 #   --port N          (default: 8099)
 #   --out FILE        history file     (default: benchmarks/speed.tsv)
 #   --note TEXT       free-form note stored with the row
@@ -57,7 +86,8 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE= VOICES_DIR=${TTS_VOICES_DIR:-}
-TEXT="$ROOT/benchmarks/bench_ru.txt" RUNS=4 PORT=8099 OUT="$ROOT/benchmarks/speed.tsv" NOTE=
+TEXT="$ROOT/benchmarks/bench_ru.txt" RUNS=9 PORT=8099 OUT="$ROOT/benchmarks/speed.tsv" NOTE=
+SEED=1234
 declare -a EXTRA_ENV=()
 
 while [ $# -gt 0 ]; do
@@ -71,10 +101,11 @@ while [ $# -gt 0 ]; do
         --voices-dir)  VOICES_DIR=$2; shift 2 ;;
         --text)        TEXT=$2; shift 2 ;;
         --runs)        RUNS=$2; shift 2 ;;
+        --seed)        SEED=$2; shift 2 ;;
         --port)        PORT=$2; shift 2 ;;
         --out)         OUT=$2; shift 2 ;;
         --note)        NOTE=$2; shift 2 ;;
-        -h|--help)     sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)     sed -n '2,84p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -115,7 +146,11 @@ fi
 
 cache() { grep -E "^$1:" "$BUILD/CMakeCache.txt" 2>/dev/null | cut -d= -f2- ; }
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-git -C "$ROOT" diff --quiet 2>/dev/null || COMMIT="$COMMIT-dirty"
+# The history file is excluded from the dirty check: appending a row dirties it,
+# so without this the first row of a session reads clean and every later one
+# reads "-dirty" on identical code.
+OUT_REL=${OUT#$ROOT/}
+git -C "$ROOT" diff --quiet -- . ":(exclude)$OUT_REL" 2>/dev/null || COMMIT="$COMMIT-dirty"
 NATIVE=$(cache GGML_NATIVE); TIMING=$(cache QWEN3_TTS_TIMING)
 TEXT_ID="$(basename "$TEXT"):$(wc -c < "$TEXT" | tr -d ' ')B"
 
@@ -134,27 +169,89 @@ for _ in $(seq 1 240); do
 done
 curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || die "server never became healthy"
 
+# The seed rides in the request body. It is not part of the OpenAI schema, but
+# the server has always accepted it, and pinning it is what makes wall time
+# mean anything - see the protocol note at the top.
 request() {
-    jq -n --rawfile input "$TEXT" \
-        '{input: $input, voice: "'"$VOICE"'", response_format: "wav"}' \
+    if [ "$SEED" = random ]; then
+        jq -n --rawfile input "$TEXT" \
+            '{input: $input, voice: "'"$VOICE"'", response_format: "wav"}'
+    else
+        jq -n --rawfile input "$TEXT" --argjson seed "$SEED" \
+            '{input: $input, voice: "'"$VOICE"'", response_format: "wav", seed: $seed}'
+    fi \
     | curl -s -m 900 -o /dev/null -X POST "http://127.0.0.1:$PORT/v1/audio/speech" \
         -H 'Content-Type: application/json' -d @-
 }
 
-printf 'bench_speed: %s  commit=%s voice=%s native=%s timing=%s\n' \
-    "$LABEL" "$COMMIT" "$VOICE" "${NATIVE:-?}" "${TIMING:-?}"
+# The server logs one line per finished request; the last one is ours. Duration
+# comes from there rather than from the returned bytes so that a change to the
+# container or the encoder cannot quietly move it.
+last_log_field() {  # $1 = awk-style regex with one capture, via sed
+    grep -a 'ok .*audio' "$ONEVOICE/server.log" | tail -1 | sed -nE "s/.*$1.*/\\1/p"
+}
+
+printf 'bench_speed: %s  commit=%s voice=%s seed=%s native=%s timing=%s\n' \
+    "$LABEL" "$COMMIT" "$VOICE" "$SEED" "${NATIVE:-?}" "${TIMING:-?}"
 request  # warm-up, discarded: it costs about double
-times=()
+times=() durations=() prefills=()
 for i in $(seq 1 "$RUNS"); do
     start=$(date +%s.%N); request; end=$(date +%s.%N)
     t=$(LC_ALL=C awk "BEGIN{printf \"%.2f\", $end - $start}")
-    times+=("$t"); printf '  run %d: %s s\n' "$i" "$t"
+    dur=$(last_log_field 'ok ([0-9.]+)s audio')
+    pre=$(last_log_field 'prefill=([0-9]+)ms')
+    times+=("$t"); durations+=("${dur:-?}"); prefills+=("${pre:-?}")
+    printf '  run %d: %s s wall, %s s audio\n' "$i" "$t" "${dur:-?}"
 done
-mean=$(printf '%s\n' "${times[@]}" | LC_ALL=C awk '{s+=$1}END{printf "%.2f", s/NR}')
 
-[ -s "$OUT" ] || printf 'date\tcommit\tlabel\tmodel\ttext\tvoice\tnative\ttiming\tmean_s\truns_s\tnote\n' > "$OUT"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+med() { printf '%s\n' "$@" | LC_ALL=C sort -n | awk '{v[NR]=$1}END{printf "%.2f", (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}'; }
+median=$(med "${times[@]}")
+prefill_ms=$(med "${prefills[@]}")
+
+# Every run must have produced the same audio, or the seconds above are timing
+# different amounts of work and their median means nothing. This is the check
+# the old protocol did not have, and it is why it could not resolve anything.
+uniq_dur=$(printf '%s\n' "${durations[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//')
+AUDIO_S=$uniq_dur
+if [ "$(printf '%s\n' "${durations[@]}" | sort -u | wc -l)" -gt 1 ]; then
+    AUDIO_S="VARIES:$(printf '%s\n' "${durations[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')"
+    printf 'bench_speed: WARNING - audio length varied across runs (%s).\n' "$uniq_dur" >&2
+    printf '             The median wall time compares nothing. With --seed pinned this\n' >&2
+    printf '             means generation is not reproducible on this build.\n' >&2
+    NOTE="${NOTE:+$NOTE; }audio length varied, wall time not comparable"
+fi
+
+# Whole-request wall time per frame of audio produced: the same end-to-end
+# number, divided by how much came out. Use it - and only it - when two rows
+# have different audio lengths. Computed per run and then medianed, so that a
+# run's seconds are always divided by that same run's frames.
+mspfs=()
+for i in "${!times[@]}"; do
+    d=${durations[$i]}
+    case "$d" in
+        ''|'?') continue ;;
+    esac
+    mspfs+=("$(LC_ALL=C awk -v t="${times[$i]}" -v d="$d" \
+        'BEGIN{ if (d+0 > 0) printf "%.3f", (t*1000)/(d*12) }')")
+done
+MSPF='?'
+[ ${#mspfs[@]} -gt 0 ] && MSPF=$(printf '%s\n' "${mspfs[@]}" | LC_ALL=C sort -n \
+    | awk '{v[NR]=$1}END{printf "%.3f", (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}')
+
+HEADER=$'date\tcommit\tlabel\tmodel\ttext\tvoice\tseed\tnative\ttiming\tmedian_s\taudio_s\tms_per_frame\tprefill_ms\truns_s\tnote'
+if [ -s "$OUT" ]; then
+    # A history written by an older protocol has different columns and its
+    # numbers were produced a different way. Appending to it would make a file
+    # that reads like one series and is two.
+    [ "$(head -1 "$OUT")" = "$HEADER" ] || \
+        die "$OUT was written by an older protocol (different columns). Move it aside; this run would corrupt the series."
+else
+    printf '%s\n' "$HEADER" > "$OUT"
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%MZ)" "$COMMIT" "$LABEL" "$(basename "$MODEL")" "$TEXT_ID" "$VOICE" \
-    "${NATIVE:-?}" "${TIMING:-?}" "$mean" "$(IFS=,; echo "${times[*]}")" "$NOTE" >> "$OUT"
+    "$SEED" "${NATIVE:-?}" "${TIMING:-?}" "$median" "$AUDIO_S" "$MSPF" "$prefill_ms" \
+    "$(IFS=,; echo "${times[*]}")" "$NOTE" >> "$OUT"
 
-printf 'bench_speed: %s -> %s s  (appended to %s)\n' "$LABEL" "$mean" "${OUT#$ROOT/}"
+printf 'bench_speed: %s -> %s s median of %s  (%s s audio, %s ms/frame)  appended to %s\n' \
+    "$LABEL" "$median" "$RUNS" "$AUDIO_S" "$MSPF" "${OUT#$ROOT/}"

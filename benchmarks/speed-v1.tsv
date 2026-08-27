@@ -1,0 +1,42 @@
+date	commit	label	model	text	voice	native	timing	mean_s	runs_s	note
+2026-08-25T18:16Z	62b2d6b-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ostro	ON	OFF	12.81	12.61,12.21,12.61,13.81	
+2026-08-25T18:17Z	62b2d6b-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ostro	ON	OFF	8.51	8.61,8.41,8.81,8.21	
+2026-08-25T18:18Z	62b2d6b-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ostro	ON	OFF	10.41	10.41,10.21,9.81,11.21	
+2026-08-25T18:19Z	62b2d6b-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	ostro	ON	OFF	18.31	17.81,18.21,18.41,18.81	
+2026-08-20T00:00Z	pre-9d4785d	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	33.00		Oleg, banch.csv, inherited ggml
+2026-08-20T00:00Z	pre-9d4785d	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	25.50		Oleg, banch.csv, inherited ggml
+2026-08-20T12:00Z	pre-9d4785d	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	19.50		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	18.00		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	30.50		Oleg, banch.csv, first fresh ggml
+2026-08-20T12:00Z	pre-9d4785d	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	?	25.00		Oleg, banch.csv, first fresh ggml
+2026-08-25T18:05Z	62b2d6b	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	17.46	17.61,17.21,16.61,18.41	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	11.66	11.21,11.61,11.61,12.21	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	14.47	14.21,14.22,15.62,13.82	reproduction of Oleg's protocol
+2026-08-25T18:05Z	62b2d6b	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	ward.txt:1339B	femaleuniquenocturnal	ON	OFF	26.92	31.02,28.82,24.62,23.22	reproduction of Oleg's protocol
+2026-08-25T18:52Z	d72014c-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	16.16	15.61,16.41,15.81,16.81	baseline on the built-in benchmark voice
+2026-08-25T18:53Z	d72014c-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	11.21,10.81,11.01,10.01	baseline on the built-in benchmark voice
+2026-08-25T18:54Z	d72014c-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	12.11	12.41,12.21,12.01,11.81	baseline on the built-in benchmark voice
+2026-08-25T18:56Z	d72014c-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	22.37	22.62,22.42,22.22,22.22	baseline on the built-in benchmark voice
+2026-08-26T05:56Z	6a87081	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	13.16	13.41,13.21,13.01,13.01	control: conv_transpose on CPU fallback
+2026-08-26T05:57Z	6a87081-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	11.51	11.41,11.81,11.61,11.21	conv_transpose on GPU (new default for Vulkan)
+2026-08-26T05:59Z	6a87081-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	22.61	22.41,22.41,22.41,23.22	control: conv_transpose on CPU fallback
+2026-08-26T06:01Z	6a87081-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	20.32	20.21,19.41,21.02,20.62	conv_transpose on GPU (new default for Vulkan)
+2026-08-26T06:02Z	6a87081-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	16.71	16.41,16.61,16.81,17.01	default unchanged: conv_transpose stays on CPU
+2026-08-26T06:04Z	6a87081-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	25.82	24.82,26.62,25.82,26.02	conv_transpose forced onto the CUDA kernel - regression, kept as evidence
+2026-08-26T06:05Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.76	10.81,10.61,11.41,10.21	default unchanged: conv_transpose stays on CPU
+2026-08-26T06:07Z	6a87081-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	14.41	14.01,14.61,14.01,15.01	conv_transpose forced onto the HIP kernel - regression, kept as evidence
+2026-08-26T06:33Z	f775bbf	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	15.96	16.01,15.81,16.01,16.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:34Z	f775bbf-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.51	10.21,11.01,10.81,10.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:35Z	f775bbf-dirty	VK 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	10.01	10.41,10.21,9.61,9.81	conv_transpose as GEMM + col2im (new default)
+2026-08-26T06:36Z	f775bbf-dirty	VK 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	19.01	18.81,19.01,19.21,19.01	conv_transpose as GEMM + col2im (new default)
+2026-08-26T07:13Z	a10b036-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	15.86	15.41,17.01,15.61,15.41	GGML_NATIVE=OFF control, GEMM vocoder
+2026-08-26T07:14Z	a10b036-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	16.31	16.81,15.61,16.41,16.41	GGML_NATIVE=OFF, conv_transpose back on the CPU fallback
+2026-08-26T07:17Z	a10b036-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	10.71	10.61,11.01,11.01,10.21	GGML_NATIVE=OFF control, GEMM vocoder
+2026-08-26T07:18Z	a10b036-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	OFF	OFF	10.66	10.41,10.81,10.41,11.01	GGML_NATIVE=OFF, conv_transpose back on the CPU fallback
+2026-08-26T07:54Z	2981ef9	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru_short.txt:136B	bench	ON	OFF	2.17	2.01,2.01,2.81,1.81,2.21	baseline before per-voice prefix reuse
+2026-08-26T07:56Z	2981ef9-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	16.13	16.81,16.81,15.81,15.41,15.81	baseline before per-voice prefix reuse; code is 2981ef9, only this file was dirty
+2026-08-26T08:14Z	386f1a1	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru_short.txt:136B	bench	ON	OFF	2.09	2.41,2.21,1.81,2.01,2.01	per-voice prefix reuse; wall time cannot resolve it - see optimization.md
+2026-08-26T08:15Z	386f1a1-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru.txt:1032B	bench	ON	OFF	15.89	16.21,16.01,16.81,15.41,15.01	per-voice prefix reuse; wall time cannot resolve it - see optimization.md
+2026-08-26T08:16Z	386f1a1-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru_short.txt:136B	bench	ON	OFF	1.49	1.41,1.41,1.41,1.61,1.61	per-voice prefix reuse; wall time cannot resolve it - see optimization.md
+2026-08-26T08:16Z	386f1a1-dirty	ROCm 6800XT	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru_short.txt:136B	bench	ON	OFF	1.57	1.81,1.61,1.41,1.41,1.61	control: QWEN3_TTS_PREFIX_CACHE=0, prefix reuse disabled
+2026-08-26T08:16Z	386f1a1-dirty	CUDA 1660S	Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf	bench_ru_short.txt:136B	bench	ON	OFF	2.29	2.21,2.41,2.21,2.41,2.21	control: QWEN3_TTS_PREFIX_CACHE=0, prefix reuse disabled

@@ -837,14 +837,64 @@ What the protocol does and why each part is load-bearing:
   once. The CLI also defaults to one-shot decode where the server streams.
 - **One warm-up request, discarded** — it costs about double (79.9 vs ~32
   ms/frame on CUDA, 2026-08-25).
-- **Four timed requests, averaged**, with every individual run kept in the row
-  so a bad spread is visible rather than hidden in a mean.
-- **Whole request wall time.** Never compare backends by generation ms/frame:
-  the vocoder is overlapped into generation on CUDA, ROCm and Metal and not on
-  Vulkan or CPU (`pipeline_supported()` in `qwen3_tts.cpp`), so the number means
-  different things on either side of that line.
+- **A fixed seed** (`--seed`, default 1234, recorded in the row). This is the
+  one thing that makes the headline number usable, and until 2026-08-27 it was
+  missing. Whole-request wall time is dominated by how much audio the model
+  chose to produce, and with an unpinned seed that is a fresh draw every run.
+  ROCm 6800XT, `bench_ru.txt`, 12 runs each:
+
+  | seed | audio produced | wall time |
+  |---|---|---|
+  | random | 38.72 – 44.88 s (**14.7%**) | 9.81 – 11.01 s (**11.5%**) |
+  | fixed | 39.44 s, bit-identical every run | 9.61 – 10.01 s (**4.2%**) |
+
+  The spread in seconds *was* the spread in length, almost exactly. On the
+  short text the pinned protocol lands on 1.41 s nine times out of nine.
+- **Nine timed requests, and the MEDIAN** — every run kept in the row so a bad
+  spread stays visible. Not the mean: on this machine roughly every fourth
+  request costs ~300 ms more (~3%), entirely inside the generation loop, on a
+  period of about 38 s. It reproduces (7 slow runs out of 24, at 1, 5, 9, 13,
+  16, 20, 24). A mean of four hands that hiccup a quarter of the weight.
+- **The produced duration is recorded and checked.** All runs in a row must
+  have generated the same audio; if they did not, the script warns and marks
+  the row `VARIES`, because a median over different amounts of work compares
+  nothing.
+- **Whole request wall time, end to end**, as the headline — what a caller
+  actually waits for. `ms_per_frame` is the same wall time divided by the
+  frames that came out of it, for the cases where seconds cannot be compared
+  (see below). Neither is the server's own generation ms/frame: never compare
+  backends by *that*, because the vocoder is overlapped into generation on
+  CUDA, ROCm and Metal and not on Vulkan or CPU (`pipeline_supported()` in
+  `qwen3_tts.cpp`), so it means different things on either side of that line.
 - **One voice in the library directory.** The server preloads the whole library
   in the background, and 198 voices compete with what is being measured.
+
+**Which column to compare:**
+
+- Same backend, same weights, a change that does not touch numerics — compare
+  `median_s` directly, after checking that `audio_s` matches. If it does not,
+  the change moved the token stream and seconds are timing different work.
+- Different backend, different weight type, or anything else that changes the
+  tokens — the lengths differ by construction, so compare `ms_per_frame`.
+
+The first baseline written under this protocol shows why that rule is not
+pedantry. Same machine, same GPU, same text, same seed:
+
+| | median_s | audio_s | ms_per_frame |
+|---|---|---|---|
+| ROCm 6800XT | **9.61** | 39.44 | 20.31 |
+| VK 6800XT | 10.21 | 43.28 | **19.66** |
+
+Vulkan is 6% slower by the clock and 3% faster per frame, and both are true:
+it generated 10% more audio for the same input, because a different backend's
+arithmetic samples a different token stream. Under the old protocol only the
+first column existed and this looked like a clean Vulkan regression.
+
+`benchmarks/speed-v1.tsv` is the history from before this protocol: means of
+four unpinned runs. Its rows are kept because they are the record of what was
+measured, but they are **not comparable** to rows in `speed.tsv` — different
+statistic, different seed regime. The script refuses to append to a file whose
+header is not its own, so the two series cannot silently merge.
 
 `benchmarks/bench_ru.txt` is the default input and should stay unchanged; a new
 text starts a new series. Rows with `text=ward.txt` predate it and came from
@@ -852,10 +902,12 @@ Oleg's own `test_tts.sh` on a file outside this repo.
 
 ## Measurement notes
 
-- Compare **ms/frame**, not wall time. Frame count varies run to run with
-  sampling, and greedy (`--temperature 0`) is unstable on this model — it can
-  run to the 6144-frame cap and produce near-silence. Two of this sweep's
-  early "regressions" were that, not code.
+- Wall time is the headline, but only with the seed pinned — otherwise the
+  frame count varies run to run with sampling and takes the seconds with it,
+  and **ms/frame** is the only thing left worth comparing. Greedy
+  (`--temperature 0`) is unstable on this model regardless — it can run to the
+  6144-frame cap and produce near-silence. Two of this sweep's early
+  "regressions" were that, not code.
 - **Do not compare configurations by RTF when they change how much audio the
   model produces.** RTF is time per second of output, so anything that makes
   the model speak longer for the same text looks faster. This is how the
@@ -865,7 +917,8 @@ Oleg's own `test_tts.sh` on a file outside this repo.
   time per request, and report the produced duration alongside it.
 - Verify intelligibility, not just timing: transcribing the output with an ASR
   model catches degradations that RMS and duration checks miss.
-- **Three runs and a median, minimum.** This machine throws occasional 30%
+- **Three runs and a median, minimum** — nine in `bench_speed.sh`, which has a
+  known ~3% periodic hiccup to out-vote. This machine throws occasional 30%
   outliers on an unchanged configuration — 12.3-12.9 ms/frame next to 9.1 in
   the same group during the chunk sweep. Two apparent wins on 2026-08-24 (7% on
   CUDA, 11% on HIP) turned out to be single-run noise. If the spread within a
