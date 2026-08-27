@@ -38,10 +38,10 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 K-quants need `qwen3-tts-quantize` (see below); the Python converter cannot
 write them.
 
-Every one of these keeps the embedding tables at the source type, which is
-**36% of the file** and was never measured. See *The embedding tables* below —
-quantising `talker.text_embd` costs nothing detectable and takes 26% off a
-1.7B `q4_k`, 42% off a 0.6B one.
+Every one of these quantises `talker.text_embd` — the Qwen vocabulary table,
+36% of the file — and keeps the *other* embedding tables (`codec_embd`,
+`codebook`) at the source type. That split is measured, not inherited: see
+*The embedding tables* below.
 
 ## How much each one throws away
 
@@ -100,15 +100,18 @@ finding. It is how *One case where the rms ranking inverts* below was measured,
 and it is the only ears-free test here that has caught something `--verify`
 could not see.
 
-## The embedding tables are 36% of the file, and skipping them was never measured
+## The embedding tables are 36% of the file, and one of them is now quantised
 
 `_should_quantize()` in the Python converter, mirrored by `should_quantize_name()`
-in `qwen3-tts-quantize`, keeps every tensor whose name contains `_embd`,
+in `qwen3-tts-quantize`, used to keep every tensor whose name contains `_embd`,
 `codebook`, `_norm`, `lm_head`, `codec_head` or ends in `.bias` at the source
-type. The comment under it says only "Tensors to keep in F16 for quality".
-No measurement was ever recorded for that.
+type. The comment under it said only "Tensors to keep in F16 for quality".
+No measurement was ever recorded for that. It was measured on 2026-08-26 and
+2026-08-27, and `talker.text_embd` now quantises with everything else; the rest
+of the list stands.
 
-It costs more than it looks. Broken down by tensor type, 1.7B:
+It cost more than it looked. Broken down by tensor type, 1.7B, **under the old
+skip list**:
 
 | | q8_0 | q4_k |
 |---|---|---|
@@ -125,6 +128,18 @@ the bit widths promise.
 **593.5 MiB of that 820 is a single tensor**: `talker.text_embd.weight`,
 2048 x 151936 — the Qwen vocabulary. It alone is 36% of the file.
 `code_pred.codec_embd.*` (fifteen tables) is 180 MiB more, `spk_enc` 23 MiB.
+
+That one tensor is the whole change made on 2026-08-27. What files look like
+now, both sizes, from the same bf16 sources:
+
+| | old default | now | |
+|---|---|---|---|
+| 1.7B `q8_0` | 2345 MiB | **2067 MiB** | −12% |
+| 1.7B `q4_0` | 1630 MiB | **1204 MiB** | −26% |
+| 0.6B `q8_0` | 1281 MiB | **1003 MiB** | −22% |
+| 0.6B `q4_0` | 1030 MiB | **604 MiB** | −41% |
+
+The smaller model gains more: the vocabulary is the same 151936 rows either way.
 
 ### What quantising it actually costs
 
@@ -183,14 +198,65 @@ the safe one.
   sequential passes, which the prefill dump does not reach at all, and the
   code predictor is the one place where 4-bit was *heard* (see below). Do not
   move those on this evidence.
-* **The default has not been changed.** `should_quantize_name()` still skips
-  `text_embd`. What changed is that `--tensor-type` now beats the skip list, so
-  the choice can be made per file:
+* **The default was not changed on this evidence.** It took the transcription
+  test below. `--tensor-type` also beats the skip list now, so any tensor can
+  still be forced either way per file:
 
 ```
-qwen3-tts-quantize 1.7B-bf16.gguf 1.7B-q4k-small.gguf q4_k \
-    --tensor-type talker.text_embd=q4_k
+qwen3-tts-quantize 1.7B-bf16.gguf 1.7B-fat.gguf q4_k \
+    --tensor-type talker.text_embd=bf16
 ```
+
+### What cleared it: 1460 clips, and no difference anywhere
+
+Measured 2026-08-27. The rule the section below sets is that the prefill metric
+can rule a change out but not clear it, and that clearing it needs the 20-seed
+transcription test **on a construct the base type does not already break**.
+That is what this is, six times over, at three times the seed count.
+
+Files built from `1.7B-bf16.gguf` and `0.6B-bf16.gguf` with one build of
+`qwen3-tts-quantize`; `-e` means `--tensor-type talker.text_embd=<base type>`.
+Same voice, same frozen `cache.bin`, HIP. Transcribed by `whisper large-v3-turbo`.
+
+| model / line | what is scored | base | +embd | Fisher p |
+|---|---|---|---|---|
+| 1.7B `В 2026 году … 17,5 процента …` | `17,5` came back | `q8_0` 59/60 | `q8_0e` 58/60 | 1.000 |
+| | | `q4_0` 118/120 | `q4_0e` 113/120 | 0.171 |
+| 1.7B English pangram | every word | `q8_0` 20/20 | `q8_0e` 20/20 | 1.000 |
+| | | `q4_0` 20/20 | `q4_0e` 20/20 | 1.000 |
+| 1.7B `Он прочитал Шопенгауэра …` | `Шопенгауэра` | `q8_0` 52/60 | `q8_0e` 55/60 | 0.558 |
+| | | `q4_0` 50/60 | `q4_0e` 45/60 | 0.369 |
+| 0.6B `Он прочитал Шопенгауэра …` | `Шопенгауэра` | `q8_0` 45/60 | `q8_0e` 45/60 | 1.000 |
+| | | `q4_0` 41/60 | `q4_0e` **53/60** | **0.014** |
+
+Pooled: `q8_0` 176/200 vs `q8_0e` 178/200 (p=0.876); `q4_0` 229/260 vs `q4_0e`
+231/260 (p=0.891). **Nothing moves.**
+
+Two things in that table need saying out loud rather than reading off:
+
+* **The one significant cell points the wrong way for the cautious answer.** On
+  the 0.6B, 4-bit with the vocabulary quantised reads the name *better* — 53/60
+  against 41/60, and level with bf16's 52/60, in a file 41% smaller. It does not
+  replicate on the 1.7B, where the same pair goes 45 against 50. Across sixteen
+  comparisons one cell at p=0.014 is what noise looks like. Read it as "no
+  penalty", never as "quantising helps".
+* **`bf16` drops the word too.** On the `17,5` line at full precision it says
+  "семьдесят пять процентов" once in 60. `q8_0` and `q4_0` do it 0/60 and
+  0/120, `q8_0e` and `q4_0e` 2/60 and 2/120 — pooled 1/240 against 4/180,
+  p=0.169. The failure mode that condemned `q4_k` (15 times in 20) exists in
+  this model at every precision at a ~2% rate. A file is only condemned by it
+  at `q4_k`'s magnitude, not at this one.
+
+**The 0.6B could not be tested on the `17,5` line at all.** At bf16 it returns
+that number correctly 7 times in 60 and drops the word 14 times; shortened to
+`Цена выросла на 17,5 процента.` it stops producing Russian words at all
+("на щенсетить 5%", "на сочесенится 5%"). The whole `17,5` collapse is native
+to the small model. Screening candidate lines on bf16 *before* comparing types
+is not optional — a construct at the floor cannot rank anything.
+
+What is still not settled is the other tables. `code_pred.codec_embd.*` is
+another 152 MiB and has never been through this test; the code predictor is the
+one place where 4-bit was *heard*. Do not move those without running it.
 
 ## One case where the rms ranking inverts — and what that costs the metric above
 
@@ -255,14 +321,17 @@ for release.
   20/20 on the construct that separates them.
 * Do not present `q4_k` as strictly better than `q4_0`. At 4 bits, whatever is
   chosen, say that numeric content is where this model is least reliable.
-* **The `text_embd` default is not being changed on the strength of the prefill
+* **The `text_embd` default was not changed on the strength of the prefill
   measurement alone.** That measurement says it is numerically free; this
-  section says numerical freedom is not the whole question. What it would take
-  is this same 20-seed transcription test run against a construct where the
-  base type is *not* already broken.
+  section says numerical freedom is not the whole question. What it took was
+  this same test against constructs the base type does not already break —
+  1460 clips of it, above, which is what actually moved the default.
 
-Not yet checked: whether the `17,5` collapse reproduces on the 0.6B, and
-whether any other construct shows it. One line is one line.
+Checked since (2026-08-27): the `17,5` collapse **is** native to the 0.6B,
+which returns the number correctly 7 times in 60 at bf16. And `bf16` on the
+1.7B drops the word once in 60 on this line — so this failure mode is not
+peculiar to `q4_k`, only its 75% rate is. One line is still one line; the
+`Шопенгауэра` line above is the second.
 
 ## Speed, and why the answer depends on the backend
 
@@ -336,8 +405,9 @@ the operator overriding it. That is how the `text_embd` measurement above was
 made, and without it `--keep-all` was the only escape and it takes every other
 kept tensor with it.
 
-Otherwise it leaves the same tensors alone the converter does (embeddings,
-norms, biases, heads), plus any row that is not a whole number of blocks - 38 speaker-encoder
+Otherwise it leaves the same tensors alone the converter does (`codec_embd`
+and `codebook` — but not `talker.text_embd`, see above — norms, biases, heads),
+plus any row that is not a whole number of blocks - 38 speaker-encoder
 convolutions, which K-quants skip far more often than Q8_0 because they need
 rows divisible by 256 rather than 32.
 

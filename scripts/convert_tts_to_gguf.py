@@ -281,12 +281,19 @@ class Qwen3TTSConverter:
         """Determine if a tensor should be quantized (Q8_0) or kept in F16.
         
         Tensors to keep in F16 for quality:
-        - Embeddings (codec_embd, text_embd, codebook)
+        - Embeddings (codec_embd, codebook)
         - Layer norms (attn_norm, ffn_norm, output_norm)
         - Biases
         - LM heads
         """
-        # Keep embeddings in F16
+        # talker.text_embd is the exception: the Qwen vocabulary table is 36%
+        # of the file, and 1460 transcribed clips across both model sizes
+        # cannot tell a file with it quantised from one without. See
+        # docs/quantisation.md.
+        if "text_embd" in tensor_name:
+            return True
+
+        # Keep the remaining embeddings in F16
         if any(x in tensor_name for x in ["_embd", "codebook"]):
             return False
         

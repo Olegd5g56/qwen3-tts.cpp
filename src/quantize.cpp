@@ -47,6 +47,10 @@ struct override_rule {
 // norms, biases and the output heads stay at the source type - they are the
 // tensors where low-bit noise is most audible, and the norms are F32 anyway.
 bool should_quantize_name(const std::string & name) {
+    // ...except talker.text_embd, the Qwen vocabulary: 36% of the file, and
+    // 1460 transcribed clips across both model sizes cannot tell a file with
+    // it quantised from one without. See docs/quantisation.md.
+    if (name.find("text_embd")  != std::string::npos) return true;
     if (name.find("_embd")      != std::string::npos) return false;
     if (name.find("codebook")   != std::string::npos) return false;
     if (name.find("_norm")      != std::string::npos) return false;

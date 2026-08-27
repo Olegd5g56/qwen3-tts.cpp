@@ -152,10 +152,10 @@ build/qwen3-tts-quantize talker-bf16.gguf talker-q4_k.gguf q4_k --verify
 ```
 
 `--verify` prints how much each tensor lost. `--tensor-type SUBSTR=TYPE`
-overrides individual tensors, and beats the built-in skip list — which is how
-you quantise the embedding table, worth 26% of a 1.7B `q4_k` file and 42% of a
-0.6B one. See `docs/quantisation.md` for which type to pick — the answer is not
-the usual llama.cpp answer.
+overrides individual tensors, and beats the built-in skip list — use it to keep
+a tensor at source type, or to force one the list would skip. See
+`docs/quantisation.md` for which type to pick — the answer is not the usual
+llama.cpp answer.
 
 ## Server
 
