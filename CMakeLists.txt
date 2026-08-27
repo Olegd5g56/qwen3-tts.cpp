@@ -291,13 +291,23 @@ target_link_libraries(test_icl_dump PRIVATE
 )
 
 # C ABI smoke test. Built as C on purpose: the header has to compile the way an
-# FFI consumer will compile it.
+# FFI consumer will compile it, and linking the real .so is what proves the
+# library exports what the header promises.
 add_executable(test_c_api
     tests/test_c_api.c
 )
 target_link_libraries(test_c_api PRIVATE
     qwen3tts_shared
 )
+if(NOT APPLE)
+    # libqwen3tts.so leaves the CUDA/HIP driver entry points (cuMemMap and
+    # friends) to be resolved at load time from the driver's own libcuda.so.1.
+    # A build container has the CUDA toolkit but no driver — only the stub — so
+    # without this the linker fails here, and only here, because this is the
+    # one target that links the shared library. The symbols are real and
+    # resolve at runtime on any machine that has a GPU to use.
+    target_link_options(test_c_api PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 
 # Server executable (OpenAI-compatible TTS API)
 if(QWEN3_TTS_SERVER)
