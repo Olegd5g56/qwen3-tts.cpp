@@ -792,10 +792,12 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   `generate()`. They have already diverged: the suppression window and the
   repetition penalty are only in `generate()`. A change to sampling rules has to
   be made in both places and can silently be made in one.
-- **20 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, ten documented.
-  Several (`DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`) are
-  diagnostics branched inline in hot loops. Tolerable; worth a config struct
-  before the next handful arrives.
+- **21 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, 11 documented
+  in the README (counted 2026-08-26). The ten undocumented ones are diagnostics
+  — `DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`,
+  `SKIP_REF_CODES`, `KEEP_RUNAWAY`, `PROBE_NUM`, `PROBE_TOP`, `USE_COREML`,
+  `COREML_MODEL` — several branched inline in hot loops. Tolerable; worth a
+  config struct before the next handful arrives.
 - **The C ABI (`qwen3tts_c_api`) lags the core**: no ICL/`ref_codes`, no
   streaming, and a different `max_audio_tokens` default. `top_p` is present but
   deliberately unused (kept for ABI stability, documented at the declaration —

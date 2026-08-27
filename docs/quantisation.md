@@ -411,6 +411,11 @@ produces a different token sequence, so a side-by-side comparison is comparing
 one draw against another. Judge across several seeds, or the seed is what you
 are hearing.
 
+Where the thing being judged can be written down — a number, a name, a foreign
+word — twenty seeds through a transcriber beats any number of careful listens,
+and it caught something `--verify` ranked backwards. See *One case where the
+rms ranking inverts*.
+
 ### Voice cloning is not an axis to choose on
 
 Measured 2026-08-25 the objective way: synthesise with a cloned voice, run the
