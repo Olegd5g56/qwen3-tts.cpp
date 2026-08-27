@@ -32,6 +32,8 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 | `q5_k` `q6_k` | everywhere | the middle of the ladder |
 | `bf16` | everywhere with VRAM | bit-identical to the checkpoint |
 | `q4_0` | everywhere | more weight error than `q4_k`, and on the one line where the two were compared by transcription it was the one that stayed correct. Not superseded; not obviously worse either |
+| `q3_k` | everywhere, but | **slower than `q4_k` on CUDA** (29.5 vs 25.5 ms/frame) while being smaller. Nothing recommends it on NVIDIA |
+| `q2_k` | **nowhere** | loads and speaks one sentence, then **runs away on a paragraph** - 924 frames with no end-of-speech, deterministically, on both GPUs. See known-issues #26 |
 | `f32` | everywhere | 2x bytes for nothing; no reason left to use it |
 | `f16` | **nowhere** | accepted so #16 stays reproducible; warns |
 
@@ -377,6 +379,52 @@ same column means different things on either side of that line.
 For whole-request figures see `optimization.md`. The short version, warm server,
 1.7B Q8_0, a 100-word line: ROCm 6800 XT 11.7 s, Vulkan 6800 XT 14.5 s, CUDA
 1660 SUPER 17.5 s, Vulkan 1660 SUPER 26.9 s.
+
+### Whole-request, which says the same thing
+
+Measured 2026-08-27 with `scripts/bench_speed.sh` — warm server, pinned seed,
+median of nine, 1.7B, `bench_ru.txt`, the whole ladder rebuilt that day from one
+bf16 with one build of the tool. The point of running it was that the table
+above measures *generation only*, and an internal metric that does not show up
+in what a request costs is worth nothing. This one does show up.
+
+`marginal` is `(wall - prefill) / frames` — the per-frame cost with the fixed
+cost taken out, which is what compares across types that produce different
+amounts of audio.
+
+| 1.7B | CUDA 1660S wall | audio | ms/frame | marginal | ROCm 6800XT wall | audio | ms/frame | marginal |
+|---|---|---|---|---|---|---|---|---|
+| `bf16` | 22.02 | 43.36 | 42.32 | 41.59 | 15.21 | 43.92 | 28.86 | 28.53 |
+| `q8_0` | 15.61 | 42.16 | 30.86 | 29.82 | 10.01 | 40.88 | 20.41 | 20.28 |
+| `q6_k` | 15.41 | 43.60 | 29.45 | 28.47 | 10.81 | 44.00 | 20.47 | 20.31 |
+| `q5_k` | 14.81 | 44.88 | 27.50 | 26.52 | 10.41 | 41.28 | 21.02 | 20.86 |
+| `q4_k` | 14.01 | 44.08 | 26.49 | **25.50** | 11.01 | 45.20 | 20.30 | 20.16 |
+| `q4_0` | 12.41 | 39.04 | 26.49 | **25.36** | 10.21 | 43.76 | 19.44 | **19.33** |
+| `q3_k` | 18.81 | 51.76 | 30.28 | 29.46 | 13.41 | 57.68 | 19.37 | 19.27 |
+| `q2_k` | — | — | — | — | — | — | — | — |
+
+**It agrees with the generation-only table above to about a point.** CUDA
+`q8_0`->`q4_0` is −15% there and −15% here; ROCm the same step is −4% there and
+−4.7% here; `bf16`->`q8_0` is −31%/−27% there against −28%/−29% here. The
+internal metric was not lying about this one.
+
+**Do not read the wall column across rows.** ROCm `q8_0` is 10.01 s and `q4_k`
+is 11.01 s, and `q4_k` is nevertheless the *faster* of the two per frame — it
+simply chose to generate 4.3 s more audio. Every type draws a different token
+stream from the same seed, so seconds compare nothing here. This is the same
+rule that applies across backends; see `optimization.md`.
+
+**`q3_k` inverts on CUDA and not on AMD.** 29.46 marginal against `q4_k`'s
+25.50, while on ROCm it is the fastest row on the board. Fewer bits is not
+automatically faster: what matters is whether the backend has a good kernel for
+that layout. It also ran 51.76 s of audio against `q4_k`'s 44.08 for the same
+text and seed, which is what over-quantisation looks like before it becomes a
+runaway.
+
+**`q2_k` produced no row at all.** Nine requests out of nine hit the frame
+budget with no end-of-speech token, on both backends, so the harness refused to
+write a time — there was nothing to time. It is not a load failure: the same
+file says one short sentence correctly in 212 frames. See known-issues #26.
 
 ## Making one
 

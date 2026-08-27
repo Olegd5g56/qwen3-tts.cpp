@@ -34,6 +34,7 @@ root cause still there) / **wontfix**.
 | [23](#23) | A 60 s reference clip paired with an 8 s transcript | fixed 2026-08-26 (clip deleted) |
 | [24](#24) | Material inherited from before the fork | fixed 2026-08-26 (swept) |
 | [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
+| [26](#26) | `q2_k` runs away on any paragraph — no end-of-speech, hits the frame budget | open 2026-08-27 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1194,3 +1195,40 @@ to produce `reference/debug/audio_resampled.bin`. It was deleted and restored.
 **When deciding whether a script is dead, grep the C++ too**; a `git grep` over
 the whole tree is the cheap version of this and would have caught it first
 time.
+
+
+## 26. `q2_k` runs away on any paragraph
+
+**Status: open** (2026-08-27). Not a bug in the quantiser — a quality floor.
+
+Found while benchmarking the rebuilt ladder for speed. `q2_k` was the one type
+that produced no row at all: nine timed requests out of nine on `bench_ru.txt`
+returned an error instead of audio, on **both** ROCm/6800XT and CUDA/1660S, at
+a pinned seed. `bench_speed.sh` refused to write a row rather than average
+nine failures, which is what its "a request produced no server log line" guard
+is for.
+
+The CLI shows what happens:
+
+```
+decode: frame 900/924 ...
+WARN generation hit the 924-frame budget without an end-of-speech token -
+     the model ran away (see docs/known-issues.md #11)
+Error: the model did not signal end of speech and ran to the 924-frame budget
+```
+
+**It is not a load or numerics failure.** The same file, same build, same
+voice, given one short sentence (`Он прочитал Шопенгауэра...`) produces 212
+frames and correct-sounding audio at ~18 ms/frame. 2 bits is simply below what
+this model needs to decide when to stop.
+
+`q3_k` is the warning shot: it does not run away, but it generated 51.8 s of
+audio for a text the neighbouring types render in 44 s, on the same seed — the
+same failure mode, not yet fatal.
+
+**What to do:** nothing, unless someone wants 2-bit badly. `q3_k` is already
+*slower* than `q4_k` on CUDA while being smaller — see `quantisation.md`,
+*Whole-request, which says the same thing* — so the bottom of the ladder has no
+user. The types worth shipping stop at `q4_0`/`q4_k`.
+
+Related: [#11](#11), the runaway itself, which this is one trigger for.
