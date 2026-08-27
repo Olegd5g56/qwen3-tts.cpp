@@ -1,4 +1,5 @@
 #include "tts_transformer.h"
+#include "env_config.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 #include "log.h"
@@ -103,21 +104,12 @@ bool TTSTransformer::load_model(const std::string & model_path) {
 
     skip_ggml_code_pred_layers_ = false;
 #if defined(__APPLE__)
-    const char * use_coreml_env = std::getenv("QWEN3_TTS_USE_COREML");
-    bool coreml_disabled = false;
-    if (use_coreml_env && use_coreml_env[0] != '\0') {
-        std::string use_coreml = use_coreml_env;
-        std::transform(use_coreml.begin(), use_coreml.end(), use_coreml.begin(),
-                       [](unsigned char c) { return (char) std::tolower(c); });
-        coreml_disabled = use_coreml == "0" || use_coreml == "false" ||
-                          use_coreml == "off" || use_coreml == "no";
-    }
+    const bool coreml_disabled = qwen3_tts::env().coreml_disabled;
 
     if (!coreml_disabled) {
         std::string coreml_path;
-        const char * override_env = std::getenv("QWEN3_TTS_COREML_MODEL");
-        if (override_env && override_env[0] != '\0') {
-            coreml_path = override_env;
+        if (!qwen3_tts::env().coreml_model.empty()) {
+            coreml_path = qwen3_tts::env().coreml_model;
         } else {
             size_t slash = model_path.find_last_of("/\\");
             const std::string model_dir = (slash == std::string::npos) ? "." : model_path.substr(0, slash);
@@ -220,30 +212,21 @@ bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_pa
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();
 
-    const char * use_coreml_env = std::getenv("QWEN3_TTS_USE_COREML");
-    bool coreml_disabled = false;
-    if (use_coreml_env && use_coreml_env[0] != '\0') {
-        std::string use_coreml = use_coreml_env;
-        std::transform(use_coreml.begin(), use_coreml.end(), use_coreml.begin(),
-                       [](unsigned char c) { return (char) std::tolower(c); });
-        coreml_disabled = use_coreml == "0" || use_coreml == "false" ||
-                          use_coreml == "off" || use_coreml == "no";
-    }
+    const bool coreml_disabled = qwen3_tts::env().coreml_disabled;
 
     if (coreml_disabled) {
         return true;
     }
 
 #if !defined(__APPLE__)
-    if (use_coreml_env && use_coreml_env[0] != '\0') {
+    if (qwen3_tts::env().coreml_requested) {
         log_warn("CoreML code predictor requested but this build is not on Apple platform");
     }
     return true;
 #else
     std::string coreml_path;
-    const char * override_env = std::getenv("QWEN3_TTS_COREML_MODEL");
-    if (override_env && override_env[0] != '\0') {
-        coreml_path = override_env;
+    if (!qwen3_tts::env().coreml_model.empty()) {
+        coreml_path = qwen3_tts::env().coreml_model;
     } else {
         size_t slash = model_path.find_last_of("/\\");
         const std::string model_dir = (slash == std::string::npos) ? "." : model_path.substr(0, slash);
@@ -1198,11 +1181,7 @@ int32_t TTSTransformer::prefix_cache_cap() const {
     // Eight voices is a few tens of megabytes of host memory on the 1.7B and
     // covers the "a handful of narrators" case the server is actually used
     // for. The whole library is deliberately not the default.
-    int32_t cap = 8;
-    if (const char * env = std::getenv("QWEN3_TTS_PREFIX_CACHE")) {
-        cap = (int32_t) strtol(env, nullptr, 10);
-        if (cap < 0) cap = 0;
-    }
+    const int32_t cap = (int32_t) qwen3_tts::env().prefix_cache;
     prefix_cache_cap_ = cap;
     return cap;
 }
@@ -1460,7 +1439,7 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         const int32_t new_text_content_count = std::max(0, n_tokens - 8);
         const int32_t * new_text_content = text_tokens + 3;
 
-        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
+        const bool skip_ref_codes = qwen3_tts::env().skip_ref_codes;
         const size_t n_ref_codes  = (size_t) n_ref_frames * cfg.n_codebooks;
 
         uint64_t voice_key = hash_bytes(ref_codes, n_ref_codes * sizeof(int32_t));
@@ -3340,15 +3319,15 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     // this point is autoregressive and diverges on a changed last bit, so this
     // is the last place two builds can be compared number to number. It is how
     // "did this change the maths" gets answered without listening to anything.
-    if (const char * dump_path = std::getenv("QWEN3_TTS_DUMP_PREFILL")) {
-        if (FILE * f = fopen(dump_path, "wb")) {
+    if (const std::string & dump_path = qwen3_tts::env().dump_prefill; !dump_path.empty()) {
+        if (FILE * f = fopen(dump_path.c_str(), "wb")) {
             fwrite(last_hidden_.data(), sizeof(float), last_hidden_.size(), f);
             fwrite(logits.data(),       sizeof(float), logits.size(),       f);
             fclose(f);
             log_info("prefill dump: %zu hidden + %zu logits -> %s",
-                     last_hidden_.size(), logits.size(), dump_path);
+                     last_hidden_.size(), logits.size(), dump_path.c_str());
         } else {
-            log_warn("prefill dump: cannot open %s", dump_path);
+            log_warn("prefill dump: cannot open %s", dump_path.c_str());
         }
     }
 
@@ -3392,7 +3371,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             return false;
         }
         // ICL diagnostic: log top-5 cb0 logits and last_hidden_ norm for first 5 frames
-        if (frame < 5 && std::getenv("QWEN3_TTS_DUMP_LOGITS")) {
+        if (frame < 5 && qwen3_tts::env().dump_logits) {
             double hnorm = 0.0;
             for (int h = 0; h < cfg.hidden_size; ++h) hnorm += (double)last_hidden_[h] * last_hidden_[h];
             hnorm = std::sqrt(hnorm);

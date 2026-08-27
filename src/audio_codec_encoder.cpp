@@ -1,4 +1,5 @@
 #include "audio_codec_encoder.h"
+#include "env_config.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 #include "log.h"
@@ -771,7 +772,7 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
     }
 
     // optional per-stage dump for Python-parity bisection
-    if (const char * prefix = std::getenv("QWEN3_TTS_DUMP_STAGES")) {
+    if (const std::string & prefix = qwen3_tts::env().dump_stages; !prefix.empty()) {
         const char * names[] = {"stage_input_conv","stage_cnn_0","stage_cnn_1","stage_cnn_2","stage_cnn_3","stage_final_conv","stage_transformer"};
         for (const char * n : names) {
             struct ggml_tensor * t = ggml_graph_get_tensor(gf, n);
@@ -785,7 +786,7 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
             } else {
                 ggml_backend_tensor_get(t, buf.data(), 0, n_elems * sizeof(float));
             }
-            char path[512]; snprintf(path, sizeof(path), "%s_%s.bin", prefix, n);
+            char path[512]; snprintf(path, sizeof(path), "%s_%s.bin", prefix.c_str(), n);
             FILE * fp = fopen(path, "wb");
             if (fp) {
                 int32_t hdr[4] = { (int32_t)t->ne[0], (int32_t)t->ne[1], (int32_t)t->ne[2], (int32_t)t->ne[3] };
@@ -820,15 +821,15 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
         }
     }
 
-    if (const char * dp = std::getenv("QWEN3_TTS_DUMP_FEATURES")) {
-        FILE * fp = fopen(dp, "wb");
+    if (const std::string & dp = qwen3_tts::env().dump_features; !dp.empty()) {
+        FILE * fp = fopen(dp.c_str(), "wb");
         if (fp) {
             int32_t hdr[2] = { n_frames, hidden };
             fwrite(hdr, sizeof(int32_t), 2, fp);
             fwrite(features_row.data(), sizeof(float), features_row.size(), fp);
             fclose(fp);
             log_info("dumped pre-VQ features [%d frames x %d hidden] to %s",
-                     n_frames, hidden, dp);
+                     n_frames, hidden, dp.c_str());
         }
     }
 

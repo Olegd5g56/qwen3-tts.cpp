@@ -1,4 +1,5 @@
 #include "audio_tokenizer_decoder.h"
+#include "env_config.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 #include "log.h"
@@ -34,11 +35,7 @@ namespace {
 // ggml_backend_sched pins a node to the buffer its weights live in, so leaving
 // the weights on the GPU would keep the graph there whatever backend we build.
 bool vocoder_wants_cpu() {
-    static const bool want = [] {
-        const char * env = std::getenv("QWEN3_TTS_VOCODER");
-        return env && (env[0] == 'c' || env[0] == 'C');
-    }();
-    return want;
+    return qwen3_tts::env().vocoder_on_cpu;
 }
 
 // The six conv_transpose_1d weights of the vocoder. Named out in full rather
@@ -97,11 +94,7 @@ bool is_conv_transpose_weight(const std::string & name) {
 // reachable with this off: this path never asks supports_op about
 // CONV_TRANSPOSE_1D at all.
 bool conv_transpose_wants_gemm() {
-    static const bool want = [] {
-        const char * env = std::getenv("QWEN3_TTS_CONV_T_GEMM");
-        return !env || !env[0] || env[0] != '0';
-    }();
-    return want;
+    return qwen3_tts::env().conv_t_gemm;
 }
 
 // QWEN3_TTS_CONV_T_F32=0/1 forces it either way.
@@ -110,9 +103,9 @@ bool conv_transpose_wants_f32() {
         if (conv_transpose_wants_gemm()) {
             return false;
         }
-        const char * env = std::getenv("QWEN3_TTS_CONV_T_F32");
-        if (env && env[0]) {
-            return env[0] != '0';
+        const int forced = qwen3_tts::env().conv_t_f32;
+        if (forced >= 0) {
+            return forced != 0;
         }
         if (vocoder_wants_cpu()) {
             return false;

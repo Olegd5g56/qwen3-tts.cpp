@@ -1,4 +1,5 @@
 #include "op_profiler.h"
+#include "env_config.h"
 #include "log.h"
 
 #include <algorithm>
@@ -159,21 +160,13 @@ bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 }
 
 bool num_probe_on() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("QWEN3_TTS_PROBE_NUM");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
+    return qwen3_tts::env().probe_num;
 }
 
 }  // namespace
 
 bool op_profiler_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("QWEN3_TTS_PROFILE_OPS");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
+    return qwen3_tts::env().profile_ops;
 }
 
 void op_profiler_attach(ggml_backend_sched_t sched, const char * label) {
@@ -201,13 +194,8 @@ void op_profiler_report(const char * label) {
         while (n_over < nrows.size() && nrows[n_over].second.max_abs > 65504.0) {
             n_over++;
         }
-        size_t n_top = 25;
-        if (const char * env = std::getenv("QWEN3_TTS_PROBE_TOP")) {
-            const long v = strtol(env, nullptr, 10);
-            if (v > 0) {
-                n_top = (size_t) v;
-            }
-        }
+        const int    top   = qwen3_tts::env().probe_top;
+        const size_t n_top = top > 0 ? (size_t) top : 25;
         const size_t n_show = std::min<size_t>(nrows.size(), std::max<size_t>(n_over, n_top));
         for (size_t i = 0; i < n_show; ++i) {
             const auto & r = nrows[i];

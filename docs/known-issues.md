@@ -928,12 +928,25 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   in `talker_kwargs`, while `code_predictor.generate()` is given only
   do_sample/top_k/top_p/temperature (`modeling_qwen3_tts.py`, the `talker_kwargs`
   dict). Both call sites now say so, so the asymmetry does not read as a bug.
-- **21 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**, 11 documented
-  in the README (counted 2026-08-26). The ten undocumented ones are diagnostics
-  — `DUMP_CODES`, `DUMP_LOGITS`, `DUMP_STAGES`, `DUMP_FEATURES`,
-  `SKIP_REF_CODES`, `KEEP_RUNAWAY`, `PROBE_NUM`, `PROBE_TOP`, `USE_COREML`,
-  `COREML_MODEL` — several branched inline in hot loops. Tolerable; worth a
-  config struct before the next handful arrives.
+- ~~**21 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**~~ **Fixed
+  2026-08-27.** All 21 are now fields of one struct in `src/env_config.h`, read
+  once on first use (`qwen3_tts::env()`), and all 21 are in the README — the
+  ten diagnostics that were only discoverable by grep now have a table of their
+  own. That header is the list: a switch that is not in it does not exist.
+
+  Two things this surfaced. Each site had invented its own parsing, so
+  "unset", "empty" and "0" meant different things in different files; the
+  struct keeps the exact old meaning per variable and says which are
+  presence-only (`SKIP_REF_CODES`, `DUMP_LOGITS` — any value, including 0,
+  enables them) and which are tri-state (`PIPELINE`, `CONV_T_F32`, where unset
+  is a third answer, not a default). And `QWEN3_TTS_DUMP_CODES` never fired on
+  the pipelined decode path, which is the one every GPU backend uses — it
+  needs `QWEN3_TTS_PIPELINE=0`. That predates the refactor; the README now
+  says so.
+
+  Verified as a pure refactor: byte-identical audio on both benchmark texts,
+  and the switches still bite (`PREFIX_CACHE=0` → "0 of 187 tokens from
+  cache", `PIPELINE=0` → the sequential path and its dump).
 - ~~**The C ABI (`qwen3tts_c_api`) lags the core.**~~ **Caught up 2026-08-27.**
   It now has ICL cloning (`qwen3_tts_voice_from_file` + `..._synthesize_request`),
   live PCM through a callback, `n_codebooks`/`seed`/`instructions`, and the

@@ -1,4 +1,5 @@
 #include "qwen3_tts.h"
+#include "env_config.h"
 #include "gguf_loader.h"
 #include "audio_streamers.h"
 #include "log.h"
@@ -46,9 +47,9 @@ namespace {
 // ends up slower than running them one after the other, so it stays on the
 // sequential path. Force either way with QWEN3_TTS_PIPELINE=1/0.
 bool pipeline_supported(const std::string & backend_name) {
-    const char * env = std::getenv("QWEN3_TTS_PIPELINE");
-    if (env && env[0]) {
-        return env[0] != '0';
+    const int forced = env().pipeline;
+    if (forced >= 0) {
+        return forced != 0;
     }
     static const char * const overlapping[] = { "CUDA", "ROCm", "HIP", "Metal" };
     for (const char * prefix : overlapping) {
@@ -62,12 +63,7 @@ bool pipeline_supported(const std::string & backend_name) {
 // QWEN3_TTS_DECODE_BATCH, or 0 when unset — the two callers below have
 // different defaults and only share the override.
 int decode_batch_override() {
-    static const int frames = [] {
-        const char * env = std::getenv("QWEN3_TTS_DECODE_BATCH");
-        const int    n   = env ? atoi(env) : 0;
-        return n > 0 ? n : 0;
-    }();
-    return frames;
+    return env().decode_batch;
 }
 
 // Overlapped path: small, so the vocoder starts early in the utterance.
@@ -371,8 +367,7 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
         decoder_model_path_ = vocoder_path;
     }
 
-    const char * low_mem_env = std::getenv("QWEN3_TTS_LOW_MEM");
-    low_mem_mode_ = low_mem_env && low_mem_env[0] != '\0' && low_mem_env[0] != '0';
+    low_mem_mode_ = env().low_mem;
     if (low_mem_mode_) {
         log_debug("low-memory mode enabled (lazy decoder + component unloads)");
     }
@@ -947,8 +942,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     // disables it if a legitimate synthesis ever trips the guard.
     int32_t frame_budget = params.max_audio_tokens;
     {
-        const char * env = std::getenv("QWEN3_TTS_FRAME_BUDGET");
-        if (!(env && env[0] == '0')) {
+        if (qwen3_tts::env().frame_budget) {
             const int32_t b = audio_token_budget(text, params.max_audio_tokens);
             if (b < frame_budget) frame_budget = b;
         }
@@ -991,9 +985,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     if (n_frames >= frame_budget) {
         // Debug escape hatch: keep the (unusable) audio so a runaway can be
         // listened to instead of only counted. See docs/known-issues.md #16.
-        const char * keep = std::getenv("QWEN3_TTS_KEEP_RUNAWAY");
-        const bool   keep_runaway = keep && keep[0] && keep[0] != '0';
-        result.hit_token_budget = !keep_runaway;
+        result.hit_token_budget = !env().keep_runaway;
         result.error_msg = "the model did not signal end of speech and ran to the "
                            + std::to_string(frame_budget) + "-frame budget";
         log_warn("generation hit the %d-frame budget without an end-of-speech token "
@@ -1099,13 +1091,13 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         log_info("[icl] ref_frames=%d new_frames=%d prepended=%d",
                  n_ref_frames, n_frames, (int)icl);
     }
-    if (const char * dp = std::getenv("QWEN3_TTS_DUMP_CODES")) {
+    if (const std::string & dp = env().dump_codes; !dp.empty()) {
         static std::atomic<int> dump_counter{0};
         int idx = dump_counter.fetch_add(1);
-        std::string path = std::string(dp);
+        std::string path = dp;
         if (path.find("%d") != std::string::npos) {
             char buf[1024];
-            snprintf(buf, sizeof(buf), dp, idx);
+            snprintf(buf, sizeof(buf), dp.c_str(), idx);
             path = buf;
         }
         FILE * fp = fopen(path.c_str(), "wb");

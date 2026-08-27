@@ -313,8 +313,28 @@ spoken text, not just the timbre.
 | `QWEN3_TTS_CONV_T_GEMM` | on | Run the vocoder's transposed convolutions as `mul_mat` + `col2im_1d` instead of ggml's `conv_transpose_1d`. 2.3–4.5x faster decode on every backend, +34 MB. `0` restores the op. |
 | `QWEN3_TTS_CONV_T_F32` | off | Only reachable with `QWEN3_TTS_CONV_T_GEMM=0`. Widens the six `conv_transpose` weights to F32 (+51 MB) so ggml's op is eligible on the GPU at all. Diagnostic; slower than both the default and the CPU fallback on CUDA and ROCm. |
 | `QWEN3_TTS_PREFIX_CACHE` | 8 | Voices whose reference block and prompt-head KV are kept for reuse across requests, evicted least-recently-used. About 7 MB of host memory per voice on the 1.7B, more for a longer reference transcript. Raise it if a workload cycles through more speakers than the cap before repeating; `0` disables the reuse. |
+| `QWEN3_TTS_USE_COREML` | on where built | Apple only. `0`/`false`/`off`/`no` keeps the code predictor on ggml instead of the CoreML model. |
+| `QWEN3_TTS_COREML_MODEL` | next to the gguf | Path to the `code_predictor.mlpackage` to use instead of `<model dir>/coreml/code_predictor.mlpackage`. |
+
+Diagnostics. None of these affect a normal run; they exist to answer a specific
+question and several cost a lot of speed:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Disables fusion and syncs per node, so read its proportions, not its absolute numbers. |
+| `QWEN3_TTS_PROBE_NUM` | off | Reports the largest activation magnitude per node — what says whether a tensor survives a cast to F16 (the limit is 65504). |
+| `QWEN3_TTS_PROBE_TOP` | 25 | Rows in that report. Nodes over the F16 limit are always shown, however many. |
 | `QWEN3_TTS_DUMP_PREFILL` | off | Path to write the prefill's last hidden state and logits as raw f32. Prefill is deterministic, so this is where two builds can be compared number to number before the sampler diverges. |
-| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Diagnostic only — disables fusion and syncs per node. |
+| `QWEN3_TTS_DUMP_LOGITS` | off | Top-5 codebook-0 logits and the hidden-state norm for the first five frames. Set to anything, including 0. |
+| `QWEN3_TTS_DUMP_CODES` | off | Path for the generated speech codes; a `%d` in it is replaced with a per-call counter. Only written on the sequential decode path, so pair it with `QWEN3_TTS_PIPELINE=0`. |
+| `QWEN3_TTS_DUMP_STAGES` | off | Path prefix for the codec encoder's per-stage tensors, for Python-parity bisection. |
+| `QWEN3_TTS_DUMP_FEATURES` | off | Path for the codec encoder's pre-VQ features. |
+| `QWEN3_TTS_SKIP_REF_CODES` | off | Drops the ICL reference frames from the prompt. Set to anything, including 0. |
+| `QWEN3_TTS_KEEP_RUNAWAY` | off | Return the audio from a runaway generation instead of reporting failure, so it can be listened to. See `docs/known-issues.md` #11. |
+
+All of the above are read **once**, on first use, in `src/env_config.h` — that
+file is the complete list, and a switch that is not in it does not exist.
+Setting one after the process has started has no effect.
 
 ## Testing
 

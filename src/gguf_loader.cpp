@@ -1,4 +1,5 @@
 #include "gguf_loader.h"
+#include "env_config.h"
 #include "ggml-cpu.h"
 
 #include <cstdio>
@@ -56,9 +57,8 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         return shared.backend;
     }
 
-    const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
     ggml_backend_t backend = nullptr;
-    if (!(force_cpu && force_cpu[0] == '1')) {
+    if (!qwen3_tts::env().force_cpu) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
         if (!backend) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
@@ -197,8 +197,7 @@ bool load_tensor_data_from_file(
     // for the CPU.
     ggml_backend_t backend = nullptr;
     if (preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
-        if (!(force_cpu && force_cpu[0] == '1')) {
+        if (!qwen3_tts::env().force_cpu) {
             static const enum ggml_backend_dev_type ladder[] = {
                 GGML_BACKEND_DEVICE_TYPE_IGPU,
                 GGML_BACKEND_DEVICE_TYPE_GPU,

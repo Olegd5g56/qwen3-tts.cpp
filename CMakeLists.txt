@@ -80,10 +80,12 @@ add_subdirectory(${GGML_DIR})
 
 # Shared stderr logger — tiny library that every other lib pulls in, so
 # log_info/log_warn/log_error resolve no matter which combination of libraries
-# a binary (CLI, server, individual test) links against. Depends on ggml for
+# a binary (CLI, server, individual test) links against. It also carries the
+# other two things every layer needs and nobody should own: the op profiler and
+# env_config (the single place the QWEN3_TTS_* switches are read). Depends on ggml for
 # the install_ggml_log_bridge() routine that funnels ggml_vulkan: / ggml_metal:
 # chatter through the same formatter.
-add_library(qwen3_log STATIC src/log.cpp src/op_profiler.cpp)
+add_library(qwen3_log STATIC src/log.cpp src/op_profiler.cpp src/env_config.cpp)
 target_include_directories(qwen3_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qwen3_log PUBLIC ggml)
 
@@ -333,6 +335,7 @@ install(FILES
     src/audio_tokenizer_decoder.h
     src/qwen3_tts.h
     src/qwen3tts_c_api.h
+    src/env_config.h
     DESTINATION include
 )
 
