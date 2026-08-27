@@ -28,10 +28,10 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 | `--type` | works | notes |
 |---|---|---|
 | **`q8_0`** | everywhere | **the default.** Cheapest to be sure about. |
-| `q4_k` | everywhere | same bytes as `q4_0`, less *weight* error - but see *One case where the rms ranking inverts* before choosing it over `q4_0` |
+| `q4_k` | everywhere | same bytes as `q4_0`, less *weight* error, and **not better** - it drops a word from a spoken decimal 44 times in 60. See *the ranking dissolves* |
 | `q5_k` `q6_k` | everywhere | the middle of the ladder |
 | `bf16` | everywhere with VRAM | bit-identical to the checkpoint |
-| `q4_0` | everywhere | more weight error than `q4_k`, and on the one line where the two were compared by transcription it was the one that stayed correct. Not superseded; not obviously worse either |
+| `q4_0` | everywhere | more weight error than `q4_k` and **also not better** - it loses a four-digit integer where `q4_k` does not. The two do not rank; choose on the text, not the type |
 | `q3_k` | everywhere, but | **slower than `q4_k` on CUDA** (29.5 vs 25.5 ms/frame) while being smaller. Nothing recommends it on NVIDIA |
 | `q2_k` | **nowhere** | loads and speaks one sentence, then **runs away on a paragraph** - 924 frames with no end-of-speech, deterministically, on both GPUs. See known-issues #26 |
 | `f32` | everywhere | 2x bytes for nothing; no reason left to use it |
@@ -98,7 +98,12 @@ draw is a lottery ticket; twenty draws is a rate, and a rate has a confidence
 interval. Give the same line to every type with seeds 1..20, transcribe all of
 it with `whisper` — the stack already runs one — and score whether the words
 came back. That turns "it sounded wrong" into 3/20 against 20/20, which is a
-finding. It is how *One case where the rms ranking inverts* below was measured,
+finding. **`scripts/seed_sweep.py` is that, packaged** — it generates,
+transcribes, scores, prints Wilson intervals and Fisher exact p, and resumes an
+interrupted run from the clips already on disk. Read its docstring before using
+it; the two traps (screen the line on `bf16` first, calibrate the pattern
+against what whisper actually writes) are both in there.
+It is how *One case where the rms ranking inverts* below was measured,
 and it is the only ears-free test here that has caught something `--verify`
 could not see.
 
@@ -321,8 +326,10 @@ for release.
 
 * Publish `q8_0`, `q6_k`, `q5_k` without qualification — all three are 19/20 or
   20/20 on the construct that separates them.
-* Do not present `q4_k` as strictly better than `q4_0`. At 4 bits, whatever is
-  chosen, say that numeric content is where this model is least reliable.
+* Do not present either 4-bit type as better than the other. 480 clips over
+  three constructs put each of them behind `bf16` somewhere and neither behind
+  the other consistently. At 4 bits, whatever is chosen, say that numeric
+  content is where this model is least reliable.
 * **The `text_embd` default was not changed on the strength of the prefill
   measurement alone.** That measurement says it is numerically free; this
   section says numerical freedom is not the whole question. What it took was
@@ -332,8 +339,54 @@ for release.
 Checked since (2026-08-27): the `17,5` collapse **is** native to the 0.6B,
 which returns the number correctly 7 times in 60 at bf16. And `bf16` on the
 1.7B drops the word once in 60 on this line — so this failure mode is not
-peculiar to `q4_k`, only its 75% rate is. One line is still one line; the
-`Шопенгауэра` line above is the second.
+peculiar to `q4_k`, only its 75% rate is.
+
+### Rerun at 60 seeds on the rebuilt files — and the ranking dissolves
+
+Measured 2026-08-27 with `scripts/seed_sweep.py`, which is that day's other
+product: the method above had been re-implemented by hand every time it was
+used. 480 clips, 1.7B, voice `ostro`, files rebuilt that morning from one bf16
+with one build of the tool, so `talker.text_embd` is quantised in all of them.
+
+**Calibrate the pattern before reading the table.** The first pass scored the
+literal string `17,5` and put `bf16` at 47/60. It is 54/60: across 180 clips
+whisper wrote the same spoken number as `17,5` 97 times, `17-5` 9, `17, 5` 4,
+`17. 5` 2. Those are the judge, not the model. The numbers below use
+`17[\s,.-]{0,2}5`.
+
+| line | scored | bf16 | `q4_0` | `q4_k` |
+|---|---|---|---|---|
+| `В 2026 году … 17,5 … 3480 …` (seeds 1-120) | `17,5` came back | **113/120** | **108/120** | **12/60** |
+| | `3480` came back | **80/120** | **58/120** | 41/60 |
+| `Он прочитал Шопенгауэра…` (seeds 1-60) | `Шопенгауэра` | **49/60** | 34/60 | 37/60 |
+| | `Рахманинова` | 60/60 | 55/60 | 57/60 |
+
+**`q4_k`'s collapse replicates and is not marginal.** 12/60 against `bf16`'s
+113/120 and `q4_0`'s 108/120, p < 0.0001 either way. In 44 of 60 draws it says
+"семьдесят пять процентов" — it drops a whole word, exactly as at 20 seeds in
+August, on rebuilt files, at three times the sample.
+
+**But `q4_0` has a construct of its own, and this is new.** It returns `3480`
+58 times in 120 against `bf16`'s 80 — p = 0.006, and it replicates: seeds 1-60
+gave 30/60 vs 43/60 (p = 0.024) and the fresh seeds 61-120 gave 26/60 vs 37/60
+(p = 0.067), same direction, same size. `q4_k` is untouched there (41/60,
+against `bf16`'s 67% rate).
+
+**And on a third construct the two are indistinguishable** — `Шопенгауэра`
+34/60 vs 37/60, p = 0.71, with both below `bf16` (p = 0.005 and p = 0.025).
+
+**So the two 4-bit types do not rank.** Each loses something the other keeps:
+`q4_k` a word in a decimal, `q4_0` a four-digit integer, and on a hard proper
+noun they degrade together. The August retraction was right that `--verify`
+ranked them backwards; it was too kind to `q4_0` in saying it "stayed correct".
+Nothing here recommends one over the other — pick on size (identical), speed
+(identical, see below) or which construct your text contains.
+
+**Two calibration facts that come free.** `bf16` returns `3480` only 80 times
+in 120: the model is unreliable on four-digit integers at full precision, and a
+4-bit type cannot be blamed for the first two-thirds of that gap. And `bf16` is
+94% on `17,5`, not the 100% the 20-seed run suggested — twenty draws put a
+ceiling where there was a wall.
 
 ## Speed, and why the answer depends on the backend
 
