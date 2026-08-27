@@ -28,10 +28,10 @@ it **on both model sizes** — a magnitude from one says nothing about the other
 | `--type` | works | notes |
 |---|---|---|
 | **`q8_0`** | everywhere | **the default.** Cheapest to be sure about. |
-| `q4_k` | everywhere | same bytes as `q4_0`, less *weight* error, and **not better** - it drops a word from a spoken decimal 44 times in 60. See *the ranking dissolves* |
+| `q4_k` | everywhere | **the 4-bit type to use** - chosen by ear over `q4_0`, twice. Cost: drops a word from a spoken decimal 44 times in 60, so prefer `q8_0` for text with numbers |
 | `q5_k` `q6_k` | everywhere | the middle of the ladder |
 | `bf16` | everywhere with VRAM | bit-identical to the checkpoint |
-| `q4_0` | everywhere | more weight error than `q4_k` and **also not better** - it loses a four-digit integer where `q4_k` does not. The two do not rank; choose on the text, not the type |
+| `q4_0` | everywhere | **not built any more.** Equal to `q4_k` on words (it loses four-digit integers where `q4_k` loses decimals) and behind it by ear, twice. Still works if you want it |
 | `q3_k` | everywhere, but | **slower than `q4_k` on CUDA** (29.5 vs 25.5 ms/frame) while being smaller. Nothing recommends it on NVIDIA |
 | `q2_k` | **nowhere** | loads and speaks one sentence, then **runs away on a paragraph** - 924 frames with no end-of-speech, deterministically, on both GPUs. See known-issues #26 |
 | `f32` | everywhere | 2x bytes for nothing; no reason left to use it |
@@ -326,10 +326,10 @@ for release.
 
 * Publish `q8_0`, `q6_k`, `q5_k` without qualification — all three are 19/20 or
   20/20 on the construct that separates them.
-* Do not present either 4-bit type as better than the other. 480 clips over
-  three constructs put each of them behind `bf16` somewhere and neither behind
-  the other consistently. At 4 bits, whatever is chosen, say that numeric
-  content is where this model is least reliable.
+* On words, neither 4-bit type is better: 480 clips over three constructs put
+  each of them behind `bf16` somewhere and neither behind the other
+  consistently. `q4_k` is the one built, chosen by ear. At 4 bits, whatever is
+  chosen, say that numeric content is where this model is least reliable.
 * **The `text_embd` default was not changed on the strength of the prefill
   measurement alone.** That measurement says it is numerically free; this
   section says numerical freedom is not the whole question. What it took was
@@ -375,12 +375,19 @@ against `bf16`'s 67% rate).
 **And on a third construct the two are indistinguishable** — `Шопенгауэра`
 34/60 vs 37/60, p = 0.71, with both below `bf16` (p = 0.005 and p = 0.025).
 
-**So the two 4-bit types do not rank.** Each loses something the other keeps:
-`q4_k` a word in a decimal, `q4_0` a four-digit integer, and on a hard proper
-noun they degrade together. The August retraction was right that `--verify`
-ranked them backwards; it was too kind to `q4_0` in saying it "stayed correct".
-Nothing here recommends one over the other — pick on size (identical), speed
-(identical, see below) or which construct your text contains.
+**So the two 4-bit types do not rank on words.** Each loses something the other
+keeps: `q4_k` a word in a decimal, `q4_0` a four-digit integer, and on a hard
+proper noun they degrade together. The August retraction was right that
+`--verify` ranked them backwards; it was too kind to `q4_0` in saying it
+"stayed correct". Size and speed are identical too.
+
+**What broke the tie was an ear, and it is allowed to.** This test scores
+whether the words came back. It says nothing about timbre, stress or how
+cleanly the voice is reproduced, and that is what Oleg listens for — twice now
+he has put `q4_0` last on exactly that (2026-08-27 and August, both in
+*Recorded ear verdicts*). **`q4_k` is the 4-bit type this repo builds.** Carry
+its one known cost with it: on text containing spoken decimals it will drop the
+integer part most of the time, so use `q8_0` where numbers matter.
 
 **Two calibration facts that come free.** `bf16` returns `3480` only 80 times
 in 120: the model is unreliable on four-digit integers at full precision, and a
@@ -631,6 +638,13 @@ for the backend that will run it, and on ears.
 
 ### Recorded ear verdicts, most recent first
 
+- **2026-08-27, after the 480-clip rerun below.** Oleg: "k звучит заметно
+  лучше чем 0". Said with the transcription table in front of him, so it is a
+  verdict about *sound*, not about the words — and it is the second time his
+  ear has put `q4_0` last (see August, below). **This is the deciding call for
+  what gets built.** The types kept on disk are now `bf16`, `q8_0`, `q4_k`
+  only; the rest were deleted, and any of them regenerates from the bf16 in a
+  minute.
 - **2026-08-25, 1.7B, cloned Russian voice, one seed each.** Oleg's read:
   heavily seed-dependent; on that draw `q4_k` came out best of the six, with
   possibly weaker cloning fidelity than `q8_0`/`bf16` but correct stress
