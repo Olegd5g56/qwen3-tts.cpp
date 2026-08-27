@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -816,26 +817,49 @@ int main(int argc, char ** argv) {
         // atomic load, cheap enough to be called per ggml node. The watcher
         // also covers time spent queued on synth_mutex: if we acquire the
         // lock and the flag is already set, we skip synthesis entirely.
+        //
+        // The wait is a condition variable and not sleep_for, because the
+        // response does not leave until this handler returns and this thread
+        // is joined on the way out. With a plain sleep the join had to wait
+        // out whatever was left of the current 200ms tick, so every request
+        // was rounded UP to a multiple of 200ms on the wire: measured 2015-
+        // 2033ms of work delivered as 2207ms nine times out of nine. That cost
+        // 100ms on average, 200ms at worst, and it is what the benchmark
+        // history called a periodic ~3% hiccup - synthesis drifting across a
+        // tick boundary, not the model.
         std::atomic<bool> client_gone{false};
-        std::atomic<bool> stop_watcher{false};
+        std::mutex watcher_mu;
+        std::condition_variable watcher_cv;
+        bool stop_watcher = false;
         std::thread watcher([&]() {
-            while (!stop_watcher.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                if (stop_watcher.load(std::memory_order_relaxed)) break;
-                if (req.is_connection_closed()) {
+            std::unique_lock<std::mutex> lk(watcher_mu);
+            while (!watcher_cv.wait_for(lk, std::chrono::milliseconds(200),
+                                        [&] { return stop_watcher; })) {
+                // Don't hold the lock across the socket peek: the handler
+                // takes it to stop us, and it is on the caller's clock.
+                lk.unlock();
+                const bool gone = req.is_connection_closed();
+                lk.lock();
+                if (gone) {
                     client_gone.store(true, std::memory_order_relaxed);
                     break;
                 }
             }
         });
         struct watcher_join {
-            std::atomic<bool> & stop;
+            std::mutex & mu;
+            std::condition_variable & cv;
+            bool & stop;
             std::thread & t;
             ~watcher_join() {
-                stop.store(true, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    stop = true;
+                }
+                cv.notify_all();
                 if (t.joinable()) t.join();
             }
-        } watcher_guard{stop_watcher, watcher};
+        } watcher_guard{watcher_mu, watcher_cv, stop_watcher, watcher};
 
         // synthesize (serialized), using voice embedding if provided
         tts_result result;

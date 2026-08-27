@@ -28,10 +28,15 @@
 #     The audio length is bit-identical across runs, so what is left is the
 #     machine, not the draw.
 #   * Nine timed requests, all recorded, and the MEDIAN reported - not the
-#     mean. On this machine roughly every fourth request runs ~300 ms slower
-#     (~3%), entirely inside the generation loop, on a period of about 38 s.
-#     A mean of four gives that hiccup a quarter of the weight; a median of
-#     nine ignores it.
+#     mean, so one slow run cannot move the row. Until 2026-08-27 this had a
+#     specific thing to out-vote: the server rounded every request UP to a
+#     multiple of 200 ms (its disconnect watcher was joined on the way out
+#     while still inside a sleep_for). That is fixed - see optimization.md,
+#     "The server added 200 ms to every request" - but EVERY ROW WRITTEN
+#     BEFORE THE FIX CARRIES IT and reads in 0.2 s steps. The first rows
+#     without it are noted "watcher join no longer waits out its 200ms sleep
+#     tick". Comparing across that line is only honest if the gap is bigger
+#     than 200 ms.
 #   * The audio duration of every run is recorded and checked. If it moves
 #     while the seed is pinned, the run is not reproducible and the wall times
 #     in it compare nothing - the script says so instead of averaging them.
@@ -53,10 +58,12 @@
 #
 # What this still cannot do:
 #
-#   * Resolve a change worth less than ~1% of the request. The floor is now
-#     the ~3% hiccup above, and the median only hides it, it does not remove
-#     it. For a change that only moves prefill, measure prefill directly -
-#     see optimization.md, "Per-voice prefill reuse".
+#   * Resolve a change worth less than ~1% of the request. With the 200 ms
+#     rounding gone the floor is the machine itself: a nine-run group on an
+#     unchanged configuration still drifts about 1% as the card warms up
+#     (15.42 -> 15.59 s across one group). For a change that only moves
+#     prefill, measure prefill directly - see optimization.md, "Per-voice
+#     prefill reuse".
 #
 # Usage:
 #   scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" [options]

@@ -35,6 +35,7 @@ root cause still there) / **wontfix**.
 | [24](#24) | Material inherited from before the fork | fixed 2026-08-26 (swept) |
 | [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
 | [26](#26) | `q2_k` runs away on any paragraph — no end-of-speech, hits the frame budget | open 2026-08-27 |
+| [27](#27) | The server rounded every request up to a multiple of 200 ms | fixed 2026-08-27 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1232,3 +1233,46 @@ same failure mode, not yet fatal.
 user. The types worth shipping stop at `q4_0`/`q4_k`.
 
 Related: [#11](#11), the runaway itself, which this is one trigger for.
+
+---
+
+<a id="27"></a>
+## 27. The server rounded every request up to a multiple of 200 ms
+
+**Status: fixed** 2026-08-27.
+
+The non-streaming `/v1/audio/speech` handler starts a side thread that polls
+`req.is_connection_closed()` every 200 ms so a client that hangs up stops the
+generation, and joins that thread on the way out. The thread waited with
+`sleep_for(200ms)`, and httplib does not write the response until the handler
+returns — so the join sat on the caller's clock, waiting out the rest of the
+current sleep. Every response left late by however much of a tick was left:
+0–200 ms, 100 ms on average.
+
+Twenty runs, `bench_ru_short.txt`, 1.7B Q8_0, CUDA 1660S — the server logged
+2015–2033 ms for itself while curl measured **2207 ms on all twenty**. A wall
+time that never moves while the work underneath it varies by 18 ms is the
+whole diagnosis.
+
+This is where the "periodic ~3% hiccup" in `bench_speed.sh` and
+`optimization.md` came from — it was described as every fourth request, ~300 ms,
+inside the generation loop. None of that was right: it was every request, up to
+200 ms, and outside the model entirely. Synthesis time drifting across a tick
+boundary is what made it look periodic.
+
+**Fix:** a `condition_variable::wait_for` with the same 200 ms cadence,
+notified when the handler stops it. Disconnect detection is unchanged — a
+client killed 3.0 s into a request still gets 499 at 3009 ms, and a client that
+gives up while queued behind another request still gets 499 the moment the
+mutex frees.
+
+Wall time on the short benchmark went 2.21 s → 2.05 s (−7%); on the 42 s
+paragraph 15.61 s → 15.51 s (−0.6%), because the cost is flat, not
+proportional. Live streaming (`stream_format=sse|audio`) never had this thread
+and never paid it.
+
+**Every row in `benchmarks/speed.tsv` written before the fix carries the
+quantisation** and reads in 0.2 s steps; the first two without it carry the
+note "watcher join no longer waits out its 200ms sleep tick". Full write-up in
+`optimization.md`,
+"The server added 200 ms to every request".

@@ -797,6 +797,66 @@ in `known-issues.md` #9 (ROCm) and #10 (CUDA).
    that it disables kernel fusion and adds sync per node, so treat its absolute
    numbers as upper bounds and its proportions as the signal.
 
+## The server added 200 ms to every request — the "3% hiccup" (2026-08-27)
+
+The benchmark history described a periodic hiccup: roughly every fourth request
+~300 ms slower, "entirely inside the generation loop", on a period of about
+38 s. Both halves of that were wrong. It was not periodic and it was not in the
+generation loop — it was the HTTP handler, and it was on **every** request.
+
+The non-streaming handler starts a side thread that polls
+`req.is_connection_closed()` every 200 ms so a client that hangs up stops the
+generation. The thread was a `sleep_for(200ms)` loop, and the handler joins it
+on the way out. httplib does not write the response until the handler returns,
+so the join sat on the caller's clock, waiting out whatever was left of the
+current sleep. Whole-request wall time was therefore **synthesis rounded UP to
+a multiple of 200 ms**.
+
+Twenty requests, one warm server, `bench_ru_short.txt`, 1.7B Q8_0, CUDA 1660S,
+comparing what the server logged for itself against what curl measured:
+
+| | server's own total | client wall | difference |
+|---|---|---|---|
+| sleep loop | 2015 – 2033 ms | **2207 ms, all 20 runs** | 174 – 192 ms |
+| condition variable | 2006 – 2025 ms | 2013 – 2031 ms | 6 – 7 ms |
+
+The server's own number was stable to 18 ms while the wire time was pinned to
+the grid — which is the whole diagnosis in one table. The "every fourth request"
+pattern was synthesis time drifting across a tick boundary: a run whose real
+cost is 2205 ms is delivered at 2400, one at 2195 ms at 2200.
+
+The fix (`src/server.cpp`) is a `condition_variable::wait_for` with the same
+200 ms cadence, notified when the handler stops it, so the join returns at once.
+Disconnect detection is unchanged — a client killed mid-request still gets 499
+within one tick (measured 3009 ms into a request it abandoned at 3000 ms).
+
+Worth, by request length — cost is a flat 0–200 ms, so the share is whatever
+that is against the request:
+
+| text | before | after | |
+|---|---|---|---|
+| `bench_ru_short.txt` (136 B, 5.44 s audio) | 2.21 s | **2.05 s** | −7% |
+| `bench_ru.txt` (1032 B, 42.16 s audio) | 15.61 s | **15.51 s** | −0.6% |
+
+The short row is the A/B above — one server configuration, one model file, only
+the binary changed — because the `speed.tsv` row that predates the fix was taken
+on the *previous* Q8_0 file and produces 5.60 s of audio, so its seconds are not
+comparable. The paragraph row is a straight `speed.tsv` comparison against
+2026-08-27T13:08Z: same commit lineage, same file, same 42.16 s of audio.
+
+Two things this also fixes. The benchmark could not resolve anything finer than
+its 200 ms grid: the long-text row used to read
+`15.41,15.41,15.41,15.41,15.61,15.61,15.61,15.61,15.61` — two discrete values —
+and now reads a continuous 15.42 – 15.59. And the live-streaming path never had
+this thread at all, so `stream_format=sse|audio` never paid it; only the
+one-shot endpoint did, which is the one every benchmark row measures.
+
+The lesson worth keeping: **a number that only ever lands on a round grid is
+measuring the harness, not the work.** The grid was visible in every row of
+`benchmarks/speed.tsv` from the day the file was created — every wall time
+ending in .01, .21, .41, .61 or .81 — and it was read as machine noise for a
+day and a half.
+
 ## Tracking speed across commits
 
 `scripts/bench_speed.sh` runs one configuration and appends a row to
@@ -861,10 +921,13 @@ What the protocol does and why each part is load-bearing:
   The spread in seconds *was* the spread in length, almost exactly. On the
   short text the pinned protocol lands on 1.41 s nine times out of nine.
 - **Nine timed requests, and the MEDIAN** — every run kept in the row so a bad
-  spread stays visible. Not the mean: on this machine roughly every fourth
-  request costs ~300 ms more (~3%), entirely inside the generation loop, on a
-  period of about 38 s. It reproduces (7 slow runs out of 24, at 1, 5, 9, 13,
-  16, 20, 24). A mean of four hands that hiccup a quarter of the weight.
+  spread stays visible. This is what made the 200 ms quantisation above
+  survivable before it was found, and it is still the right protocol: a mean
+  hands a single slow run a ninth of the weight. Every row written before
+  the fix carries that quantisation and reads in 0.2 s steps — the first rows
+  without it are the two noted "watcher join no longer waits out its 200ms
+  sleep tick". Across that line two rows differ by 0–200 ms of harness, so
+  compare them only if the gap is larger than that.
 - **The produced duration is recorded and checked.** All runs in a row must
   have generated the same audio; if they did not, the script warns and marks
   the row `VARIES`, because a median over different amounts of work compares
@@ -952,8 +1015,9 @@ Oleg's own `test_tts.sh` on a file outside this repo.
   time per request, and report the produced duration alongside it.
 - Verify intelligibility, not just timing: transcribing the output with an ASR
   model catches degradations that RMS and duration checks miss.
-- **Three runs and a median, minimum** — nine in `bench_speed.sh`, which has a
-  known ~3% periodic hiccup to out-vote. This machine throws occasional 30%
+- **Three runs and a median, minimum** — nine in `bench_speed.sh`. (The "~3%
+  periodic hiccup" this used to cite was the server's own 200 ms rounding, not
+  the machine — see above; it is fixed.) This machine throws occasional 30%
   outliers on an unchanged configuration — 12.3-12.9 ms/frame next to 9.1 in
   the same group during the chunk sweep. Two apparent wins on 2026-08-24 (7% on
   CUDA, 11% on HIP) turned out to be single-run noise. If the spread within a
