@@ -16,7 +16,7 @@ root cause still there) / **wontfix**.
 | [5](#5) | Two ggml Vulkan backend instances serialise on one device | worked around (pipeline gated to CUDA/Metal) |
 | [6](#6) | Stale architecture numbers in `AGENTS.md` | fixed 2026-08-20 |
 | [7](#7) | Codebook truncation breaks generation, not just fidelity | wontfix 2026-08-20 |
-| [8](#8) | ggml Vulkan multi-add fusion is pathological on RADV / RDNA2 | worked around (env var), upstream bug |
+| [8](#8) | ggml Vulkan multi-add fusion is pathological on RADV / RDNA2 | worked around (env var); no longer reproduces on Mesa 26.2.1 (2026-08-27) |
 | [9](#9) | ROCm is no longer the slow option on gfx1030 | resolved |
 | [10](#10) | Why CUDA used to measure slower than Vulkan | explained; fixed by the KV window |
 | [11](#11) | Generation does not stop — runs to the 6144-frame cap on long text | mitigated (guard + retry); root cause is upstream and unfixed |
@@ -275,6 +275,33 @@ i.e. noise), so this is a RADV/RDNA2 path.
 on an AMD card. Set in `Dockerfile.vulkan`. Harmless on NVIDIA.
 
 **Worth reporting upstream** with the shape/dtype of the add chain.
+
+### 2026-08-27: no longer reproduces here, and the workaround is now a no-op
+
+Re-measured on Mesa 26.2.1 (RADV, api 1.4.354) under the pinned-seed protocol,
+RX 6800 XT, `bench_ru.txt`, medians of 9. All three rows produced 43.28 s of
+audio, so they are timing the same work:
+
+| Vulkan fusion | median | ms/frame |
+|---|---|---|
+| as shipped | 10.21 s | 19.659 |
+| `GGML_VK_DISABLE_MULTI_ADD=1` | 10.21 s | 19.659 |
+| `GGML_VK_DISABLE_FUSION=1` | 11.21 s | **21.584** |
+
+Disabling multi-add changes nothing to three decimal places. Disabling *all*
+fusion costs 10%, so fusion is very much running and earning its keep — it is
+specifically the multi-add pathology that is gone. The 3.3x is not there any
+more, and Vulkan is now the fastest per-frame configuration on this machine
+(19.66 ms/frame against ROCm's 20.31).
+
+Two things changed since 2026-08-19 and this measurement cannot say which did
+it: Mesa was updated, and the vocoder was rewritten (`f775bbf`, conv_transpose
+as GEMM + col2im) so the graph feeding the fusion is not the same graph.
+
+**The env var stays in `Dockerfile.vulkan`.** It is measured free here, and an
+image does not get to assume the host's Mesa is this new. Status stays
+"worked around" rather than "fixed" for the same reason: nothing was fixed
+*here*, it stopped reproducing.
 
 ---
 

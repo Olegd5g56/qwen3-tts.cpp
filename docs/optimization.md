@@ -877,8 +877,8 @@ What the protocol does and why each part is load-bearing:
 - Different backend, different weight type, or anything else that changes the
   tokens — the lengths differ by construction, so compare `ms_per_frame`.
 
-The first baseline written under this protocol shows why that rule is not
-pedantry. Same machine, same GPU, same text, same seed:
+The baseline written under this protocol shows why that rule is not pedantry.
+Same machine, same GPU, same text, same seed:
 
 | | median_s | audio_s | ms_per_frame |
 |---|---|---|---|
@@ -889,6 +889,24 @@ Vulkan is 6% slower by the clock and 3% faster per frame, and both are true:
 it generated 10% more audio for the same input, because a different backend's
 arithmetic samples a different token stream. Under the old protocol only the
 first column existed and this looked like a clean Vulkan regression.
+
+That Vulkan number was checked rather than trusted, because a backend can also
+look fast by producing less: both files transcribe to the source text word for
+word and sit at the same level (-23.4 dB against ROCm's -23.7).
+
+The full baseline, 2026-08-27, 1.7B `q8_0`, medians of 9 at seed 1234:
+
+| | short text | | long text | |
+|---|---|---|---|---|
+| | median_s | ms/frame | median_s | ms/frame |
+| ROCm 6800XT | 1.41 | 21.92 | 9.61 | 20.31 |
+| VK 6800XT | 1.41 | 24.08 | 10.21 | **19.66** |
+| CUDA 1660S | 2.21 | 32.89 | 16.41 | 30.80 |
+| VK 1660S | 2.81 | 38.51 | 19.21 | 37.54 |
+
+Prefill is where the two cards differ most: 59 ms on the 6800 XT against
+528 ms on the 1660 SUPER for the long text, which is four PCIe lanes as much
+as it is the GPU.
 
 `benchmarks/speed-v1.tsv` is the history from before this protocol: means of
 four unpinned runs. Its rows are kept because they are the record of what was

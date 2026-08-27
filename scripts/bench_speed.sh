@@ -152,6 +152,10 @@ COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 OUT_REL=${OUT#$ROOT/}
 git -C "$ROOT" diff --quiet -- . ":(exclude)$OUT_REL" 2>/dev/null || COMMIT="$COMMIT-dirty"
 NATIVE=$(cache GGML_NATIVE); TIMING=$(cache QWEN3_TTS_TIMING)
+# Everything passed with --env goes in the row. A device selection or a backend
+# workaround changes the answer exactly as much as a build flag does, and a row
+# that does not say which one was set cannot be compared to anything.
+ENV_ID=$( [ ${#EXTRA_ENV[@]} -gt 0 ] && (IFS=' '; echo "${EXTRA_ENV[*]}") || echo '-' )
 TEXT_ID="$(basename "$TEXT"):$(wc -c < "$TEXT" | tr -d ' ')B"
 
 "$BUILD/qwen3-tts-server" --help >/dev/null 2>&1  # fail fast on a broken binary
@@ -191,8 +195,8 @@ last_log_field() {  # $1 = awk-style regex with one capture, via sed
     grep -a 'ok .*audio' "$ONEVOICE/server.log" | tail -1 | sed -nE "s/.*$1.*/\\1/p"
 }
 
-printf 'bench_speed: %s  commit=%s voice=%s seed=%s native=%s timing=%s\n' \
-    "$LABEL" "$COMMIT" "$VOICE" "$SEED" "${NATIVE:-?}" "${TIMING:-?}"
+printf 'bench_speed: %s  commit=%s voice=%s seed=%s native=%s timing=%s env=%s\n' \
+    "$LABEL" "$COMMIT" "$VOICE" "$SEED" "${NATIVE:-?}" "${TIMING:-?}" "$ENV_ID"
 request  # warm-up, discarded: it costs about double
 times=() durations=() prefills=()
 for i in $(seq 1 "$RUNS"); do
@@ -238,7 +242,7 @@ MSPF='?'
 [ ${#mspfs[@]} -gt 0 ] && MSPF=$(printf '%s\n' "${mspfs[@]}" | LC_ALL=C sort -n \
     | awk '{v[NR]=$1}END{printf "%.3f", (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}')
 
-HEADER=$'date\tcommit\tlabel\tmodel\ttext\tvoice\tseed\tnative\ttiming\tmedian_s\taudio_s\tms_per_frame\tprefill_ms\truns_s\tnote'
+HEADER=$'date\tcommit\tlabel\tmodel\ttext\tvoice\tseed\tnative\ttiming\tenv\tmedian_s\taudio_s\tms_per_frame\tprefill_ms\truns_s\tnote'
 if [ -s "$OUT" ]; then
     # A history written by an older protocol has different columns and its
     # numbers were produced a different way. Appending to it would make a file
@@ -248,9 +252,9 @@ if [ -s "$OUT" ]; then
 else
     printf '%s\n' "$HEADER" > "$OUT"
 fi
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%MZ)" "$COMMIT" "$LABEL" "$(basename "$MODEL")" "$TEXT_ID" "$VOICE" \
-    "$SEED" "${NATIVE:-?}" "${TIMING:-?}" "$median" "$AUDIO_S" "$MSPF" "$prefill_ms" \
+    "$SEED" "${NATIVE:-?}" "${TIMING:-?}" "$ENV_ID" "$median" "$AUDIO_S" "$MSPF" "$prefill_ms" \
     "$(IFS=,; echo "${times[*]}")" "$NOTE" >> "$OUT"
 
 printf 'bench_speed: %s -> %s s median of %s  (%s s audio, %s ms/frame)  appended to %s\n' \
