@@ -237,8 +237,12 @@ stack, so their KV genuinely differs per request.
 - `qwen3-tts-server` (`server.cpp` + `server_args` + `server_audio`) —
   OpenAI-compatible `/v1/audio/speech`, live streaming, the voice library, an
   idle-unload watchdog. Quiet by default (`TTS_VERBOSE` / `--verbose`).
-- `libqwen3tts.so` (`qwen3tts_c_api`) — a C ABI over the same core, currently
-  behind it in features (no ICL, no streaming).
+- `libqwen3tts.so` (`qwen3tts_c_api`) — a C ABI over the same core, for FFI
+  consumers. Caught up with the core on 2026-08-27: ICL cloning through a
+  prepared `Qwen3TtsVoice`, live PCM through a callback, and the same frame cap
+  the other two use. `qwen3_tts_synthesize_request()` is the entry point; the
+  older per-case functions are wrappers over it. Verified byte-identical to the
+  server for the same voice, text and seed (`tests/test_c_api.c`).
 
 All three go through `Qwen3TTS`, so a change to the pipeline reaches every
 front end. `install_ggml_log_bridge()` must run before the first model load or

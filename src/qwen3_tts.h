@@ -237,7 +237,9 @@ public:
 
     // Extract speaker embedding from reference audio file (without synthesis)
     // reference_audio: path to reference audio file (WAV or MP3)
-    // embedding: output vector of 1024 float32 values
+    // embedding: output vector, as wide as the talker's hidden size - 2048 for
+    //            the 1.7B, 1024 for the 0.6B. Never assume the width; a voice
+    //            encoded by one variant is unusable by the other.
     bool extract_speaker_embedding(const std::string & reference_audio,
                                     std::vector<float> & embedding);
 
@@ -255,8 +257,8 @@ public:
 
     // Generate speech with pre-extracted speaker embedding
     // text: input text to synthesize
-    // embedding: pre-extracted speaker embedding (1024 float32 values)
-    // embedding_size: number of elements in embedding (must be 1024)
+    // embedding: pre-extracted speaker embedding (see extract_speaker_embedding)
+    // embedding_size: number of elements in embedding (the talker hidden size)
     // params: generation parameters
     tts_result synthesize_with_embedding(const std::string & text,
                                           const float * embedding, int32_t embedding_size,
@@ -342,6 +344,12 @@ private:
 // Utility: Load audio file (WAV or MP3, dispatched by extension)
 bool load_audio_file(const std::string & path, std::vector<float> & samples,
                      int & sample_rate);
+
+// Utility: Resample in place to the 24 kHz the encoder and the codec expect.
+// Linear interpolation - good enough for a reference clip, and the same
+// resampler every caller must use, or two paths produce different codes from
+// the same file. A no-op when the input is already 24 kHz.
+void resample_to_24k(std::vector<float> & samples, int sample_rate);
 
 // Utility: Load audio from a memory buffer (WAV or MP3, sniffed by magic bytes)
 bool load_audio_bytes(const void * data, size_t len,

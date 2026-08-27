@@ -934,10 +934,22 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   `SKIP_REF_CODES`, `KEEP_RUNAWAY`, `PROBE_NUM`, `PROBE_TOP`, `USE_COREML`,
   `COREML_MODEL` — several branched inline in hot loops. Tolerable; worth a
   config struct before the next handful arrives.
-- **The C ABI (`qwen3tts_c_api`) lags the core**: no ICL/`ref_codes`, no
-  streaming, and a different `max_audio_tokens` default. `top_p` is present but
-  deliberately unused (kept for ABI stability, documented at the declaration —
-  that part is fine). Either catch it up or mark the target experimental.
+- ~~**The C ABI (`qwen3tts_c_api`) lags the core.**~~ **Caught up 2026-08-27.**
+  It now has ICL cloning (`qwen3_tts_voice_from_file` + `..._synthesize_request`),
+  live PCM through a callback, `n_codebooks`/`seed`/`instructions`, and the
+  frame cap the CLI and server use — the old 4096 silently truncated long
+  requests. A voice can be copied out as parts and rebuilt, which is what a
+  caller needs to cache voices the way the server does.
+
+  **The ABI broke to do it** (the params struct grew), so anything built
+  against the old header must be rebuilt. Every struct now leads with
+  `struct_size` and every entry point validates it, so the next addition is
+  refused rather than read as garbage. `top_p` is still present and still
+  deliberately unused.
+
+  Verified against the server: same voice, same text, same seed, byte-identical
+  audio — and streaming matches one-shot byte for byte. `tests/test_c_api.c`,
+  wired into ctest, skips without models like the other model-dependent tests.
 - **Two ggml findings are sitting unreported.** #17 (OOM segfault) is a
   one-line fix with a verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops
   compose into something 6x faster than its dedicated CUDA kernel — is measured

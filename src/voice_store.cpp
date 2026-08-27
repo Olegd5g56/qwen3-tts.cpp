@@ -45,23 +45,6 @@ std::string read_text_trimmed(const std::string & path) {
     return s;
 }
 
-void resample_to_24k(std::vector<float> & samples, int sample_rate) {
-    if (sample_rate == 24000 || sample_rate <= 0 || samples.empty()) return;
-    int64_t new_len = (int64_t)samples.size() * 24000 / sample_rate;
-    std::vector<float> resampled(new_len);
-    for (int64_t i = 0; i < new_len; i++) {
-        float src = (float)i * sample_rate / 24000.0f;
-        int idx = (int)src;
-        float frac = src - idx;
-        if (idx + 1 < (int)samples.size()) {
-            resampled[i] = samples[idx] * (1 - frac) + samples[idx + 1] * frac;
-        } else {
-            resampled[i] = samples[std::min(idx, (int)samples.size() - 1)];
-        }
-    }
-    samples = std::move(resampled);
-}
-
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();

@@ -82,13 +82,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/qwen3-tts /opt/qwen3-tts
 
-# GGML_VK_DISABLE_MULTI_ADD: ggml's multi-add fusion is pathological on RADV
-# (RX 6800 XT: RTF 2.20 with it, 0.65 without — the vocoder sums 15 residual
-# projections over very large tensors). Neutral on other Vulkan drivers, so it
-# is safe to set unconditionally here. See docs/known-issues.md #8.
+# No GGML_VK_DISABLE_MULTI_ADD here any more. It worked around a RADV fusion
+# pathology that turned out to be a mesa regression: gone in 26.2.1, and never
+# present in the mesa this image ships. Measured 2026-08-27 under the
+# pinned-seed protocol - setting it changes the median by nothing at all, while
+# disabling all fusion costs 10%. See docs/known-issues.md #8.
 ENV PATH=/opt/qwen3-tts/bin:$PATH \
     LD_LIBRARY_PATH=/opt/qwen3-tts/lib \
-    GGML_VK_DISABLE_MULTI_ADD=1 \
     TTS_HOST=0.0.0.0 \
     TTS_PORT=8081 \
     TTS_THREADS=8

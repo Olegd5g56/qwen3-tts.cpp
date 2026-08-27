@@ -68,8 +68,6 @@ Prefer CUDA/ROCm/Metal over Vulkan on the same card.
 - **ROCm on gfx1030**: add `-DAMDGPU_TARGETS=gfx1030
   -DCMAKE_HIP_ARCHITECTURES=gfx1030 -DCMAKE_PREFIX_PATH=/opt/rocm` and point
   the compilers at `/opt/rocm/llvm/bin/clang{,++}`.
-- **Vulkan on AMD**: set `GGML_VK_DISABLE_MULTI_ADD=1` at runtime, or it is
-  ~3x slower.
 
 ### Build toggles
 

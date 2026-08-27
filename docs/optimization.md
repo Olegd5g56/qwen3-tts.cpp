@@ -708,7 +708,7 @@ win, because they are the ones that can overlap the vocoder with generation:
 | GPU | backend | RTF |
 |---|---|---|
 | RX 6800 XT | ROCm/HIP + overlap | **0.530** |
-| RX 6800 XT | Vulkan (needs `GGML_VK_DISABLE_MULTI_ADD=1`) | 0.649 |
+| RX 6800 XT | Vulkan (`GGML_VK_DISABLE_MULTI_ADD=1`, needed on the mesa of the day) | 0.649 |
 | RX 6800 XT | Vulkan, ggml 0.9.11 — what the fork shipped | 0.672 |
 | GTX 1660 SUPER | CUDA + overlap | **0.530** |
 | GTX 1660 SUPER | Vulkan | 0.793 |

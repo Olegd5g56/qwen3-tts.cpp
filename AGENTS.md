@@ -65,7 +65,13 @@ qwen3-tts.cpp/
 
 - `qwen3_tts` (STATIC) — pipeline + audio I/O + audio_streamers; PUBLIC pkg-config
   deps on `lame` and `libopusenc` (the streamer header embeds their opaque types)
-- `qwen3tts_shared` (SHARED, soname `libqwen3tts.so`) — C ABI over qwen3_tts
+- `qwen3tts_shared` (SHARED, soname `libqwen3tts.so`) — C ABI over qwen3_tts.
+  Every struct in it starts with `struct_size` and every entry point checks it,
+  so a caller built against an older header is refused instead of misread. Add
+  fields at the END of a struct and nowhere else.
+- `test_c_api` — the C ABI's smoke test, and the only thing that would catch an
+  ABI break. Built as C on purpose. Skips (77) without `QWEN3_TTS_TEST_MODEL` /
+  `QWEN3_TTS_TEST_VOCODER`.
 - `qwen3-tts-cli` — CLI executable, links qwen3_tts + voice_store
 - `qwen3-tts-server` — HTTP server, links qwen3_tts + voice_store + httplib +
   nlohmann_json. Gated by `-DQWEN3_TTS_SERVER=ON` (default ON).

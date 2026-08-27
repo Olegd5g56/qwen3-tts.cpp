@@ -1534,6 +1534,23 @@ static bool load_mp3_bytes(const void * data, size_t len,
     return ok;
 }
 
+void resample_to_24k(std::vector<float> & samples, int sample_rate) {
+    if (sample_rate == 24000 || sample_rate <= 0 || samples.empty()) return;
+    int64_t new_len = (int64_t)samples.size() * 24000 / sample_rate;
+    std::vector<float> resampled(new_len);
+    for (int64_t i = 0; i < new_len; i++) {
+        float src = (float)i * sample_rate / 24000.0f;
+        int idx = (int)src;
+        float frac = src - idx;
+        if (idx + 1 < (int)samples.size()) {
+            resampled[i] = samples[idx] * (1 - frac) + samples[idx + 1] * frac;
+        } else {
+            resampled[i] = samples[std::min(idx, (int)samples.size() - 1)];
+        }
+    }
+    samples = std::move(resampled);
+}
+
 // Audio file loading - dispatches to format-specific loaders based on file extension
 bool load_audio_file(const std::string & path, std::vector<float> & samples,
                      int & sample_rate) {

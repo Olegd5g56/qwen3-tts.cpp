@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(qwen3-tts-ggml VERSION 0.1.0 LANGUAGES CXX)
+project(qwen3-tts-ggml VERSION 0.1.0 LANGUAGES C CXX)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -288,6 +288,15 @@ target_link_libraries(test_icl_dump PRIVATE
     Threads::Threads
 )
 
+# C ABI smoke test. Built as C on purpose: the header has to compile the way an
+# FFI consumer will compile it.
+add_executable(test_c_api
+    tests/test_c_api.c
+)
+target_link_libraries(test_c_api PRIVATE
+    qwen3tts_shared
+)
+
 # Server executable (OpenAI-compatible TTS API)
 if(QWEN3_TTS_SERVER)
     add_executable(qwen3-tts-server
@@ -345,6 +354,10 @@ add_test(NAME streaming_parity_test
     COMMAND test_streaming_parity
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(NAME c_api_test
+    COMMAND test_c_api
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 # The reference tests need model ggufs and binary dumps from the original
 # Python implementation, none of which are in the repo. Without them the tests
@@ -352,6 +365,6 @@ add_test(NAME streaming_parity_test
 # still means something. Set QWEN3_TTS_TEST_MODEL / QWEN3_TTS_TEST_VOCODER to
 # local ggufs to run the ones that need only a model.
 set_tests_properties(
-    encoder_test transformer_test streaming_parity_test
+    encoder_test transformer_test streaming_parity_test c_api_test
     PROPERTIES SKIP_RETURN_CODE 77
 )
