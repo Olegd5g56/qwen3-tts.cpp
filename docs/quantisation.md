@@ -203,7 +203,7 @@ the safe one.
   still be forced either way per file:
 
 ```
-qwen3-tts-quantize 1.7B-bf16.gguf 1.7B-fat.gguf q4_k \
+qwen3-tts-quantize Qwen3-TTS-12Hz-1.7B-Base-BF16.gguf 1.7B-fat.gguf q4_k \
     --tensor-type talker.text_embd=bf16
 ```
 
