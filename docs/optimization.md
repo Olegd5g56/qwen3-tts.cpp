@@ -82,6 +82,15 @@ Measured 2026-08-24. The point of this section is not the headline ratio — it
 is that the ratio is the average of a large win and a large loss, and that the
 loss has a name.
 
+> **Stale as of 2026-08-27, on the vocoder half.** Two days after this was
+> measured the vocoder moved onto the GPU and got 2.3-4.5x faster (`74ff512`,
+> `f775bbf`), so the 3.6x loss to cuDNN below is from before that and is
+> probably smaller or gone. `tts_transformer.cpp` changed three times since as
+> well, so the generate row is not guaranteed either. **The method below is
+> what survives** — per frame, bf16 on both sides, warm-up discarded — and it
+> is the answer to whether this comparison can be made honestly at all. Re-run
+> before quoting a number from the table.
+
 Setup, identical on both sides: 0.6B Base, `ward.txt` (726 chars, Russian),
 ICL cloning from the model card's `clone.wav` (8.08 s, 97-101 reference
 frames), `QWEN3_TTS_PIPELINE=0`, one warm-up then the median of three runs.

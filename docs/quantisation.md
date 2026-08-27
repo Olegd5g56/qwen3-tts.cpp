@@ -54,26 +54,38 @@ this model, for the reason in the next section.
 
 | type | bits/weight | rel. rms error | 0.6B | 1.7B |
 |---|---|---|---|---|
-| `q8_0` | 8.5 | **0.55%** | 1281 MiB | 2345 MiB |
-| `q6_k` | 6.56 | 1.81% | 1159 MiB | 1999 MiB |
-| `q5_k` | 5.5 | 3.68% | 1093 MiB | 1809 MiB |
-| `q4_k` | 4.5 | 7.26% | 1030 MiB | 1630 MiB |
-| `q4_0` | 4.5 | 8.82% | 1030 MiB | 1630 MiB |
+| `q8_0` | 8.5 | **0.55%** | 1003 MiB | 2067 MiB |
+| `q6_k` | 6.56 | 1.81% | 809 MiB | 1649 MiB |
+| `q5_k` | 5.5 | 3.68% | 703 MiB | 1420 MiB |
+| `q4_k` | 4.5 | 7.26% | 604 MiB | 1204 MiB |
+| `q4_0` | 4.5 | 8.82% | 604 MiB | 1204 MiB |
+| `q3_k` | 3.44 | not measured | 498 MiB | 975 MiB |
+| `q2_k` | 2.63 | not measured | 417 MiB | 799 MiB |
 
-Measured 2026-08-25 against the bf16 files. The two model sizes agree to the
-third decimal, so this is a property of the format, not of the model.
+Errors measured 2026-08-25 against the bf16 files; the two model sizes agree to
+the third decimal, so this is a property of the format, not of the model. Sizes
+re-measured 2026-08-27 after `talker.text_embd` stopped being skipped - every
+file is 12-41% smaller than the same row was before that.
+
+`q3_k` and `q2_k` are listed for the sizes only. Do not build them: `q2_k` runs
+away on any paragraph (known-issues #26) and `q3_k` is *slower* than `q4_k` on
+CUDA while being smaller.
 
 Two things fall out of it:
 
-**`q4_0` has no reason to exist any more.** Q4_K is the same 4.5 bits per
-weight - the two files match to the byte - for 17% less error, and it is no
-slower anywhere and faster on the CPU.
+**Less weight error does not mean fewer mistakes.** `q4_k` is the same 4.5 bits
+as `q4_0` - the two files match to the byte - for 17% less error by this
+metric, and it still drops a word from a spoken decimal where `q4_0` does not.
+This table ranks *distortion*. See *One case where the rms ranking inverts*
+below before using it to choose anything.
 
-**A better quant is nearly free in bytes here.** 43% of the file is embeddings
-and heads that are never quantised: of the 0.6B's 1745 MiB only 1002 MiB is
-eligible. So `q4_k` -> `q6_k` costs 129 MiB (+12%) and cuts the error fourfold.
+**A better quant is nearly free in bytes here.** In a `q4_k` file 25% of the
+0.6B and 19% of the 1.7B is still `codec_embd`, `codebook`, the norms and the
+heads, which are never quantised - so squeezing the rest pays less than the bit
+widths promise. `q4_k` -> `q6_k` costs 205 MiB on the 0.6B (+34%) and 445 MiB
+on the 1.7B (+37%), and cuts the error fourfold.
 The usual llama.cpp instinct - squeeze to 4 bits, the file is mostly weights -
-pays much worse on this model than it does on an LLM.
+pays worse on this model than it does on an LLM.
 
 ## Why generated audio cannot rank any of this
 
@@ -134,7 +146,10 @@ the bit widths promise.
 
 **593.5 MiB of that 820 is a single tensor**: `talker.text_embd.weight`,
 2048 x 151936 — the Qwen vocabulary. It alone is 36% of the file.
-`code_pred.codec_embd.*` (fifteen tables) is 180 MiB more, `spk_enc` 23 MiB.
+`code_pred.codec_embd.*` (fifteen tables) is 120.0 MiB more, `talker.codec_embd`
+12.0 and `spk_enc` 22.9 — 154.9 MiB of skips altogether beside the vocabulary.
+(Re-measured 2026-08-27 off the 1.7B bf16; this paragraph and the two below it
+had carried 180 and 152, neither of which was right.)
 
 That one tensor is the whole change made on 2026-08-27. What files look like
 now, both sizes, from the same bf16 sources:
@@ -201,7 +216,7 @@ the safe one.
 * **The other kept tables are a separate question.** `code_pred.codec_embd.*`
   isolated the same way gives 1.3 – 2.6% / 39.8 – 45.0 dB — larger than
   `text_embd` but still an order of magnitude under the body, and worth
-  another 152 MiB. But their main use is inside the code predictor's fifteen
+  another 120 MiB. But their main use is inside the code predictor's fifteen
   sequential passes, which the prefill dump does not reach at all, and the
   code predictor is the one place where 4-bit was *heard* (see below). Do not
   move those on this evidence.
@@ -262,7 +277,7 @@ to the small model. Screening candidate lines on bf16 *before* comparing types
 is not optional — a construct at the floor cannot rank anything.
 
 What is still not settled is the other tables. `code_pred.codec_embd.*` is
-another 152 MiB and has never been through this test; the code predictor is the
+another 120 MiB and has never been through this test; the code predictor is the
 one place where 4-bit was *heard*. Do not move those without running it.
 
 ## One case where the rms ranking inverts — and what that costs the metric above
@@ -642,9 +657,9 @@ for the backend that will run it, and on ears.
   лучше чем 0". Said with the transcription table in front of him, so it is a
   verdict about *sound*, not about the words — and it is the second time his
   ear has put `q4_0` last (see August, below). **This is the deciding call for
-  what gets built.** The types kept on disk are now `bf16`, `q8_0`, `q4_k`
-  only; the rest were deleted, and any of them regenerates from the bf16 in a
-  minute.
+  what gets built:** `bf16`, `q8_0`, `q4_k`. Everything else on the ladder
+  stays supported by the tool and stops being produced — any of it regenerates
+  from a bf16 file in about a minute, so there is no reason to keep one.
 - **2026-08-25, 1.7B, cloned Russian voice, one seed each.** Oleg's read:
   heavily seed-dependent; on that draw `q4_k` came out best of the six, with
   possibly weaker cloning fidelity than `q8_0`/`bf16` but correct stress
