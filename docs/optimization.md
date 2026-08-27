@@ -269,7 +269,7 @@ convolution with a GPU round trip either side.
 > CPU kernels these six land in."* Both halves are wrong. Re-measured
 > 2026-08-26 against purpose-built `NATIVE=OFF` build directories, the flag has
 > **no measurable effect** on either backend, with the GEMM vocoder *or* with
-> the CPU fallback forced back on (four rows in `speed.tsv`, all within noise).
+> the CPU fallback forced back on (four rows, all within noise — in `speed-v1.tsv`, the pre-2026-08-27 series).
 > And `NATIVE=OFF` does not strip AVX2 or FMA as was claimed — it only drops
 > `-march=native`; ggml still builds its explicit ISA variants. What the
 > original 26.67-vs-11.86 s measurement actually captured is unknown; it was
@@ -293,7 +293,8 @@ fixed seed so the frame count is identical across the pair, three runs:
 | Vulkan | 6800XT | 7.0 ms/frame | **3.8** | 1.8x better |
 | Vulkan | 1660S | 11.0 ms/frame | **8.5** | 1.3x better |
 
-Whole request, the `bench_speed.sh` protocol, rows in `benchmarks/speed.tsv`:
+Whole request, the `bench_speed.sh` protocol as it stood then (mean of four
+unpinned runs), rows in `benchmarks/speed-v1.tsv`:
 
 | config | control | conv_transpose on GPU |
 |---|---|---|

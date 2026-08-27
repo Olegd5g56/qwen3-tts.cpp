@@ -43,7 +43,9 @@ qwen3-tts.cpp/
   scripts/                      # Python utilities (HF↔GGUF conversion, refs)
                                 # + bench_speed.sh: the speed protocol
   benchmarks/                   # speed.tsv: committed speed history, one row
-                                #   per run — append, never tidy
+                                #   per run — append, never tidy.
+                                #   speed-v1.tsv is the pre-2026-08-27 series,
+                                #   measured differently and not comparable
                                 # + bench_ru.txt and voice/: the fixed input
                                 #   and reference voice. Changing either starts
                                 #   a new series.

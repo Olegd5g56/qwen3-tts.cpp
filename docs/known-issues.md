@@ -28,9 +28,11 @@ root cause still there) / **wontfix**.
 | [17](#17) | A vocoder OOM segfaults instead of failing — upstream ggml | fixed locally 2026-08-24; upstreaming deliberately deferred |
 | [18](#18) | The converter's default output type is the one that does not work | fixed 2026-08-25 |
 | [19](#19) | Nothing checks the vocoder's output for non-finite samples | fixed 2026-08-25 |
-| [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
+| [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | fixed 2026-08-26 (test deleted, not repaired) |
 | [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU | fixed 2026-08-25 |
 | [22](#22) | A 1.7B bf16 talker does not fit on a 6 GB card | open 2026-08-25 |
+| [23](#23) | A 60 s reference clip paired with an 8 s transcript | fixed 2026-08-26 (clip deleted) |
+| [24](#24) | Material inherited from before the fork | fixed 2026-08-26 (swept) |
 | [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
@@ -946,7 +948,7 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
 <a id="18"></a>
 ## 18. The converter's default output type is the one that does not work
 
-**Status:** open
+**Status:** fixed 2026-08-25
 **Found:** 2026-08-25
 **Severity:** correctness — the no-argument path produces an unusable model
 

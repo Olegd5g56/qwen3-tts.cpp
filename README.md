@@ -18,9 +18,10 @@ pipeline fits together), `optimization.md` (performance),
 `quantisation.md` (which weight type to use), `known-issues.md` (bug log),
 `ggml-notes.md` (ggml side).
 
-`scripts/bench_speed.sh` times one configuration and appends it to
-`benchmarks/speed.tsv`, which is committed so speed can be compared across
-commits.
+`scripts/bench_speed.sh` times one configuration — or one built image, with
+`--docker` — and appends it to `benchmarks/speed.tsv`, which is committed so
+speed can be compared across commits. (`speed-v1.tsv` is the older series,
+measured a different way and not comparable to it.)
 
 ## Quickstart
 
