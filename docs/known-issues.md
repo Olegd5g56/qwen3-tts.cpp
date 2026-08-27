@@ -16,7 +16,7 @@ root cause still there) / **wontfix**.
 | [5](#5) | Two ggml Vulkan backend instances serialise on one device | worked around (pipeline gated to CUDA/Metal) |
 | [6](#6) | Stale architecture numbers in `AGENTS.md` | fixed 2026-08-20 |
 | [7](#7) | Codebook truncation breaks generation, not just fidelity | wontfix 2026-08-20 |
-| [8](#8) | ggml Vulkan multi-add fusion is pathological on RADV / RDNA2 | worked around (env var); no longer reproduces on Mesa 26.2.1 (2026-08-27) |
+| [8](#8) | ggml Vulkan multi-add fusion is pathological on RADV / RDNA2 | upstream mesa regression in 26.1.x; gone in 26.2.1 and never in 25.0.7 (2026-08-27) |
 | [9](#9) | ROCm is no longer the slow option on gfx1030 | resolved |
 | [10](#10) | Why CUDA used to measure slower than Vulkan | explained; fixed by the KV window |
 | [11](#11) | Generation does not stop — runs to the 6144-frame cap on long text | mitigated (guard + retry); root cause is upstream and unfixed |
@@ -317,11 +317,44 @@ producing 42.48 s of audio:
 | `GGML_VK_DISABLE_FUSION=1` | 11.41 s | 22.383 |
 
 Identical to three decimals on a Mesa a major version older, with the same 10%
-still riding on fusion as a whole. **So the multi-add pathology is gone on both
-drivers available here**, which makes the vocoder rewrite (`f775bbf`) the more
-likely cause than any Mesa fix — the graph feeding the fusion is not the same
-graph any more. It is not proven; reverting that commit and re-running these
-three rows would prove it.
+still riding on fusion as a whole. **The multi-add pathology is gone on both
+drivers available here.**
+
+### It was a Mesa regression, not our graph
+
+An earlier version of this note guessed the vocoder rewrite (`f775bbf`) had
+removed the fused pattern. That guess is **wrong**, and it was wrong in a way
+worth recording: both measurements above run current code, so "two drivers
+agree" says nothing at all about whether the driver or the graph changed.
+
+The chain #8 blamed is still there, untouched:
+
+```
+src/audio_tokenizer_decoder.cpp:1108
+    rest_proj_2d = ggml_add(ctx0, rest_proj_2d, cb_proj_2d);   // per codebook
+```
+
+`git diff f775bbf^ f775bbf` does not touch it — that commit rewrote
+conv_transpose, a different part of the decoder. So there is no mechanism by
+which our code removed the pattern.
+
+What did change is the driver, and `/var/log/pacman.log` dates it exactly:
+
+| date | mesa on this host |
+|---|---|
+| 2026-08-15 | 26.1.7 |
+| **2026-08-19 — #8 found here** | **26.1.7** |
+| 2026-08-22 | 26.1.8 |
+| 2026-08-23 | 26.2.1 |
+
+The pathology was seen on **26.1.7**, and is absent on 26.2.1 (this host) and
+on 25.0.7 (the image). A regression that landed in the 26.1 series and was
+fixed by 26.2 fits every observation; nothing in our tree does.
+
+**Still unresolved:** #13 says the vocoder was not reaching the GPU until
+2026-08-24, which sits badly with a Vulkan fusion over vocoder tensors mattering
+on 2026-08-19. Either #13's title is broader than its finding, or the fused
+chain #8 hit was somewhere other than the vocoder. Nobody has checked.
 
 **The env var stays in `Dockerfile.vulkan`** — measured free on both drivers,
 and it still covers a driver neither of these represents. Status stays "worked
