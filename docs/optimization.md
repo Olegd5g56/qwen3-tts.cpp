@@ -908,6 +908,13 @@ Prefill is where the two cards differ most: 59 ms on the 6800 XT against
 528 ms on the 1660 SUPER for the long text, which is four PCIe lanes as much
 as it is the GPU.
 
+`--docker IMAGE` benchmarks a built image instead of a build directory, and it
+is not the same configuration: the image is built portable (`QWEN3_TTS_NATIVE`
+defaults to OFF) and carries its own userspace GPU driver. `qwen3-tts:vulkan`
+on the 6800 XT is 20.42 ms/frame against the host build's 19.66 — 4% for
+portability, on Debian's mesa 25.0.7 instead of the host's 26.2.1. Benchmark
+the image when the question is about what gets deployed.
+
 `benchmarks/speed-v1.tsv` is the history from before this protocol: means of
 four unpinned runs. Its rows are kept because they are the record of what was
 measured, but they are **not comparable** to rows in `speed.tsv` — different

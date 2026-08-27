@@ -61,10 +61,22 @@
 # Usage:
 #   scripts/bench_speed.sh --build build-cuda --label "CUDA 1660S" [options]
 #
-#   --build DIR       build directory holding qwen3-tts-server   (required)
+#   --build DIR       build directory holding qwen3-tts-server
+#   --docker IMAGE    benchmark a built image instead of a build directory.
+#                     The deployed artefact ships its own userspace GPU driver -
+#                     the Vulkan image carries Debian's mesa, not the host's -
+#                     so a host build and the image it is built from are two
+#                     different configurations and can differ. Exactly one of
+#                     --build / --docker is required.
 #   --label NAME      how this configuration is named in the log (required)
 #   --env K=V         extra environment for the server (repeatable),
 #                     e.g. --env CUDA_VISIBLE_DEVICES=0
+#   --unset-env K     remove a variable the image's own ENV sets (repeatable,
+#                     --docker only). Needed because ggml's Vulkan switches test
+#                     for a variable's PRESENCE, not its value: setting
+#                     GGML_VK_DISABLE_MULTI_ADD=0 disables multi-add just as
+#                     surely as =1 does, so the only way to measure the image
+#                     without its own workaround is to unset it.
 #   --model PATH      talker gguf      (default: $TTS_MODEL)
 #   --vocoder PATH    vocoder gguf     (default: $TTS_VOCODER)
 #   --voice NAME      voice from --voices-dir to use instead of the built-in
@@ -87,12 +99,15 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BUILD= LABEL= MODEL=${TTS_MODEL:-} VOCODER=${TTS_VOCODER:-} VOICE= VOICES_DIR=${TTS_VOICES_DIR:-}
 TEXT="$ROOT/benchmarks/bench_ru.txt" RUNS=9 PORT=8099 OUT="$ROOT/benchmarks/speed.tsv" NOTE=
-SEED=1234
+SEED=1234 DOCKER=
+declare -a UNSET_ENV=()
 declare -a EXTRA_ENV=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --build)       BUILD=$2; shift 2 ;;
+        --docker)      DOCKER=$2; shift 2 ;;
+        --unset-env)   UNSET_ENV+=("$2"); shift 2 ;;
         --label)       LABEL=$2; shift 2 ;;
         --env)         EXTRA_ENV+=("$2"); shift 2 ;;
         --model)       MODEL=$2; shift 2 ;;
@@ -111,9 +126,16 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "bench_speed: $*" >&2; exit 1; }
-[ -n "$BUILD" ]  || die "--build is required"
+[ -n "$BUILD" ] || [ -n "$DOCKER" ] || die "one of --build / --docker is required"
+[ -z "$BUILD" ] || [ -z "$DOCKER" ] || die "--build and --docker are mutually exclusive"
 [ -n "$LABEL" ]  || die "--label is required"
-[ -x "$BUILD/qwen3-tts-server" ] || die "no qwen3-tts-server in $BUILD"
+[ ${#UNSET_ENV[@]} -eq 0 ] || [ -n "$DOCKER" ] || die "--unset-env only applies to --docker"
+if [ -n "$BUILD" ]; then
+    [ -x "$BUILD/qwen3-tts-server" ] || die "no qwen3-tts-server in $BUILD"
+else
+    command -v docker >/dev/null || die "docker is required for --docker"
+    docker image inspect "$DOCKER" >/dev/null 2>&1 || die "no such image: $DOCKER"
+fi
 [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "--model / TTS_MODEL must point at a gguf"
 [ -n "$VOCODER" ] && [ -f "$VOCODER" ] || die "--vocoder / TTS_VOCODER must point at a gguf"
 [ -f "$TEXT" ] || die "text file not found: $TEXT"
@@ -151,24 +173,70 @@ COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # reads "-dirty" on identical code.
 OUT_REL=${OUT#$ROOT/}
 git -C "$ROOT" diff --quiet -- . ":(exclude)$OUT_REL" 2>/dev/null || COMMIT="$COMMIT-dirty"
-NATIVE=$(cache GGML_NATIVE); TIMING=$(cache QWEN3_TTS_TIMING)
+if [ -n "$BUILD" ]; then
+    NATIVE=$(cache GGML_NATIVE); TIMING=$(cache QWEN3_TTS_TIMING)
+else
+    # An image has no CMakeCache to read. Its identity is the image digest, and
+    # that is what has to be in the row: two images built from the same commit
+    # can still differ, because the base image's packages moved under them.
+    NATIVE="img:$(docker image inspect -f '{{.Id}}' "$DOCKER" | cut -c8-19)"; TIMING=-
+fi
 # Everything passed with --env goes in the row. A device selection or a backend
 # workaround changes the answer exactly as much as a build flag does, and a row
 # that does not say which one was set cannot be compared to anything.
 ENV_ID=$( [ ${#EXTRA_ENV[@]} -gt 0 ] && (IFS=' '; echo "${EXTRA_ENV[*]}") || echo '-' )
+for u in "${UNSET_ENV[@]}"; do
+    [ "$ENV_ID" = '-' ] && ENV_ID="unset:$u" || ENV_ID="$ENV_ID unset:$u"
+done
 TEXT_ID="$(basename "$TEXT"):$(wc -c < "$TEXT" | tr -d ' ')B"
 
-"$BUILD/qwen3-tts-server" --help >/dev/null 2>&1  # fail fast on a broken binary
-env "${EXTRA_ENV[@]}" \
-    TTS_MODEL="$MODEL" TTS_VOCODER="$VOCODER" TTS_VOICES_DIR="$ONEVOICE" \
-    TTS_PORT="$PORT" TTS_HOST=127.0.0.1 TTS_VERBOSE=1 TTS_IDLE_TIMEOUT=3600 \
-    "$BUILD/qwen3-tts-server" > "$ONEVOICE/server.log" 2>&1 &
-SERVER=$!
-trap 'kill $SERVER 2>/dev/null; rm -rf "$ONEVOICE"' EXIT
+if [ -n "$BUILD" ]; then
+    "$BUILD/qwen3-tts-server" --help >/dev/null 2>&1  # fail fast on a broken binary
+    env "${EXTRA_ENV[@]}" \
+        TTS_MODEL="$MODEL" TTS_VOCODER="$VOCODER" TTS_VOICES_DIR="$ONEVOICE" \
+        TTS_PORT="$PORT" TTS_HOST=127.0.0.1 TTS_VERBOSE=1 TTS_IDLE_TIMEOUT=3600 \
+        "$BUILD/qwen3-tts-server" > "$ONEVOICE/server.log" 2>&1 &
+    SERVER=$!
+    trap 'kill $SERVER 2>/dev/null; rm -rf "$ONEVOICE"' EXIT
+    server_alive() { kill -0 $SERVER 2>/dev/null; }
+    server_log()   { cat "$ONEVOICE/server.log"; }
+else
+    # Both gguf files are mounted by their own directory, read-only, and the
+    # staged one-voice library likewise. --device /dev/dri --group-add video is
+    # what the image's own header documents for GPU access.
+    CNAME="bench-speed-$PORT-$$"
+    docker_env=()
+    for e in "${EXTRA_ENV[@]}"; do docker_env+=(-e "$e"); done
+    # docker has no way to remove a variable the image's own ENV set - -e K=
+    # leaves it present and empty, which getenv() still sees. So when something
+    # has to be unset, the entrypoint becomes a shell that unsets it and execs
+    # the server.
+    docker_entry=(); docker_cmd=()
+    if [ ${#UNSET_ENV[@]} -gt 0 ]; then
+        unset_script=""
+        for u in "${UNSET_ENV[@]}"; do unset_script+="unset $u; "; done
+        docker_entry=(--entrypoint /bin/sh)
+        docker_cmd=(-c "${unset_script}exec /opt/qwen3-tts/bin/qwen3-tts-server")
+    fi
+    docker run -d --rm --name "$CNAME" \
+        --device /dev/dri --group-add video \
+        -p "127.0.0.1:$PORT:8081" \
+        -v "$(cd "$(dirname "$MODEL")" && pwd):/m:ro" \
+        -v "$(cd "$(dirname "$VOCODER")" && pwd):/v:ro" \
+        -v "$ONEVOICE:/voices:ro" \
+        -e TTS_MODEL="/m/$(basename "$MODEL")" -e TTS_VOCODER="/v/$(basename "$VOCODER")" \
+        -e TTS_VOICES_DIR=/voices -e TTS_HOST=0.0.0.0 -e TTS_PORT=8081 \
+        -e TTS_VERBOSE=1 -e TTS_IDLE_TIMEOUT=3600 \
+        "${docker_env[@]}" "${docker_entry[@]}" "$DOCKER" "${docker_cmd[@]}" \
+        >/dev/null || die "docker run failed"
+    trap 'docker rm -f "$CNAME" >/dev/null 2>&1; rm -rf "$ONEVOICE"' EXIT
+    server_alive() { [ -n "$(docker ps -q -f name="^$CNAME\$")" ]; }
+    server_log()   { docker logs "$CNAME" 2>&1; }
+fi
 
 for _ in $(seq 1 240); do
     curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 $SERVER 2>/dev/null || { cat "$ONEVOICE/server.log" >&2; die "server exited"; }
+    server_alive || { server_log >&2; die "server exited"; }
     sleep 1
 done
 curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || die "server never became healthy"
@@ -191,8 +259,8 @@ request() {
 # The server logs one line per finished request; the last one is ours. Duration
 # comes from there rather than from the returned bytes so that a change to the
 # container or the encoder cannot quietly move it.
-last_log_field() {  # $1 = awk-style regex with one capture, via sed
-    grep -a 'ok .*audio' "$ONEVOICE/server.log" | tail -1 | sed -nE "s/.*$1.*/\\1/p"
+last_log_field() {  # $1 = regex with one capture group
+    server_log | grep -a 'ok .*audio' | tail -1 | sed -nE "s/.*$1.*/\\1/p"
 }
 
 printf 'bench_speed: %s  commit=%s voice=%s seed=%s native=%s timing=%s env=%s\n' \
@@ -211,6 +279,14 @@ done
 med() { printf '%s\n' "$@" | LC_ALL=C sort -n | awk '{v[NR]=$1}END{printf "%.2f", (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}'; }
 median=$(med "${times[@]}")
 prefill_ms=$(med "${prefills[@]}")
+
+# A run with no log line behind it is not a slow measurement, it is a failed
+# request - the server died, the container was removed, the port moved. Writing
+# that as a row puts debris in a history whose whole value is that its rows are
+# comparable. Refuse instead: an aborted run leaves nothing behind.
+for d in "${durations[@]}"; do
+    [ "$d" = '?' ] && die "a request produced no server log line - nothing was measured, no row written"
+done
 
 # Every run must have produced the same audio, or the seconds above are timing
 # different amounts of work and their median means nothing. This is the check

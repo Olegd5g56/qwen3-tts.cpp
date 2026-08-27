@@ -20,6 +20,14 @@ models/
 *.ogg
 !examples/*.wav
 
+# Python virtualenvs. These live in the repo and are enormous (21 GB of
+# .venv + .venv-rocm on the dev box); without this, every image build spends
+# minutes walking them before deciding it needs none of it.
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+
 # Logs, scratch, forensics.
 forensics/
 *.log

@@ -31,6 +31,7 @@ root cause still there) / **wontfix**.
 | [20](#20) | The decoder tests cannot run — their reference dumps are not in the repo | open 2026-08-25 |
 | [21](#21) | 4-bit: `q4_k` never worked at all, and `q4_0` broke on GPU | fixed 2026-08-25 |
 | [22](#22) | A 1.7B bf16 talker does not fit on a 6 GB card | open 2026-08-25 |
+| [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -294,14 +295,43 @@ specifically the multi-add pathology that is gone. The 3.3x is not there any
 more, and Vulkan is now the fastest per-frame configuration on this machine
 (19.66 ms/frame against ROCm's 20.31).
 
-Two things changed since 2026-08-19 and this measurement cannot say which did
-it: Mesa was updated, and the vocoder was rewritten (`f775bbf`, conv_transpose
-as GEMM + col2im) so the graph feeding the fusion is not the same graph.
+### And it is not the host's new Mesa, because the image's old Mesa agrees
 
-**The env var stays in `Dockerfile.vulkan`.** It is measured free here, and an
-image does not get to assume the host's Mesa is this new. Status stays
-"worked around" rather than "fixed" for the same reason: nothing was fixed
-*here*, it stopped reproducing.
+The first version of this note said the env var stays because "an image does
+not get to assume the host's Mesa is this new". That reasoning was untested —
+nobody had ever run this measurement inside the container, where the userspace
+Vulkan driver is Debian's, not the host's:
+
+| | Mesa |
+|---|---|
+| host (Arch) | 26.2.1 |
+| `qwen3-tts:vulkan` (debian:trixie-slim) | **25.0.7** |
+
+Same three rows, run against the image with `bench_speed.sh --docker`, all
+producing 42.48 s of audio:
+
+| Vulkan fusion | median | ms/frame |
+|---|---|---|
+| as shipped (workaround unset) | 10.41 s | 20.421 |
+| as deployed (`GGML_VK_DISABLE_MULTI_ADD=1`) | 10.41 s | 20.421 |
+| `GGML_VK_DISABLE_FUSION=1` | 11.41 s | 22.383 |
+
+Identical to three decimals on a Mesa a major version older, with the same 10%
+still riding on fusion as a whole. **So the multi-add pathology is gone on both
+drivers available here**, which makes the vocoder rewrite (`f775bbf`) the more
+likely cause than any Mesa fix — the graph feeding the fusion is not the same
+graph any more. It is not proven; reverting that commit and re-running these
+three rows would prove it.
+
+**The env var stays in `Dockerfile.vulkan`** — measured free on both drivers,
+and it still covers a driver neither of these represents. Status stays "worked
+around" rather than "fixed": nothing was fixed *here*, it stopped reproducing.
+
+Note what the flag actually does, because it is a trap for anyone measuring it:
+ggml tests these switches with `getenv(...) != nullptr`, so
+`GGML_VK_DISABLE_MULTI_ADD=0` disables multi-add exactly as `=1` does. The only
+way to measure the image without its own workaround is to unset the variable —
+`bench_speed.sh --unset-env` exists for that.
 
 ---
 
@@ -805,6 +835,40 @@ agree rather than introducing a new convention.
 Reporting it upstream was considered and deferred on 2026-08-24: worth doing
 together with the `CONV_TRANSPOSE_1D` work, which touches the same project, so
 there is one conversation rather than two.
+
+---
+
+<a id="25"></a>
+## 25. `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers
+
+**Status:** fixed 2026-08-27
+**Found:** 2026-08-27
+**Severity:** major — the Vulkan image could not be produced at all
+
+```
+CMake Error at ggml/src/ggml-vulkan/CMakeLists.txt:14 (find_package):
+  Could not find a package configuration file provided by "SPIRV-Headers"
+```
+
+`ggml/src/ggml-vulkan/CMakeLists.txt` calls `find_package(SPIRV-Headers CONFIG
+REQUIRED)`. The builder stage installed `libvulkan-dev` and `glslc`, which was
+enough for the ggml the image was last built against and is not enough now.
+
+It went unnoticed because **the host builds work**: on Arch, `spirv-headers` is
+already present as a dependency of the Vulkan stack, so `build-vk-native`
+configures fine and nothing in the repo builds the image on a schedule.
+
+**Fix:** `spirv-headers` in the builder stage's apt list.
+
+**The general shape is worth remembering:** a host build passing says nothing
+about the image building, because the image starts from a bare base and gets
+only the packages it names. The reverse also holds and is the reason this was
+being chased at all — the image ships Debian's mesa 25.0.7 while this host runs
+26.2.1, so a Vulkan driver bug measured on one says nothing about the other.
+
+**Found alongside:** `.dockerignore` did not exclude `.venv/` and `.venv-rocm/`,
+21 GB between them, so every image build spent ~13 minutes walking them before
+sending 357 MB. Now excluded.
 
 ---
 
