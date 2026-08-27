@@ -915,6 +915,12 @@ sending 357 MB. Now excluded.
 Not bugs, and none of them bite today. Kept so they are not rediscovered from
 scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
 
+**Three of the four closed on 2026-08-27** — the duplicated sampler, the C ABI
+lagging the core, and the env-var sprawl. They are struck through below with
+what replaced them, because the reasoning ("this divergence is a bug") turned
+out to be wrong in one case and worth recording. **One is open: the two
+unreported ggml findings.**
+
 - ~~**Sampling logic exists twice.**~~ **Fixed 2026-08-27** — it existed three
   times, in fact: `generate()`, `predict_codes_autoregressive` and the CoreML
   path each carried the same temperature → top-k → softmax → multinomial draw.
@@ -930,9 +936,10 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   dict). Both call sites now say so, so the asymmetry does not read as a bug.
 - ~~**21 `QWEN3_TTS_*` env vars read by `getenv()` from 6 files**~~ **Fixed
   2026-08-27.** All 21 are now fields of one struct in `src/env_config.h`, read
-  once on first use (`qwen3_tts::env()`), and all 21 are in the README — the
-  ten diagnostics that were only discoverable by grep now have a table of their
-  own. That header is the list: a switch that is not in it does not exist.
+  once on first use (`qwen3_tts::env()`), and all 21 are documented in
+  `docs/server.md` — the ten diagnostics that were only discoverable by grep
+  now have a table of their own. That header is the list: a switch that is not
+  in it does not exist.
 
   Two things this surfaced. Each site had invented its own parsing, so
   "unset", "empty" and "0" meant different things in different files; the
@@ -941,8 +948,8 @@ scratch. Verified against the code on 2026-08-24, pruned 2026-08-26.
   enables them) and which are tri-state (`PIPELINE`, `CONV_T_F32`, where unset
   is a third answer, not a default). And `QWEN3_TTS_DUMP_CODES` never fired on
   the pipelined decode path, which is the one every GPU backend uses — it
-  needs `QWEN3_TTS_PIPELINE=0`. That predates the refactor; the README now
-  says so.
+  needs `QWEN3_TTS_PIPELINE=0`. That predates the refactor; the docs now say
+  so.
 
   Verified as a pure refactor: byte-identical audio on both benchmark texts,
   and the switches still bite (`PREFIX_CACHE=0` → "0 of 187 tokens from
@@ -1222,9 +1229,9 @@ import and none of it referenced by anything still alive:
   which regenerates the dump in one command against whatever checkpoint is
   actually on disk.
 * **`scripts/setup_pipeline_models.py`** — a one-shot downloader/converter that
-  wrote into a `models/` layout this repo no longer uses, overlapping the
-  README's two documented paths (`--hf-repo` auto-download, or
-  `scripts/convert_tts_to_gguf.py`).
+  wrote into a `models/` layout this repo no longer uses, overlapping the two
+  documented paths (`--hf-repo` auto-download, or
+  `scripts/convert_tts_to_gguf.py` — both in `docs/models.md`).
 
 **One near-miss worth recording.** `scripts/debug_speaker_encoder.py` looked
 identically dead — nothing in any `.md`, `.sh` or `.py` mentions it. It is

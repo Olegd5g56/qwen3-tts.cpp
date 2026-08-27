@@ -697,14 +697,14 @@ SSE via §autiobook).
 
 see §7.
 
-### phase G — CLI streaming switch (optional, #24 adjacent)
+### phase G — CLI streaming switch (optional, #24 adjacent) ✅ landed
 
-- [ ] G1. add `--streaming-batch-size N` to `src/main.cpp`. when N>0,
-      construct `streaming_opts` with an `on_pcm` that appends pcm
-      straight to a `std::vector<float>` (identical to the one-shot
-      output buffer), then write the wav at the end. this gives us a
-      CLI-driven repro for parity tests.
-- [ ] G2. update README with the new flag.
+- [x] G1. `--streaming-batch-size N` in `src/main.cpp`. When N>0 it builds
+      `streaming_opts` with an `on_pcm` that appends straight to the same
+      `std::vector<float>` the one-shot path fills, then writes the wav at the
+      end — a CLI-driven repro for parity tests.
+- [x] G2. documented, now in `docs/server.md` (the CLI section) rather than the
+      README, which no longer carries flag reference.
 
 ---
 

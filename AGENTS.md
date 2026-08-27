@@ -6,6 +6,19 @@ Coding conventions and architecture guide for AI agents working on this codebase
 
 `qwen3-tts.cpp` is a pure C++17 implementation of the Qwen3-TTS text-to-speech pipeline using GGML. It converts text to speech through four stages: tokenization, speaker encoding, transformer code generation, and vocoder decoding.
 
+### Where documentation goes
+
+**The README is for a human who wants this running.** Shortest path to a
+working server, the few variations most people need (which card, which model,
+how to clone a voice), and links onward. Nothing else: no reference tables, no
+rationale, no measurements. If something in it can be cut without making the
+first run harder, cut it and link to the doc that owns it.
+
+Everything else lives under `docs/`, and every doc there has one job — listed
+in the tree below. Material goes where its job says. When a new fact does not
+fit any of them, that is a signal to check whether it belongs in the repo at
+all before inventing a tenth file.
+
 ## Repository Structure
 
 ```
@@ -33,6 +46,9 @@ qwen3-tts.cpp/
     gguf_loader.{h,cpp}         # GGUF model loading
     op_profiler.{h,cpp}         # opt-in per-op GPU profiler
                                 #   (QWEN3_TTS_PROFILE_OPS=1)
+    env_config.{h,cpp}          # THE list of QWEN3_TTS_* switches, read once.
+                                #   Add a switch here and in docs/server.md,
+                                #   never with a getenv() at the use site.
     coreml_code_predictor.{h,mm} # macOS-only Core ML bridge (stub on Linux)
   tests/                        # Component tests
     test_tokenizer.cpp
@@ -40,6 +56,7 @@ qwen3-tts.cpp/
     test_transformer.cpp        # Deterministic reference comparison
     test_streaming_parity.cpp   # Streaming-vs-oneshot decoder parity
     test_icl_dump.cpp           # ICL diagnostic dump
+    test_c_api.c                # C ABI smoke test — written in C on purpose
   scripts/                      # Python utilities (HF↔GGUF conversion, refs)
                                 # + bench_speed.sh: the speed protocol
   benchmarks/                   # speed.tsv: committed speed history, one row
@@ -52,12 +69,21 @@ qwen3-tts.cpp/
   reference/                    # Generated reference dumps, entirely gitignored
   voices/                       # Default --voices-dir, per-id sample.{wav,mp3,txt}
                                 # + cache.bin (encoded embedding + ref codes)
-  docs/                         # Design notes (streaming, optimization, tensors)
+  docs/                         # Every doc has one job — put material where its
+                                # job says, not wherever it was written:
                                 # + architecture.md: the pipeline end to end,
                                 #   read this first
+                                # + server.md: operating manual — flags,
+                                #   endpoints, voices, CLI, env knobs
+                                # + build.md: build options, Docker, tests
+                                # + models.md: variants, conversion, quantising
+                                # + quantisation.md: which weight type, and why
+                                # + optimization.md: what was measured, what was
+                                #   ruled out, and the speed protocol
+                                # + streaming_design.md: streaming vocoder design
                                 # + known-issues.md: running bug log, append to it
-                                # + quantisation.md: which weight type works, and why
-                                # + ggml-notes.md: upstream ggml bugs/gaps
+                                # + ggml-notes.md: findings in ggml itself
+                                # + tensor_mapping.md: HF -> GGUF tensor names
   CMakeLists.txt
 ```
 
@@ -81,12 +107,19 @@ qwen3-tts.cpp/
 
 ## Build System
 
-- **CMake 3.14+** with C++17
-- GGML is vendored under `./ggml` and linked from `./ggml/build/src`
-- Build GGML first: `cmake -S ggml -B ggml/build -DGGML_METAL=ON && cmake --build ggml/build -j4`
-- Build project: `cmake -S . -B build && cmake --build build -j4`
-- Timing build: `cmake -S . -B build -DQWEN3_TTS_TIMING=ON && cmake --build build -j4`
-- GGML headers are in `./ggml/include`
+- **CMake 3.14+**, C++17 (and C — the C ABI's test is compiled as C)
+- ggml is a submodule at `./ggml`, added with `add_subdirectory` and built as
+  part of this project. **There is no separate ggml build step**; backend
+  options (`GGML_CUDA`, `GGML_HIP`, `GGML_VULKAN`, `GGML_METAL`) pass straight
+  through, and headers come from `./ggml/include`.
+- Build: `cmake -S . -B build -DGGML_CUDA=ON && cmake --build build -j$(nproc)`
+- Timing build: add `-DQWEN3_TTS_TIMING=ON`
+- `GGML_NATIVE` is FORCEd from `QWEN3_TTS_NATIVE` before the subdirectory is
+  added. Before comparing two build directories, check they agree:
+  `grep GGML_NATIVE */CMakeCache.txt`.
+- Never use `--clean-first` with a single `--target`: it wipes every other
+  binary in the tree, not just the target's.
+- Options, images and the test matrix: `docs/build.md`
 
 ## Coding Conventions
 
@@ -261,7 +294,9 @@ bash scripts/run_all_tests.sh           # Full suite
   and the model generates noise forever. Use `--type bf16` (same size, and the
   checkpoint is already bf16) or the default `q8_0`. See `known-issues.md` #16
 - M-RoPE uses 1D positions (equivalent for single-batch, may differ for batched inference)
-- `--top-p` is parsed in CLI params but currently not used in transformer sampling
+- `top_p` exists in the CLI params and the C ABI struct but is not used: the
+  sampler is temperature / top-k / repetition-penalty only. Kept in the C
+  struct for layout stability, documented at both declarations.
 - Top-level CMake expects vendored GGML at `./ggml`
 
 ## Performance Profile
@@ -308,8 +343,13 @@ Both predate the vocoder change below.
   model variant.
 
 See `docs/optimization.md` for the full breakdown, the list of approaches that
-were tried and ruled out, and the measurement pitfalls (compare ms/frame, not
-wall time; `--temperature 0` is unstable on this model).
+were tried and ruled out, and the measurement protocol. Two pitfalls worth
+carrying in your head: **compare whole-request seconds inside one
+configuration** (with the seed pinned, which is what makes them mean anything)
+and **ms/frame only across backends or weight types**, where the frame counts
+differ by construction — an older version of this line had that backwards. And
+`--temperature 0` is unstable on this model, so it is never the way to get a
+repeatable run; a fixed `--seed` is.
 
 ## Historical Performance Profile
 

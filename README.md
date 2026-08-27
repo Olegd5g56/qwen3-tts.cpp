@@ -5,25 +5,19 @@
 > but I can't promise production-grade robustness — read the diff and use at
 > your own risk.
 
-C++17 inference for [Qwen3-TTS](https://huggingface.co/collections/khimaros/qwen3-tts)
-on [GGML](https://github.com/ggml-org/ggml). No Python at inference time.
-OpenAI-compatible HTTP server with live streaming, a shared voice library,
-and a one-shot CLI.
+Text to speech in C++17 on [GGML](https://github.com/ggml-org/ggml), no Python
+at inference time. An OpenAI-compatible HTTP server with live streaming and a
+voice library, plus a one-shot CLI.
 
-Languages: en, ru, zh, ja, ko, de, fr, es, it, pt.
-Backends: CUDA / ROCm / Vulkan / Metal / CPU.
+- **Model:** [Qwen3-TTS](https://huggingface.co/collections/khimaros/qwen3-tts), 0.6B or 1.7B
+- **Languages:** en, ru, zh, ja, ko, de, fr, es, it, pt
+- **Backends:** CUDA, ROCm, Vulkan, Metal, CPU
+- **Voice cloning** from a few seconds of reference audio (needs a **Base** model)
 
-Measurements and design notes are in `docs/`: `architecture.md` (how the
-pipeline fits together), `optimization.md` (performance),
-`quantisation.md` (which weight type to use), `known-issues.md` (bug log),
-`ggml-notes.md` (ggml side).
+## Run it
 
-`scripts/bench_speed.sh` times one configuration — or one built image, with
-`--docker` — and appends it to `benchmarks/speed.tsv`, which is committed so
-speed can be compared across commits. (`speed-v1.tsv` is the older series,
-measured a different way and not comparable to it.)
-
-## Quickstart
+Three steps: build, start, ask it to speak. Models download themselves on the
+first launch (into `~/.cache/huggingface/`).
 
 ```bash
 git clone https://github.com/Olegd5g56/qwen3-tts.cpp.git
@@ -32,7 +26,6 @@ cd qwen3-tts.cpp && git submodule update --init --recursive
 cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# models auto-download on first launch
 ./build/qwen3-tts-server \
     --hf-repo   khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF:Q8_0 \
     --hf-repo-v khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16 \
@@ -46,10 +39,12 @@ curl -X POST http://localhost:8080/v1/audio/speech \
   --output hello.wav
 ```
 
-## Build
+That is the whole happy path. Everything below is the variations.
 
-**Deps** (Arch names): `mpg123`, `libopusenc`, `lame`, a C++17 compiler,
-CMake 3.14+. Vulkan SDK only for `-DGGML_VULKAN=ON`.
+### Build for your card
+
+Swap the one flag. Prefer the vendor backend (CUDA/ROCm/Metal) over Vulkan on
+the same card — it is faster and it can overlap the vocoder with generation.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release                  # CPU
@@ -58,38 +53,29 @@ cmake -S . -B build -DGGML_HIP=ON    -DCMAKE_BUILD_TYPE=Release # AMD ROCm
 cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release # Vulkan
 ```
 
-Outputs: `build/qwen3-tts-server`, `build/qwen3-tts-cli`.
+You get `build/qwen3-tts-server` and `build/qwen3-tts-cli`.
 
-Prefer CUDA/ROCm/Metal over Vulkan on the same card.
+Dependencies (Arch names): `mpg123`, `libopusenc`, `lame`, a C++17 compiler,
+CMake 3.14+. Vulkan additionally needs the Vulkan SDK.
 
-- **CUDA**: set `-DCMAKE_CUDA_ARCHITECTURES=` to your card (75 Turing,
-  86 Ampere, 89 Ada, 120 Blackwell). CUDA 13 needs GCC ≤ 15
-  (`-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15`).
-- **ROCm on gfx1030**: add `-DAMDGPU_TARGETS=gfx1030
-  -DCMAKE_HIP_ARCHITECTURES=gfx1030 -DCMAKE_PREFIX_PATH=/opt/rocm` and point
+Two cards that need an extra flag:
+
+- **CUDA** — `-DCMAKE_CUDA_ARCHITECTURES=` your architecture (75 Turing,
+  86 Ampere, 89 Ada, 120 Blackwell). CUDA 13 also needs GCC ≤ 15:
+  `-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15`.
+- **ROCm on gfx1030** — `-DAMDGPU_TARGETS=gfx1030
+  -DCMAKE_HIP_ARCHITECTURES=gfx1030 -DCMAKE_PREFIX_PATH=/opt/rocm`, and point
   the compilers at `/opt/rocm/llvm/bin/clang{,++}`.
 
-### Build toggles
+Build options are in [docs/build.md](docs/build.md).
 
-| Option | Default | Effect |
-|---|---|---|
-| `QWEN3_TTS_NATIVE` | `OFF` | `-march=native` for this CPU (also pins ggml's `GGML_NATIVE`). Turn on only when the build host and the run host are the same machine — elsewhere the binary dies with `SIGILL`. `OFF` still assumes AVX2. |
-| `QWEN3_TTS_SERVER` | `ON` | `OFF` skips building the server. |
-| `QWEN3_TTS_TIMING` | `OFF` | Compiles in per-stage timing. |
-
-## Docker
+### Or run the container
 
 ```bash
-docker build -f Dockerfile.cuda   -t qwen3-tts:cuda   .   # Nvidia
-docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD/Intel
+docker build -f Dockerfile.cuda   -t qwen3-tts:cuda   .   # NVIDIA
+docker build -f Dockerfile.vulkan -t qwen3-tts:vulkan .   # AMD / Intel
 docker build -f Dockerfile.cpu    -t qwen3-tts:cpu    .   # CPU
-```
 
-Build args: `QWEN3_TTS_NATIVE=ON` (see the table above), and for
-`Dockerfile.cuda` also `CUDA_ARCH=75` (default). `Dockerfile.cuda` carries a
-`HEALTHCHECK`.
-
-```bash
 docker run --rm -it --gpus '"device=0"' \
     -p 8081:8081 \
     -v /path/to/models:/models:ro \
@@ -101,251 +87,95 @@ docker run --rm -it --gpus '"device=0"' \
     qwen3-tts:cuda
 ```
 
-Set `-e TZ=<IANA name>` to match log timestamps to the host.
+Details — build args, the Vulkan image's own GPU access flags, timezones —
+in [docs/build.md](docs/build.md).
 
-## Models
+### Speak in your own voice
 
-GGUFs: [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-tts)
-(F16 and Q8_0).
+Point the server at a directory of voices and name one in the request:
+
+```
+voices/
+  alice/
+    sample.mp3     # 5-15 s of clean speech (or sample.wav)
+    sample.txt     # what is said in it — this is what makes cloning work
+```
+
+```bash
+./build/qwen3-tts-server -m ./models --voices-dir ./voices ...
+
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Now in Alice'\''s voice.", "voice": "alice", "language": "en"}' \
+  --output alice.wav
+```
+
+`sample.txt` must be the exact transcript of `sample.mp3`. Without it the
+likeness is much weaker; wrong, and the output is noise. Cloning needs a
+**Base** model.
+
+Voice uploads over HTTP, the CLI, and the rest of the library rules are in
+[docs/server.md](docs/server.md).
+
+### One-shot, no server
+
+```bash
+./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.wav
+```
+
+The output format follows the extension (`.wav`, `.mp3`, `.opus`). Full CLI
+reference: [docs/server.md](docs/server.md#cli).
+
+## Which model to download
 
 | Variant | Cloning | `instructions` | Built-in speakers |
 |---------|---------|----------------|-------------------|
 | 0.6B / 1.7B **Base** | yes | no | no |
 | 0.6B / 1.7B **CustomVoice** | no | no | yes |
 | 1.7B **VoiceDesign** | no | yes | no |
-| **vocoder** (Qwen3-TTS-Tokenizer-12Hz) | — | — | — |
 
-Cloning and the voice library need a **Base** model; loading anything else
-disables the library at startup.
+Take **Base** unless you know you want the others — it is the one that clones
+voices, and the voice library is disabled at startup without it.
 
-0.6B vs 1.7B: ~1 GB less VRAM, ~11% faster per frame, audibly worse quality.
+**1.7B** sounds better; **0.6B** is ~11% faster per frame and needs ~1 GB less
+memory. Peak VRAM is ~3.2 GB for the 1.7B and ~2.1 GB for the 0.6B, everything
+resident. **Q8_0** is the weight type to take; the reasoning, and what the
+4-bit types cost, are in [docs/quantisation.md](docs/quantisation.md).
 
-**GPU memory** — peak on a long clip, everything resident:
+Ready-made GGUFs: [`khimaros/qwen3-tts`](https://huggingface.co/collections/khimaros/qwen3-tts).
+Converting a checkpoint yourself: [docs/models.md](docs/models.md).
 
-| Model | Peak VRAM |
+## When something is wrong
+
+- The server answers `429` — one request is synthesized at a time; see
+  [docs/server.md](docs/server.md).
+- Speech ends early, or the tail turns to noise — a known model-level runaway;
+  [docs/known-issues.md](docs/known-issues.md) #11.
+- It generates noise from the first frame — an F16 talker. Use Q8_0;
+  [docs/known-issues.md](docs/known-issues.md) #16.
+- Cloning sounds nothing like the reference — `sample.txt` is missing or does
+  not match the audio; [docs/known-issues.md](docs/known-issues.md) #23.
+
+## Documentation
+
+| Document | What is in it |
 |---|---|
-| 1.7B | ~3.2 GB |
-| 0.6B | ~2.1 GB |
+| [docs/server.md](docs/server.md) | Operating manual: every flag, endpoint, request field, the voice library, the CLI, and the runtime environment knobs |
+| [docs/build.md](docs/build.md) | Build options, Docker images, testing |
+| [docs/models.md](docs/models.md) | Model variants, converting and quantising a checkpoint yourself |
+| [docs/architecture.md](docs/architecture.md) | How the pipeline fits together — read this first if you intend to change code |
+| [docs/quantisation.md](docs/quantisation.md) | Which weight type to use, decided by listening |
+| [docs/optimization.md](docs/optimization.md) | Performance: what was measured, what worked, what was ruled out |
+| [docs/streaming_design.md](docs/streaming_design.md) | How the streaming vocoder and live-stream path work |
+| [docs/known-issues.md](docs/known-issues.md) | Running log of bugs and rough edges, open and closed |
+| [docs/ggml-notes.md](docs/ggml-notes.md) | Findings in ggml itself |
+| [docs/tensor_mapping.md](docs/tensor_mapping.md) | HF checkpoint tensor names → GGUF names |
+| [AGENTS.md](AGENTS.md) | Conventions for working on the code |
 
-Budget for that plus anything else on the card; a CUDA out-of-memory aborts the
-process. To cut it: `QWEN3_TTS_DECODE_BATCH=8` (−120 MB, −7% throughput) or
-`QWEN3_TTS_LOW_MEM=1` (much lower peak, one model load per request).
-
-**Auto-download**: `--hf-repo <repo>[:<quant>]` and `--hf-repo-v ...` (default
-quant `Q8_0`, cached in `~/.cache/huggingface/`). **Local**: `-m talker.gguf
--v vocoder.gguf`; `-m` also takes a directory and finds the vocoder itself.
-
-### Building a GGUF yourself
-
-```bash
-scripts/convert_tts_to_gguf.py --type q8_0 <hf-checkpoint-dir> talker.gguf
-```
-
-`--type` takes `q8_0` (default), `bf16`, `q4_0`, `f32`. Do not use `f16` — this
-model's activations do not fit in it and the result generates noise.
-
-For K-quants (`q4_k`, `q5_k`, `q6_k`, …) convert to `bf16` first, then:
-
-```bash
-build/qwen3-tts-quantize talker-bf16.gguf talker-q4_k.gguf q4_k --verify
-```
-
-`--verify` prints how much each tensor lost. `--tensor-type SUBSTR=TYPE`
-overrides individual tensors, and beats the built-in skip list — use it to keep
-a tensor at source type, or to force one the list would skip. See
-`docs/quantisation.md` for which type to pick — the answer is not the usual
-llama.cpp answer.
-
-## Server
-
-All flags have matching `TTS_*` env vars (CLI > env > default).
-
-| Flag | Env | Default | What it does |
-|------|-----|---------|--------------|
-| `-m, --model` | `TTS_MODEL` | — | talker GGUF (file or directory) |
-| `-v, --vocoder` | `TTS_VOCODER` | auto | vocoder GGUF |
-| `--hf-repo` / `--hf-repo-v` | `TTS_HF_REPO` / `TTS_HF_REPO_V` | — | auto-download from HF |
-| `--hf-file` / `--hf-file-v` | `TTS_HF_FILE` / `TTS_HF_FILE_V` | derived | override GGUF filename |
-| `-H, --host` | `TTS_HOST` | `127.0.0.1` | listen address |
-| `-p, --port` | `TTS_PORT` | `8080` | listen port |
-| `-j, --threads` | `TTS_THREADS` | `4` | compute threads |
-| `--voices-dir` | `TTS_VOICES_DIR` | — | voice library directory |
-| `--idle-timeout` | `TTS_IDLE_TIMEOUT` | `0` | unload model after N idle seconds (0 = off); reloads lazily, voice library survives |
-| `--max-queue` | `TTS_MAX_QUEUE` | `2` | requests allowed to wait for the synthesis slot; beyond that, `429` with `Retry-After` (0 = unbounded) |
-| `-V, --verbose` | `TTS_VERBOSE` | off | per-stage progress + timing logs |
-| `--temperature`, `--top-k`, `--repetition-penalty`, `--seed` | `TTS_*` | `0.9` / `50` / `1.05` / `-1` | sampling defaults |
-
-Notes:
-
-- **One request at a time.** A second request waits for the first (tens of
-  seconds on long text). One in progress plus `--max-queue` waiting is
-  admitted; past that the server answers `429` with `Retry-After` instead of
-  accepting work it will finish long after the caller has given up. Set
-  `--max-queue 0` for the old unbounded behaviour — do that if your client does
-  not retry, because a refused request is a lost one.
-- `--temperature 0` degenerates on this model. Use a low temperature with a
-  fixed `--seed` for repeatable output.
-- The port opens before the voice library is warm. Voices encode on demand, so
-  requests work immediately; the first call for a not-yet-warmed voice is
-  slower.
-
-### Endpoints
-
-| Method | Path | What it does |
-|--------|------|--------------|
-| `GET` | `/health` | health check; answers while busy |
-| `GET` | `/v1/models` | currently-loaded model id |
-| `GET` | `/v1/audio/languages` | supported language codes |
-| `GET` | `/v1/audio/voices` | list built-in + library voices |
-| `POST` | `/v1/audio/voices` | upload an in-memory session voice (multipart) |
-| `DELETE` | `/v1/audio/voices/:id` | drop a session voice |
-| `POST` | `/v1/audio/speech` | synthesize (one-shot or streaming) |
-
-`/health`:
-
-```json
-{"status":"ok","model_loaded":true,"busy":false,
- "voices":{"total":312,"warmed":312,"warming":false}}
-```
-
-`voices` is absent when no voice library is configured.
-
-### `POST /v1/audio/speech`
-
-```json
-{
-  "input": "Text to synthesize (max 4096 UTF-8 codepoints)",
-  "voice": "default | <built-in name> | <library voice id>",
-  "instructions": "(VoiceDesign only) describe the desired voice",
-  "language": "en",
-  "response_format": "mp3 (default, as in OpenAI) | wav | pcm | opus",
-  "stream_format": "audio | sse",
-  "stream_batch_size": 16,
-  "temperature": 0.9,
-  "top_k": 50,
-  "repetition_penalty": 1.05,
-  "seed": -1
-}
-```
-
-`language` applies to the whole request — there is no per-clause markup. Set it
-to the carrier language; Latin names and embedded foreign sentences ride along
-fine.
-
-- **Default** (no `stream_format`): full audio body once generation completes.
-- **`stream_format=audio`**: HTTP chunked transfer. WAV uses a placeholder-size
-  header so playback starts immediately; Opus is a self-contained Ogg stream;
-  MP3 is self-framing.
-- **`stream_format=sse`**: `speech.audio.delta` frames (base64) then
-  `speech.audio.done`.
-
-Live streaming needs **both** `stream_format` and a non-zero
-`stream_batch_size`. PCM is 24 kHz mono S16LE. MP3 is LAME VBR `-V 4`
-(~70 kbps mono, fixed — the OpenAI spec has no bitrate knob).
-
-```bash
-curl -sN -X POST http://localhost:8080/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{"input": "Hello, streaming PCM straight to ALSA.",
-       "response_format": "pcm", "stream_format": "audio",
-       "stream_batch_size": 16, "language": "en"}' \
-| aplay -q -f S16_LE -r 24000 -c 1
-```
-
-### Voice library
-
-Two sources that never overlap.
-
-**Disk-backed**, via `--voices-dir` — you manage it by editing files:
-
-```
-<voices-dir>/
-  alice/
-    sample.wav     # or sample.mp3 (wav wins if both exist)
-    sample.txt     # optional transcript — enables ICL cloning
-    cache.bin      # generated: embedding + reference codes
-```
-
-A voice is re-encoded (~1.4 s) whenever `sample.*` changes or the model variant
-does. First use of an ICL voice also pays a ~2 s vocoder warm-up, cached
-in-process afterwards. `DELETE` on a disk voice returns **409** — remove the
-directory instead.
-
-**Session**: `POST /v1/audio/voices` holds a voice in RAM. Survives idle
-unload, dies on restart, **409** on a name that collides with a disk voice.
-
-Both need a Base model.
-
-## CLI
-
-One-shot synthesis. Same env vars, same voice layout, same model rules. Output
-format comes from the extension (`.wav`, `.mp3`, `.opus`/`.ogg`).
-
-```bash
-./build/qwen3-tts-cli -m ./models -t "Hello!" -o hello.wav
-echo "From a pipe" | ./build/qwen3-tts-cli -m ./models -o piped.wav
-
-# library voice / inline reference / built-in speaker
-./build/qwen3-tts-cli -m ./base --voices-dir ./voices -v bob -t "Hi bob" -o bob.wav
-./build/qwen3-tts-cli -m ./base -r reference.mp3 -t "Hello" -o cloned.wav
-./build/qwen3-tts-cli -m ./customvoice -v alice -t "Hi" -o alice.wav
-
-./build/qwen3-tts-cli -m ./model --voices-dir ./voices --list-voices
-```
-
-Voices load lazily — only the one passed to `-v` is encoded.
-
-CLI-only flags: `-t/--text`, `-o/--output`, `-r/--reference`, `--ref-text`,
-`-l/--language`, `-i/--instructions`, `--list-voices`, `--codebooks`,
-`--streaming-batch-size`. Do not set `--codebooks` below 12 — it wrecks the
-spoken text, not just the timbre.
-
-## Environment knobs
-
-| Variable | Default | Effect |
-|---|---|---|
-| `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/ROCm/Metal, off for Vulkan. `1`/`0` forces it. |
-| `QWEN3_TTS_DECODE_BATCH` | 16 overlapped / 100 sequential | Frames per vocoder batch; overrides both paths. `8` saves ~120 MB VRAM and costs ~7%. Above ~100 frames larger batches buy nothing. |
-| `QWEN3_TTS_FRAME_BUDGET` | on | Runaway guard: caps generated frames from input length. `0` disables it. |
-| `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
-| `QWEN3_TTS_FORCE_CPU` | off | `1` keeps everything on the CPU. |
-| `QWEN3_TTS_VOCODER` | gpu | `cpu` moves the vocoder (weights and compute) off the accelerator. Much slower everywhere measured; it exists for diagnosis. |
-| `QWEN3_TTS_CONV_T_GEMM` | on | Run the vocoder's transposed convolutions as `mul_mat` + `col2im_1d` instead of ggml's `conv_transpose_1d`. 2.3–4.5x faster decode on every backend, +34 MB. `0` restores the op. |
-| `QWEN3_TTS_CONV_T_F32` | off | Only reachable with `QWEN3_TTS_CONV_T_GEMM=0`. Widens the six `conv_transpose` weights to F32 (+51 MB) so ggml's op is eligible on the GPU at all. Diagnostic; slower than both the default and the CPU fallback on CUDA and ROCm. |
-| `QWEN3_TTS_PREFIX_CACHE` | 8 | Voices whose reference block and prompt-head KV are kept for reuse across requests, evicted least-recently-used. About 7 MB of host memory per voice on the 1.7B, more for a longer reference transcript. Raise it if a workload cycles through more speakers than the cap before repeating; `0` disables the reuse. |
-| `QWEN3_TTS_USE_COREML` | on where built | Apple only. `0`/`false`/`off`/`no` keeps the code predictor on ggml instead of the CoreML model. |
-| `QWEN3_TTS_COREML_MODEL` | next to the gguf | Path to the `code_predictor.mlpackage` to use instead of `<model dir>/coreml/code_predictor.mlpackage`. |
-
-Diagnostics. None of these affect a normal run; they exist to answer a specific
-question and several cost a lot of speed:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `QWEN3_TTS_PROFILE_OPS` | off | Per-op timing table. Disables fusion and syncs per node, so read its proportions, not its absolute numbers. |
-| `QWEN3_TTS_PROBE_NUM` | off | Reports the largest activation magnitude per node — what says whether a tensor survives a cast to F16 (the limit is 65504). |
-| `QWEN3_TTS_PROBE_TOP` | 25 | Rows in that report. Nodes over the F16 limit are always shown, however many. |
-| `QWEN3_TTS_DUMP_PREFILL` | off | Path to write the prefill's last hidden state and logits as raw f32. Prefill is deterministic, so this is where two builds can be compared number to number before the sampler diverges. |
-| `QWEN3_TTS_DUMP_LOGITS` | off | Top-5 codebook-0 logits and the hidden-state norm for the first five frames. Set to anything, including 0. |
-| `QWEN3_TTS_DUMP_CODES` | off | Path for the generated speech codes; a `%d` in it is replaced with a per-call counter. Only written on the sequential decode path, so pair it with `QWEN3_TTS_PIPELINE=0`. |
-| `QWEN3_TTS_DUMP_STAGES` | off | Path prefix for the codec encoder's per-stage tensors, for Python-parity bisection. |
-| `QWEN3_TTS_DUMP_FEATURES` | off | Path for the codec encoder's pre-VQ features. |
-| `QWEN3_TTS_SKIP_REF_CODES` | off | Drops the ICL reference frames from the prompt. Set to anything, including 0. |
-| `QWEN3_TTS_KEEP_RUNAWAY` | off | Return the audio from a runaway generation instead of reporting failure, so it can be listened to. See `docs/known-issues.md` #11. |
-
-All of the above are read **once**, on first use, in `src/env_config.h` — that
-file is the complete list, and a switch that is not in it does not exist.
-Setting one after the process has started has no effect.
-
-## Testing
-
-```bash
-ctest --test-dir build
-QWEN3_TTS_TEST_VOCODER=/path/to/tokenizer.gguf ctest --test-dir build
-```
-
-Tests without their fixtures report **Skipped**, so a red run is a real
-regression. `QWEN3_TTS_TEST_MODEL` points at a talker GGUF;
-`scripts/generate_deterministic_reference.py` regenerates the reference dumps.
+Speed is tracked in `benchmarks/speed.tsv`, one committed row per measured
+configuration; `scripts/bench_speed.sh` writes them. The protocol, and how to
+compare two rows honestly, is in
+[docs/optimization.md](docs/optimization.md#tracking-speed-across-commits).
 
 ## Acknowledgments
 

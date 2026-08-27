@@ -6,9 +6,10 @@ between requests.
 
 This file is the map. It does not carry measurements (`optimization.md`), bugs
 (`known-issues.md`), ggml-side findings (`ggml-notes.md`), the streaming
-derivation (`streaming_design.md`), or weight-type advice
-(`quantisation.md`). `AGENTS.md` covers file layout and coding conventions;
-this covers the data path.
+derivation (`streaming_design.md`), weight-type advice (`quantisation.md`), or
+anything about operating the thing — flags, endpoints and switches are in
+`server.md`, building in `build.md`, checkpoints in `models.md`. `AGENTS.md`
+covers file layout and coding conventions; this covers the data path.
 
 ---
 
@@ -96,6 +97,14 @@ talker's hidden state plus the codebook-0 embedding and produces codebooks 1–1
 cache (16 tokens). Because its width does not follow the talker's, it costs the
 same on both models — which is why the 0.6B is not proportionally faster end to
 end.
+
+**Both draw from the same sampler**, `TTSTransformer::sample_token`:
+temperature, then top-k, then softmax, then a multinomial draw. Two steps sit
+outside it and belong to the talker alone, because that is where the reference
+puts them — the suppression window over the top 1024 codec ids, and the
+repetition penalty over the codebook-0 tokens already emitted. Do not move them
+into the shared sampler to make the two paths symmetric; the asymmetry is the
+model's.
 
 The prefill embedding is a fixed structure (10 positions for the thinking path,
 one shorter without a language id, different again for ICL). The exact layout
