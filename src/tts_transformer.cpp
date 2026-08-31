@@ -199,15 +199,6 @@ bool TTSTransformer::load_model(const std::string & model_path) {
 
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
 
-    // Only the code predictor: five layers, and every frame runs them fifteen
-    // times. The talker's would cost 588 MB of duplicated weights for 23 of
-    // the 98 layer passes in a frame.
-    if (qwen3_tts::env().fuse_weights && !model_.code_pred_layers.empty()) {
-        if (!fuse_layer_weights(model_.code_pred_layers)) {
-            return false;
-        }
-    }
-
     // The per-op profiler and the numeric probe both hook the scheduler's eval
     // callback, and a cached graph never reaches the scheduler. Diagnostics
     // win: they are why anyone turns them on.
@@ -470,7 +461,97 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
     const int32_t cp_hidden = cfg.code_pred_hidden_size;
     const int32_t cp_intermediate = cfg.code_pred_intermediate_size;
     
-    const size_t ctx_size = n_tensors * ggml_tensor_overhead();
+    model_.layers.resize(cfg.n_layers);
+    model_.code_pred_layers.resize(cfg.code_pred_layers);
+    model_.code_pred_embd.resize(cfg.n_codebooks - 1);
+    model_.code_pred_head.resize(cfg.n_codebooks - 1);
+
+    // ---- weight fusion, planned before anything is created ---------------
+    //
+    // Q, K and V become one weight and gate and up another, so a one-token
+    // step runs one matmul where it ran three (and two). Doing it here rather
+    // than by copying after the load is what makes it free: the three are
+    // created as *views* into the fused tensor and the loader writes each into
+    // its own slice, so nothing is duplicated and nothing extra is allocated.
+    //
+    // A group is skipped whenever its members disagree on type, which is what
+    // a mixed --tensor-type model produces.
+    struct fuse_part { std::string name; int64_t rows; };
+    struct fuse_group {
+        std::vector<fuse_part> parts;
+        int64_t                ne0  = 0;
+        int64_t                rows = 0;
+        enum ggml_type         type = GGML_TYPE_COUNT;
+        struct ggml_tensor **  dst  = nullptr;
+    };
+    std::vector<fuse_group> fuse_plan;
+
+    auto plan_group = [&](const std::string & prefix, int64_t ne0,
+                          std::vector<fuse_part> parts, struct ggml_tensor ** dst) {
+        fuse_group g;
+        g.ne0 = ne0;
+        g.dst = dst;
+        for (auto & part : parts) {
+            part.name = prefix + part.name;
+            const int64_t idx = gguf_find_tensor(ctx, part.name.c_str());
+            if (idx < 0) {
+                return;
+            }
+            const enum ggml_type t = gguf_get_tensor_type(ctx, idx);
+            if (g.type == GGML_TYPE_COUNT) {
+                g.type = t;
+            } else if (g.type != t) {
+                return;
+            }
+            g.rows += part.rows;
+            g.parts.push_back(part);
+        }
+        fuse_plan.push_back(std::move(g));
+    };
+
+    const int fuse = qwen3_tts::env().fuse_weights;
+    // The talker's pair is decided by the backend when nobody said. It is
+    // worth -4% of generation on Vulkan and -1% on ROCm, and *costs* 1.2% on
+    // CUDA, where one 4096-row matmul lands on a different kernel than three
+    // smaller ones. The code predictor's pair is a win on all three, so it is
+    // fused whenever fusion is on at all.
+    bool fuse_talker = fuse != 0;
+    if (fuse < 0) {
+        ggml_backend_t probe = init_preferred_backend("TTSTransformer", nullptr);
+        if (probe) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(probe);
+            const char * dev_name = dev ? ggml_backend_dev_name(dev) : "";
+            fuse_talker = strncmp(dev_name, "CUDA", 4) != 0;
+            release_preferred_backend(probe);
+        }
+    }
+
+    if (fuse != 0) {
+        const int64_t q_rows = (int64_t) cfg.n_attention_heads * cfg.head_dim;
+        const int64_t kv_rows = (int64_t) cfg.n_key_value_heads * cfg.head_dim;
+        for (int il = 0; fuse_talker && il < cfg.n_layers; ++il) {
+            const std::string prefix = "talker.blk." + std::to_string(il) + ".";
+            plan_group(prefix, cfg.hidden_size,
+                       {{"attn_q.weight", q_rows}, {"attn_k.weight", kv_rows}, {"attn_v.weight", kv_rows}},
+                       &model_.layers[il].attn_qkv);
+            plan_group(prefix, cfg.hidden_size,
+                       {{"ffn_gate.weight", cfg.intermediate_size}, {"ffn_up.weight", cfg.intermediate_size}},
+                       &model_.layers[il].ffn_gate_up);
+        }
+        if (!skip_ggml_code_pred_layers_) {
+            for (int il = 0; il < cfg.code_pred_layers; ++il) {
+                const std::string prefix = "code_pred.blk." + std::to_string(il) + ".";
+                plan_group(prefix, cp_hidden,
+                           {{"attn_q.weight", q_rows}, {"attn_k.weight", kv_rows}, {"attn_v.weight", kv_rows}},
+                           &model_.code_pred_layers[il].attn_qkv);
+                plan_group(prefix, cp_hidden,
+                           {{"ffn_gate.weight", cp_intermediate}, {"ffn_up.weight", cp_intermediate}},
+                           &model_.code_pred_layers[il].ffn_gate_up);
+            }
+        }
+    }
+
+    const size_t ctx_size = (n_tensors + fuse_plan.size()) * ggml_tensor_overhead();
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx_size,
         /*.mem_buffer =*/ nullptr,
@@ -482,11 +563,30 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
         error_msg_ = "Failed to create GGML context";
         return false;
     }
-    
-    model_.layers.resize(cfg.n_layers);
-    model_.code_pred_layers.resize(cfg.code_pred_layers);
-    model_.code_pred_embd.resize(cfg.n_codebooks - 1);
-    model_.code_pred_head.resize(cfg.n_codebooks - 1);
+
+    // The fused tensors have to exist before the views into them, and be
+    // allocated before them too - ggml_backend_alloc_ctx_tensors walks the
+    // context in creation order.
+    std::map<std::string, std::pair<struct ggml_tensor *, size_t>> fused_slots;
+    for (auto & g : fuse_plan) {
+        struct ggml_tensor * fused = ggml_new_tensor_2d(model_.ctx, g.type, g.ne0, g.rows);
+        if (!fused) {
+            error_msg_ = "Failed to create fused tensor for " + g.parts[0].name;
+            return false;
+        }
+        ggml_format_name(fused, "%s.fused", g.parts[0].name.c_str());
+        *g.dst = fused;
+
+        size_t offset = 0;
+        for (const auto & part : g.parts) {
+            fused_slots[part.name] = {fused, offset};
+            offset += (size_t) part.rows * fused->nb[1];
+        }
+    }
+    if (!fuse_plan.empty()) {
+        log_debug("fused %zu weight groups: Q/K/V into one matmul, gate/up into another",
+                  fuse_plan.size());
+    }
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
@@ -675,7 +775,16 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
              continue;
          }
         
-        struct ggml_tensor * tensor = ggml_new_tensor(model_.ctx, type, n_dims, ne);
+        // A member of a fused group is a window onto it, not a tensor of its
+        // own. The loader still writes it by name, into its own rows.
+        struct ggml_tensor * tensor = nullptr;
+        auto slot = fused_slots.find(name);
+        if (slot != fused_slots.end() && n_dims == 2 && ne[0] == slot->second.first->ne[0]) {
+            tensor = ggml_view_2d(model_.ctx, slot->second.first, ne[0], ne[1],
+                                  slot->second.first->nb[1], slot->second.second);
+        } else {
+            tensor = ggml_new_tensor(model_.ctx, type, n_dims, ne);
+        }
         if (!tensor) {
             error_msg_ = "Failed to create tensor: " + std::string(name);
             return false;
@@ -850,110 +959,6 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
     fclose(f);
     release_preferred_backend(backend);
     
-    return true;
-}
-
-bool TTSTransformer::fuse_layer_weights(std::vector<transformer_layer> & layers) {
-    // Concatenating along ne1 is a plain byte concatenation: a row is a whole
-    // number of quantisation blocks, so the fused weight is the sources laid
-    // end to end and the arithmetic per output row is untouched.
-    struct build_plan {
-        transformer_layer * layer;
-        bool qkv  = false;
-        bool gate = false;
-    };
-
-    std::vector<build_plan> plan;
-    for (auto & layer : layers) {
-        build_plan p{&layer, false, false};
-        p.qkv = layer.attn_q && layer.attn_k && layer.attn_v &&
-                layer.attn_q->type == layer.attn_k->type &&
-                layer.attn_q->type == layer.attn_v->type &&
-                layer.attn_q->ne[0] == layer.attn_k->ne[0] &&
-                layer.attn_q->ne[0] == layer.attn_v->ne[0];
-        p.gate = layer.ffn_gate && layer.ffn_up &&
-                 layer.ffn_gate->type == layer.ffn_up->type &&
-                 layer.ffn_gate->ne[0] == layer.ffn_up->ne[0] &&
-                 layer.ffn_gate->ne[1] == layer.ffn_up->ne[1];
-        if (p.qkv || p.gate) {
-            plan.push_back(p);
-        }
-    }
-    if (plan.empty()) {
-        return true;
-    }
-
-    if (!model_.fused_ctx) {
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * (2 * plan.size() + 2),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        model_.fused_ctx = ggml_init(params);
-        if (!model_.fused_ctx) {
-            error_msg_ = "Failed to create context for fused weights";
-            return false;
-        }
-    }
-
-    for (auto & p : plan) {
-        transformer_layer & layer = *p.layer;
-        if (p.qkv) {
-            layer.attn_qkv = ggml_new_tensor_2d(model_.fused_ctx, layer.attn_q->type,
-                                                layer.attn_q->ne[0],
-                                                layer.attn_q->ne[1] + layer.attn_k->ne[1] + layer.attn_v->ne[1]);
-            ggml_format_name(layer.attn_qkv, "%s.fused_qkv", ggml_get_name(layer.attn_q));
-        }
-        if (p.gate) {
-            layer.ffn_gate_up = ggml_new_tensor_2d(model_.fused_ctx, layer.ffn_gate->type,
-                                                   layer.ffn_gate->ne[0],
-                                                   layer.ffn_gate->ne[1] + layer.ffn_up->ne[1]);
-            ggml_format_name(layer.ffn_gate_up, "%s.fused_gate_up", ggml_get_name(layer.ffn_gate));
-        }
-    }
-
-    model_.fused_buffer = ggml_backend_alloc_ctx_tensors(model_.fused_ctx, state_.backend);
-    if (!model_.fused_buffer) {
-        // Not fatal: without the buffer every layer keeps its separate weights.
-        log_warn("could not allocate fused weights, keeping the separate ones");
-        for (auto & p : plan) {
-            p.layer->attn_qkv    = nullptr;
-            p.layer->ffn_gate_up = nullptr;
-        }
-        ggml_free(model_.fused_ctx);
-        model_.fused_ctx = nullptr;
-        return true;
-    }
-
-    std::vector<uint8_t> scratch;
-    auto append = [&](struct ggml_tensor * dst, struct ggml_tensor * src, size_t & offset) {
-        const size_t nbytes = ggml_nbytes(src);
-        scratch.resize(nbytes);
-        ggml_backend_tensor_get(src, scratch.data(), 0, nbytes);
-        ggml_backend_tensor_set(dst, scratch.data(), offset, nbytes);
-        offset += nbytes;
-    };
-
-    size_t fused_bytes = 0;
-    for (auto & p : plan) {
-        transformer_layer & layer = *p.layer;
-        if (layer.attn_qkv) {
-            size_t off = 0;
-            append(layer.attn_qkv, layer.attn_q, off);
-            append(layer.attn_qkv, layer.attn_k, off);
-            append(layer.attn_qkv, layer.attn_v, off);
-            fused_bytes += off;
-        }
-        if (layer.ffn_gate_up) {
-            size_t off = 0;
-            append(layer.ffn_gate_up, layer.ffn_gate, off);
-            append(layer.ffn_gate_up, layer.ffn_up, off);
-            fused_bytes += off;
-        }
-    }
-
-    log_info("code predictor: Q/K/V and gate/up fused into one matmul each (+%.1f MB)",
-             fused_bytes / (1024.0 * 1024.0));
     return true;
 }
 
@@ -1914,7 +1919,12 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         struct ggml_tensor * Qcur;
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
-        if (layer.attn_qkv) {
+        // Only for a single token. With more, Q, K and V are strided views of
+        // the fused output rather than contiguous ones, and the matmul is a
+        // different shape - on CUDA that picks a different kernel and the
+        // result stops matching the unfused path bit for bit. A prefill runs
+        // once a request; the step graphs are what needed this.
+        if (layer.attn_qkv && n_tokens == 1) {
             // One matmul, then three views over its output. Q sits first, then
             // K, then V - the order fuse_layer_weights() concatenated them in.
             struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
@@ -1999,7 +2009,7 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         
         // One GLU node, not silu + mul, and where the weights are fused, one
         // matmul instead of two. Same arithmetic either way.
-        if (layer.ffn_gate_up) {
+        if (layer.ffn_gate_up && n_tokens == 1) {
             cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
         } else {
             struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
@@ -2118,7 +2128,12 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
         struct ggml_tensor * Qcur;
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
-        if (layer.attn_qkv) {
+        // Only for a single token. With more, Q, K and V are strided views of
+        // the fused output rather than contiguous ones, and the matmul is a
+        // different shape - on CUDA that picks a different kernel and the
+        // result stops matching the unfused path bit for bit. A prefill runs
+        // once a request; the step graphs are what needed this.
+        if (layer.attn_qkv && n_tokens == 1) {
             // One matmul, then three views over its output. Q sits first, then
             // K, then V - the order fuse_layer_weights() concatenated them in.
             struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
@@ -2196,7 +2211,7 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
         
         // One GLU node, not silu + mul, and where the weights are fused, one
         // matmul instead of two. Same arithmetic either way.
-        if (layer.ffn_gate_up) {
+        if (layer.ffn_gate_up && n_tokens == 1) {
             cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
         } else {
             struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
@@ -2418,7 +2433,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         struct ggml_tensor * Qcur;
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
-        if (layer.attn_qkv) {
+        // Only for a single token. With more, Q, K and V are strided views of
+        // the fused output rather than contiguous ones, and the matmul is a
+        // different shape - on CUDA that picks a different kernel and the
+        // result stops matching the unfused path bit for bit. A prefill runs
+        // once a request; the step graphs are what needed this.
+        if (layer.attn_qkv && n_tokens == 1) {
             // One matmul, then three views over its output. Q sits first, then
             // K, then V - the order fuse_layer_weights() concatenated them in.
             struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
@@ -2495,7 +2515,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         
         // One GLU node, not silu + mul, and where the weights are fused, one
         // matmul instead of two. Same arithmetic either way.
-        if (layer.ffn_gate_up) {
+        if (layer.ffn_gate_up && n_tokens == 1) {
             cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
         } else {
             struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
@@ -2593,7 +2613,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         struct ggml_tensor * Qcur;
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
-        if (layer.attn_qkv) {
+        // Only for a single token. With more, Q, K and V are strided views of
+        // the fused output rather than contiguous ones, and the matmul is a
+        // different shape - on CUDA that picks a different kernel and the
+        // result stops matching the unfused path bit for bit. A prefill runs
+        // once a request; the step graphs are what needed this.
+        if (layer.attn_qkv && n_tokens == 1) {
             // One matmul, then three views over its output. Q sits first, then
             // K, then V - the order fuse_layer_weights() concatenated them in.
             struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
@@ -2671,7 +2696,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         
         // One GLU node, not silu + mul, and where the weights are fused, one
         // matmul instead of two. Same arithmetic either way.
-        if (layer.ffn_gate_up) {
+        if (layer.ffn_gate_up && n_tokens == 1) {
             cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
         } else {
             struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
@@ -3906,14 +3931,6 @@ bool TTSTransformer::forward_with_audio(const int32_t * tokens, int32_t n_tokens
 }
 
 void free_transformer_model(tts_transformer_model & model) {
-    if (model.fused_buffer) {
-        ggml_backend_buffer_free(model.fused_buffer);
-        model.fused_buffer = nullptr;
-    }
-    if (model.fused_ctx) {
-        ggml_free(model.fused_ctx);
-        model.fused_ctx = nullptr;
-    }
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);
         model.buffer = nullptr;

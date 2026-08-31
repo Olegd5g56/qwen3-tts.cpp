@@ -655,15 +655,28 @@ touching the arithmetic:
   of quantisation blocks - so per-row arithmetic is untouched. Generation
   5915 -> 5713 ms (-3.4%); the code predictor's own line -6.3%.
 
-**Only the code predictor is fused.** The fused weights are copies in a buffer
-of their own, because the originals cannot be freed out of a model buffer that
-holds every tensor at once. That is +53 MB for the code predictor's five
-layers, which a frame runs fifteen times - 75 of its 98 layer passes. The
-talker's 28 would cost **588 MB** of duplicated weights for the other 23
-passes, worth an estimated 1.5-2.5%. Doing it there means building the fused
-tensor at *create* time and loading Q, K and V into views of it, which is a
-real change to `create_tensors` and `load_tensor_data`; it is the right way and
-it is not done. `QWEN3_TTS_FUSE_WEIGHTS=0` switches the fusion off.
+The fusion is built at **create** time, not by copying after the load: the
+fused tensor is created first and `attn_q`, `attn_k` and `attn_v` are created
+as **views into it**, so the loader still writes each by name into its own rows
+and nothing is duplicated. Peak VRAM is unchanged - 5486 MB against 5489 with
+the fusion off, which is the desktop moving. (The first version of this did
+copy, and cost +53 MB; that is why only the code predictor had it.)
+
+Two things this turned up, both measured:
+
+* **Only single-token graphs are fused.** With more than one token Q, K and V
+  are *strided* views of the fused output rather than contiguous ones, and the
+  matmul is a different shape. On CUDA that stops matching the unfused path bit
+  for bit - the run diverges into a different audio file. A prefill runs once a
+  request and is 23 ms of it, so it keeps the three separate matmuls and the
+  byte-exactness bar holds everywhere.
+* **The talker's pair is not fused on CUDA.** Interleaved A/B, same build,
+  three pairs: 13017/13031/13080 ms unfused against 13202/13253/13242 fused -
+  **1.6% slower, reproducibly**. One 4096-row matmul lands on a different
+  kernel than three smaller ones there. On Vulkan the same change is worth
+  **-4%** of generation and on ROCm **-1%**, so the default is decided by the
+  backend: code predictor everywhere, talker everywhere but CUDA.
+  `QWEN3_TTS_FUSE_WEIGHTS=1` forces it on, `0` off.
 
 ### Where this landed
 
@@ -672,11 +685,16 @@ identical throughout:
 
 | backend | before it all | graphs cached | + gathered | + fused | |
 |---|---|---|---|---|---|
-| ROCm 6800XT | 9.94 s | 8.69 s | 8.49 s | **7.47 s** | **-24.8%** |
-| CUDA 1660S | 15.55 s | 15.02 s | 14.76 s | **13.89 s** | **-10.7%** |
-| Vulkan 6800XT | generate 8445 ms | 6557 | 6028 | **5695 ms** | **-32.6%** |
+| ROCm 6800XT | 9.94 s | 8.69 s | 8.49 s | **7.39 s** | **-25.7%** |
+| CUDA 1660S | 15.55 s | 15.02 s | 14.76 s | **13.96 s** | **-10.2%** |
+| Vulkan 6800XT | generate 8445 ms | 6557 | 6028 | **5475 ms** | **-35.2%** |
 
 Byte-identical WAV at every one of these steps, on all four backends.
+
+The CUDA column stopped moving at the last step and its three nine-run groups
+came in at 13.96, 14.05 and 14.13 s - drifting upward across the afternoon,
+which is the thermal drift `bench_speed.sh` warns about, not the change. Read
+it as unchanged.
 
 ### Two things that did not work, so nobody repeats them
 

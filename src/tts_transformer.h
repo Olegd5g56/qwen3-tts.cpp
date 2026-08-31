@@ -149,7 +149,8 @@ struct transformer_layer {
     // Q, K and V laid end to end, and gate on top of up. Both are one matmul
     // where the three (or two) above are three (or two), which on a one-token
     // step is three (or two) kernel launches reading the same activation.
-    // Null when the fusion was skipped - see fuse_layer_weights().
+    // These own the memory and the three above are views into them, so the
+    // fusion costs nothing; null when create_tensors() skipped the group.
     struct ggml_tensor * attn_qkv     = nullptr;
     struct ggml_tensor * ffn_gate_up  = nullptr;
 };
@@ -196,12 +197,6 @@ struct tts_transformer_model {
     
     // Backend buffer for weights
     ggml_backend_buffer_t buffer = nullptr;
-
-    // Fused attention/FFN weights live apart from the model's own buffer: they
-    // are copies, built after loading, and the originals cannot be freed out
-    // of a buffer that holds every tensor at once.
-    struct ggml_context * fused_ctx = nullptr;
-    ggml_backend_buffer_t fused_buffer = nullptr;
     
     // Tensor name to tensor mapping
     std::map<std::string, struct ggml_tensor *> tensors;
@@ -537,10 +532,6 @@ private:
     static void release_cached_graph(tts_cached_graph & cg);
     void release_cached_graphs();
 
-    // Builds layer.attn_qkv / layer.ffn_gate_up for the layers given. Copies,
-    // so it costs the weight bytes again - which is why only the code
-    // predictor gets it: five layers, and fifteen passes over them per frame.
-    bool fuse_layer_weights(std::vector<transformer_layer> & layers);
 
     
     // Parse hyperparameters from GGUF

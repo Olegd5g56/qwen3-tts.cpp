@@ -35,7 +35,10 @@ struct env_config {
     int  prefix_cache = 8;        // QWEN3_TTS_PREFIX_CACHE    - voices in the prefill KV cache
     bool frame_budget = true;     // QWEN3_TTS_FRAME_BUDGET=0  - disable the per-request frame cap
     bool graph_reuse  = true;     // QWEN3_TTS_GRAPH_REUSE=0   - rebuild every step graph per frame
-    bool fuse_weights = true;     // QWEN3_TTS_FUSE_WEIGHTS=0  - keep Q/K/V and gate/up as separate matmuls
+    int  fuse_weights = -1;       // QWEN3_TTS_FUSE_WEIGHTS=1/0 - Q/K/V as one weight, gate/up as another
+                                  //   -1 = decide from the backend: the talker's pair is a win on
+                                  //   Vulkan and ROCm and a loss on CUDA; the code predictor's is
+                                  //   a win everywhere, so it is fused either way
 
     // ---- vocoder conv_transpose route (docs/optimization.md) -------------
     bool conv_t_gemm = true;      // QWEN3_TTS_CONV_T_GEMM=0   - back to ggml's own kernel
