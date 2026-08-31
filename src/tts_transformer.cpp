@@ -1058,7 +1058,11 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate code predictor KV cache buffer";
         return false;
     }
-    
+
+    // Once, here. A fresh buffer holds whatever was in that memory, and the
+    // masked-out tail of the window is still read by flash attention.
+    clear_code_pred_kv_cache();
+
     return true;
 }
 
@@ -1904,7 +1908,7 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
+struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_gather) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1924,9 +1928,27 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
     struct ggml_context * ctx0 = nullptr;
     struct ggml_cgraph * gf = new_graph(&ctx0);
 
-    struct ggml_tensor * inp_step_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
-    ggml_set_name(inp_step_embd, "inp_step_embd");
-    ggml_set_input(inp_step_embd);
+    // Two ways in. n_gather == 0 takes the summed embedding ready-made, which
+    // is what the unused legacy entry points pass. Generation passes the frame's
+    // codes instead and the sum happens here: sixteen rows read on the device
+    // beat sixteen single-row reads pulled back to the host, one sync each.
+    struct ggml_tensor * inp_step_embd = nullptr;
+    struct ggml_tensor * inp_codes     = nullptr;
+    struct ggml_tensor * inp_trailing  = nullptr;
+    if (n_gather > 0) {
+        inp_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_gather);
+        ggml_set_name(inp_codes, "inp_codes");
+        ggml_set_input(inp_codes);
+
+        // The trailing text row (or the pad embedding) that is added on top.
+        inp_trailing = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
+        ggml_set_name(inp_trailing, "inp_trailing");
+        ggml_set_input(inp_trailing);
+    } else {
+        inp_step_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
+        ggml_set_name(inp_step_embd, "inp_step_embd");
+        ggml_set_input(inp_step_embd);
+    }
     
     struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(inp_pos, "inp_pos");
@@ -1937,6 +1959,19 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
     ggml_set_input(inp_mask);
 
     struct ggml_tensor * cur = inp_step_embd;
+    if (n_gather > 0) {
+        // Codebook 0 comes from the talker's own table, 1..15 from the code
+        // predictor's. Summed left to right and then the trailing row, which
+        // is the order the host loop used, so the arithmetic is unchanged.
+        struct ggml_tensor * idx0 = ggml_view_1d(ctx0, inp_codes, 1, 0);
+        cur = ggml_get_rows(ctx0, model_.codec_embd, idx0);
+        for (int cb = 1; cb < n_gather; ++cb) {
+            struct ggml_tensor * idx = ggml_view_1d(ctx0, inp_codes, 1, cb * ggml_element_size(inp_codes));
+            cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, model_.code_pred_embd[cb - 1], idx));
+        }
+        cur = ggml_add(ctx0, cur, inp_trailing);
+        cur = ggml_reshape_2d(ctx0, cur, hidden_size, 1);
+    }
 
     struct ggml_tensor * inpL = cur;
 
@@ -2193,10 +2228,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
     ggml_set_name(inp_hidden, "inp_hidden");
     ggml_set_input(inp_hidden);
 
-    // Input: codebook 0 token embedding [hidden_size] (pre-computed using talker's codec_embd)
-    struct ggml_tensor * inp_cb0_embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
-    ggml_set_name(inp_cb0_embd, "inp_cb0_embd");
-    ggml_set_input(inp_cb0_embd);
+    // Input: the codebook 0 token itself. Its row of the talker's codec_embd
+    // used to be fetched to the host and pushed back in; the device can read
+    // its own table.
+    struct ggml_tensor * inp_cb0_token = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(inp_cb0_token, "inp_cb0_token");
+    ggml_set_input(inp_cb0_token);
 
     struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_pos, "inp_pos");
@@ -2204,7 +2241,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
 
     // Concatenate [past_hidden, cb0_embd] -> [hidden_size, 2]
     struct ggml_tensor * hidden_2d = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
-    struct ggml_tensor * cb0_2d = ggml_reshape_2d(ctx0, inp_cb0_embd, hidden_size, 1);
+    struct ggml_tensor * cb0_2d = ggml_reshape_2d(
+        ctx0, ggml_get_rows(ctx0, model_.codec_embd, inp_cb0_token), hidden_size, 1);
     struct ggml_tensor * cur = ggml_concat(ctx0, hidden_2d, cb0_2d, 1);
 
     // Apply MTP projection if needed (1.7B: hidden_size -> cp_hidden)
@@ -2643,12 +2681,17 @@ bool TTSTransformer::forward_text(const int32_t * text_tokens, int32_t n_tokens,
 
 bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
                                   std::vector<float> & output,
-                                  std::vector<float> * hidden_out) {
+                                  std::vector<float> * hidden_out,
+                                  const int32_t * codes, int32_t n_codes,
+                                  const float * trailing) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
     }
-    if (!step_embd) {
+    // Either the caller brings the summed embedding, or it brings the codes and
+    // the graph sums them.
+    const int32_t n_gather = (codes && trailing && n_codes > 0) ? n_codes : 0;
+    if (n_gather == 0 && !step_embd) {
         error_msg_ = "step_embd is null";
         return false;
     }
@@ -2677,11 +2720,14 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     // build serves QWEN3_TTS_KV_STEP consecutive frames.
     const int32_t kv_key = std::min<int>(state_.cache.n_ctx,
                                          GGML_PAD(n_past + 1, QWEN3_TTS_KV_STEP));
-    struct ggml_cgraph * gf = cached_graph(talker_graph_, kv_key,
-                                           [&] { return build_step_graph(n_past); });
+    // Both halves of the shape go in the key: the KV window, and how many
+    // codebooks the graph gathers (--codebooks changes that mid-life).
+    const int32_t shape_key = kv_key * 32 + n_gather;
+    struct ggml_cgraph * gf = cached_graph(talker_graph_, shape_key,
+                                           [&] { return build_step_graph(n_past, n_gather); });
     const bool cached = gf != nullptr;
     if (!cached) {
-        gf = build_step_graph(n_past);
+        gf = build_step_graph(n_past, n_gather);
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -2703,10 +2749,19 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    struct ggml_tensor * inp_step = ggml_graph_get_tensor(gf, "inp_step_embd");
-    if (inp_step) {
-        ggml_backend_tensor_set(inp_step, step_embd, 0,
+    if (n_gather > 0) {
+        struct ggml_tensor * inp_codes = ggml_graph_get_tensor(gf, "inp_codes");
+        ggml_backend_tensor_set(inp_codes, codes, 0, n_gather * sizeof(int32_t));
+
+        struct ggml_tensor * inp_trailing = ggml_graph_get_tensor(gf, "inp_trailing");
+        ggml_backend_tensor_set(inp_trailing, trailing, 0,
                                 model_.config.hidden_size * sizeof(float));
+    } else {
+        struct ggml_tensor * inp_step = ggml_graph_get_tensor(gf, "inp_step_embd");
+        if (inp_step) {
+            ggml_backend_tensor_set(inp_step, step_embd, 0,
+                                    model_.config.hidden_size * sizeof(float));
+        }
     }
     
     struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
@@ -3042,7 +3097,13 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             return false;
         }
     }
-    clear_code_pred_kv_cache();
+    // No wipe here. Every slot the mask lets this frame read - 0 through
+    // n_past - is written by this frame before it is read: the prefill writes
+    // 0 and 1, step s writes s + 1. What is left above that is last frame's
+    // finite numbers, multiplied by a zero attention weight. The cache is
+    // zeroed once, where it is created, so the very first frame does not read
+    // whatever the allocator handed us.
+    state_.code_pred_cache.n_used = 0;
 
     // Codebooks beyond the active count are left at 0 and ignored downstream;
     // the vocoder is told to drop the same tail from its VQ sum.
@@ -3061,10 +3122,6 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     // suppression window, no repetition penalty. That matches the reference,
     // where those two are talker-only.
     
-    std::vector<float> cb0_embd(cfg.hidden_size);
-    if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token, cb0_embd.data())) {
-        return false;
-    }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_code_pred_init_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3110,9 +3167,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             ggml_backend_tensor_set(inp_hidden, hidden, 0, cfg.hidden_size * sizeof(float));
         }
         
-        struct ggml_tensor * inp_cb0_embd = ggml_graph_get_tensor(gf, "inp_cb0_embd");
-        if (inp_cb0_embd) {
-            ggml_backend_tensor_set(inp_cb0_embd, cb0_embd.data(), 0, cfg.hidden_size * sizeof(float));
+        struct ggml_tensor * inp_cb0_token = ggml_graph_get_tensor(gf, "inp_cb0_token");
+        if (inp_cb0_token) {
+            ggml_backend_tensor_set(inp_cb0_token, &codebook_0_token, 0, sizeof(int32_t));
         }
         
         struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
@@ -3455,8 +3512,6 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t suppress_start = cfg.codec_vocab_size - 1024;
 
     std::vector<float> probs(cfg.codec_vocab_size);
-    std::vector<float> step_embd(cfg.hidden_size, 0.0f);
-    std::vector<float> embd_row(cfg.hidden_size);
 
     // Truncated RVQ: only the codebooks we predict feed back into the talker.
     const int n_active_cb = (active_codebooks_ > 0 && active_codebooks_ < cfg.n_codebooks)
@@ -3577,43 +3632,18 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             break;
         }
 
-        std::fill(step_embd.begin(), step_embd.end(), 0.0f);
-
-#ifdef QWEN3_TTS_TIMING
-        t0 = clk::now();
-#endif
-        if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
-            return false;
-        }
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] = embd_row[h];
-        }
-
-        for (int cb = 1; cb < n_active_cb; ++cb) {
-            int32_t code_token = frame_codes[cb];
-            if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
-                return false;
-            }
-            for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-                step_embd[h] += embd_row[h];
-            }
-        }
-#ifdef QWEN3_TTS_TIMING
-        t1 = clk::now();
-        timing.t_embed_lookup_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-#endif
-
+        // The next step's input is this frame's sixteen codebook rows summed,
+        // plus the trailing text row. The rows are gathered inside the step
+        // graph - see build_step_graph - so nothing is pulled back here.
         const float * trailing_row = (frame < trailing_len)
             ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
             : tts_pad_embed.data();
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] += trailing_row[h];
-        }
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!forward_step(step_embd.data(), n_past, logits)) {
+        if (!forward_step(nullptr, n_past, logits, nullptr,
+                          frame_codes.data(), n_active_cb, trailing_row)) {
             return false;
         }
 #ifdef QWEN3_TTS_TIMING

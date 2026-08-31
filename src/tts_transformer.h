@@ -284,9 +284,14 @@ public:
     bool forward_codec(int32_t codec_token, int32_t n_past,
                        std::vector<float> & output);
 
+    // `codes` + `trailing` is the generation entry: the graph gathers this
+    // frame's codebook rows itself. Passing `step_embd` instead keeps the old
+    // behaviour, where the caller has already summed them on the host.
     bool forward_step(const float * step_embd, int32_t n_past,
                       std::vector<float> & output,
-                      std::vector<float> * hidden_out = nullptr);
+                      std::vector<float> * hidden_out = nullptr,
+                      const int32_t * codes = nullptr, int32_t n_codes = 0,
+                      const float * trailing = nullptr);
     
     // Get hidden states from last forward pass (for code predictor)
     bool get_hidden_states(std::vector<float> & hidden) const;
@@ -482,7 +487,9 @@ private:
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 
-    struct ggml_cgraph * build_step_graph(int32_t n_past);
+    // n_gather > 0 makes the graph read that many codebook embedding rows
+    // and sum them, instead of taking the sum as an input.
+    struct ggml_cgraph * build_step_graph(int32_t n_past, int32_t n_gather = 0);
 
     bool project_text_tokens(const int32_t * text_tokens, int32_t n_tokens,
                              std::vector<float> & output);

@@ -597,21 +597,55 @@ off, on Vulkan, ROCm, CUDA and CPU, plus `ctest` (streaming parity green) and
 ten server requests per configuration through `bench_speed.sh`. Peak VRAM moved
 by 1 MB, which is the desktop.
 
-**What is left in the same place, unfixed and measured:**
+### The frame also fetched 17 single rows to the host, and wiped a cache it refills
 
-* **16 embedding rows fetched one at a time, per frame - 369 ms (4.4%).** The
-  next step's input is the sum of 16 codebook embeddings, and `generate()`
-  builds it with 16 separate device-to-host `ggml_backend_tensor_get` calls and
-  a host-side add. This is the same pattern the prefix cache fixed for the
-  reference block; nobody fixed it for the frames being generated. One
-  `ggml_get_rows` + sum inside the step graph removes 16 round trips a frame.
-* **`clear_code_pred_kv_cache()` - 10 device memsets a frame**, part of the
-  243 ms `init` line. Every slot the mask lets the model read is written before
-  it is read, so the clear looks redundant.
-* **`io` in the code predictor - 523 ms (7.9%).** Fifteen logits readbacks a
-  frame, each a full sync. Sampling is host-side, so this cannot go to zero,
-  but with the graphs now cached the on-device-argmax variant is a much
-  cheaper experiment than it was when it was tried and scored 3%.
+Two more host round trips per frame came out with the same measurement, and
+both are gone:
+
+* **16 codebook embedding rows, fetched one at a time - 369 ms (4.4%).** The
+  next step's input is the sum of the frame's 16 codebook embeddings, and
+  `generate()` built it with 16 separate device-to-host `tensor_get` calls and
+  a host-side add - then pushed the sum straight back. This is the pattern the
+  prefix cache fixed for the reference block; nobody had fixed it for the
+  frames being generated. `build_step_graph` now takes the codes and gathers
+  the rows itself, summed left to right and then the trailing text row, which
+  is the order the host loop used. A 17th fetch, the code predictor's
+  codebook-0 row, went the same way into its prefill graph.
+* **`clear_code_pred_kv_cache()`, 10 device memsets a frame** - the 243 ms
+  `init` line. Every slot the mask lets a frame read is written by that frame
+  before it is read: the prefill writes 0 and 1, step *s* writes *s*+1. What
+  sits above `n_past` is the previous frame's finite numbers, multiplied by a
+  zero attention weight. The cache is now zeroed once, where it is created, so
+  a fresh buffer's contents are still never read.
+
+| | before | graphs cached | + gathered on device |
+|---|---|---|---|
+| talker forward | 3135 ms | 2686 ms | 2724 ms |
+| code predictor | 4888 ms | 3513 ms | 3255 ms (init 243 -> 0.6) |
+| embed lookups | 369 ms | 361 ms | **0 ms** |
+| **generate** | **8441 ms** | 6608 ms | **6028 ms** |
+
+The talker's own line goes *up* by 38 ms - it is doing the 16 `get_rows` and
+15 adds now - and buys 369 ms of round trips for it.
+
+Whole request, same protocol as above:
+
+| backend | before | graphs cached | + gathered | |
+|---|---|---|---|---|
+| ROCm 6800XT | 9.94 s | 8.69 s | **8.49 s** | **-14.6%** |
+| CUDA 1660S | 15.55 s | 15.02 s | **14.76 s** | **-5.1%** |
+| Vulkan 6800XT | generate 8445 ms | 6557 ms | **6028 ms** | **-28.6%** |
+
+Byte-identical WAV at every step, on all four backends, and the ICL clone path
+too. `QWEN3_TTS_GRAPH_REUSE=0` on the final build measures 9.80 s against
+8.49 s on ROCm, so the graph cache is still worth 13.4% of a request on its
+own.
+
+**What is left in the same place, measured and unfixed:** `io` in the code
+predictor, 520 ms (8.6%). Fifteen logits readbacks a frame, each a full sync.
+Sampling is host-side, so it cannot go to zero, but with the graphs now cached
+the on-device-argmax variant is a much cheaper experiment than it was when it
+was tried and scored 3%.
 
 ## Remaining ideas (descending value)
 
