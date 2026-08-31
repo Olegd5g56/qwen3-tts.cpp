@@ -55,6 +55,44 @@ Both non-GPU-vendor configurations above were benchmarked for the first time on
 2026-08-31, and both crashed on the first attempt — see `known-issues.md` #30
 and #31. A backend is not a device.
 
+### The 0.6B is 2.8x smaller and 20-26% faster
+
+The same sweep on `Qwen3-TTS-12Hz-0.6B-Base-Q8_0`, same day, same protocol:
+
+| config | 1.7B ms/frame | 0.6B ms/frame | gain |
+|---|---|---|---|
+| Vulkan 6800XT | 13.03 | 10.34 | 1.26x |
+| ROCm 6800XT | 14.98 | 12.47 | 1.20x |
+| CUDA 1660S | 27.49 | 23.07 | 1.19x |
+| Vulkan 1660S | 30.61 | 24.29 | 1.26x |
+| CPU 4 threads | 133.17 | 98.61 | 1.35x |
+| CPU 8 threads | 123.56 | 90.79 | 1.36x |
+
+**Why so little.** Both variants have **28 layers**; the 0.6B halves the hidden
+size, 2048 to 1024. So the *number of dispatches per frame is identical* and
+only the size of each matmul changes. On a GPU that number is the cost, which
+is why the parameter ratio does not show up in the clock.
+
+Splitting the request into its stages makes it explicit (single warm request,
+per frame, so the two models' different audio lengths cancel):
+
+| | generate 1.7B | generate 0.6B | decode 1.7B | decode 0.6B |
+|---|---|---|---|---|
+| Vulkan 6800XT | 11.43 | **8.96** (1.28x) | 1.09 | 1.09 (1.00x) |
+| CPU, 4 threads | 71.57 | **42.10** (1.70x) | 38.76 | 38.84 (1.00x) |
+
+Two things fall out of that table. The vocoder is the *same file* in both, so
+its cost is a constant floor — 11% of a 0.6B request on Vulkan but **48% on the
+CPU**, where shrinking the talker halves only half the work. And generation
+itself speeds up 1.28x on the GPU against 1.70x on the CPU: the CPU is the one
+paying for the FLOPs, so it is the one that collects when there are fewer of
+them. That is the dispatch-bound conclusion arriving from a direction that has
+nothing to do with fusion or graph reuse.
+
+**So the 0.6B is not a speed lever on a GPU.** A quarter off, for a smaller
+model. It is worth more on the CPU (1.38x end to end) and it is worth
+considering for VRAM, not for latency.
+
 Inside generation — Vulkan, 490 frames, a build configured with
 `-DQWEN3_TTS_TIMING=ON`:
 
