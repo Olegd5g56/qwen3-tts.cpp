@@ -199,6 +199,15 @@ bool TTSTransformer::load_model(const std::string & model_path) {
 
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
 
+    // Only the code predictor: five layers, and every frame runs them fifteen
+    // times. The talker's would cost 588 MB of duplicated weights for 23 of
+    // the 98 layer passes in a frame.
+    if (qwen3_tts::env().fuse_weights && !model_.code_pred_layers.empty()) {
+        if (!fuse_layer_weights(model_.code_pred_layers)) {
+            return false;
+        }
+    }
+
     // The per-op profiler and the numeric probe both hook the scheduler's eval
     // callback, and a cached graph never reaches the scheduler. Diagnostics
     // win: they are why anyone turns them on.
@@ -841,6 +850,110 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
     fclose(f);
     release_preferred_backend(backend);
     
+    return true;
+}
+
+bool TTSTransformer::fuse_layer_weights(std::vector<transformer_layer> & layers) {
+    // Concatenating along ne1 is a plain byte concatenation: a row is a whole
+    // number of quantisation blocks, so the fused weight is the sources laid
+    // end to end and the arithmetic per output row is untouched.
+    struct build_plan {
+        transformer_layer * layer;
+        bool qkv  = false;
+        bool gate = false;
+    };
+
+    std::vector<build_plan> plan;
+    for (auto & layer : layers) {
+        build_plan p{&layer, false, false};
+        p.qkv = layer.attn_q && layer.attn_k && layer.attn_v &&
+                layer.attn_q->type == layer.attn_k->type &&
+                layer.attn_q->type == layer.attn_v->type &&
+                layer.attn_q->ne[0] == layer.attn_k->ne[0] &&
+                layer.attn_q->ne[0] == layer.attn_v->ne[0];
+        p.gate = layer.ffn_gate && layer.ffn_up &&
+                 layer.ffn_gate->type == layer.ffn_up->type &&
+                 layer.ffn_gate->ne[0] == layer.ffn_up->ne[0] &&
+                 layer.ffn_gate->ne[1] == layer.ffn_up->ne[1];
+        if (p.qkv || p.gate) {
+            plan.push_back(p);
+        }
+    }
+    if (plan.empty()) {
+        return true;
+    }
+
+    if (!model_.fused_ctx) {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (2 * plan.size() + 2),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        model_.fused_ctx = ggml_init(params);
+        if (!model_.fused_ctx) {
+            error_msg_ = "Failed to create context for fused weights";
+            return false;
+        }
+    }
+
+    for (auto & p : plan) {
+        transformer_layer & layer = *p.layer;
+        if (p.qkv) {
+            layer.attn_qkv = ggml_new_tensor_2d(model_.fused_ctx, layer.attn_q->type,
+                                                layer.attn_q->ne[0],
+                                                layer.attn_q->ne[1] + layer.attn_k->ne[1] + layer.attn_v->ne[1]);
+            ggml_format_name(layer.attn_qkv, "%s.fused_qkv", ggml_get_name(layer.attn_q));
+        }
+        if (p.gate) {
+            layer.ffn_gate_up = ggml_new_tensor_2d(model_.fused_ctx, layer.ffn_gate->type,
+                                                   layer.ffn_gate->ne[0],
+                                                   layer.ffn_gate->ne[1] + layer.ffn_up->ne[1]);
+            ggml_format_name(layer.ffn_gate_up, "%s.fused_gate_up", ggml_get_name(layer.ffn_gate));
+        }
+    }
+
+    model_.fused_buffer = ggml_backend_alloc_ctx_tensors(model_.fused_ctx, state_.backend);
+    if (!model_.fused_buffer) {
+        // Not fatal: without the buffer every layer keeps its separate weights.
+        log_warn("could not allocate fused weights, keeping the separate ones");
+        for (auto & p : plan) {
+            p.layer->attn_qkv    = nullptr;
+            p.layer->ffn_gate_up = nullptr;
+        }
+        ggml_free(model_.fused_ctx);
+        model_.fused_ctx = nullptr;
+        return true;
+    }
+
+    std::vector<uint8_t> scratch;
+    auto append = [&](struct ggml_tensor * dst, struct ggml_tensor * src, size_t & offset) {
+        const size_t nbytes = ggml_nbytes(src);
+        scratch.resize(nbytes);
+        ggml_backend_tensor_get(src, scratch.data(), 0, nbytes);
+        ggml_backend_tensor_set(dst, scratch.data(), offset, nbytes);
+        offset += nbytes;
+    };
+
+    size_t fused_bytes = 0;
+    for (auto & p : plan) {
+        transformer_layer & layer = *p.layer;
+        if (layer.attn_qkv) {
+            size_t off = 0;
+            append(layer.attn_qkv, layer.attn_q, off);
+            append(layer.attn_qkv, layer.attn_k, off);
+            append(layer.attn_qkv, layer.attn_v, off);
+            fused_bytes += off;
+        }
+        if (layer.ffn_gate_up) {
+            size_t off = 0;
+            append(layer.ffn_gate_up, layer.ffn_gate, off);
+            append(layer.ffn_gate_up, layer.ffn_up, off);
+            fused_bytes += off;
+        }
+    }
+
+    log_info("code predictor: Q/K/V and gate/up fused into one matmul each (+%.1f MB)",
+             fused_bytes / (1024.0 * 1024.0));
     return true;
 }
 
@@ -1798,13 +1911,29 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
-        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        struct ggml_tensor * Qcur;
+        struct ggml_tensor * Kcur;
+        struct ggml_tensor * Vcur;
+        if (layer.attn_qkv) {
+            // One matmul, then three views over its output. Q sits first, then
+            // K, then V - the order fuse_layer_weights() concatenated them in.
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_off = 0;
+            const size_t k_off = (size_t) n_head    * head_dim * sizeof(float);
+            const size_t v_off = k_off + (size_t) n_kv_head * head_dim * sizeof(float);
+            const size_t row   = (size_t) head_dim * sizeof(float);
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head,    n_tokens, row, qkv->nb[1], q_off);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], k_off);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], v_off);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
         
         if (layer.attn_q_norm) {
             Qcur = ggml_rms_norm(ctx0, Qcur, eps);
@@ -1868,12 +1997,15 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
-        gate = ggml_silu(ctx0, gate);
-        
-        cur = ggml_mul(ctx0, gate, up);
+        // One GLU node, not silu + mul, and where the weights are fused, one
+        // matmul instead of two. Same arithmetic either way.
+        if (layer.ffn_gate_up) {
+            cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
         // Named because this is where the model's largest activations live and
         // the numeric probe reports by name (docs/known-issues.md #16).
         ggml_format_name(cur, "talker.blk.%d.ffn_swiglu", il);
@@ -1983,13 +2115,29 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
-        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        struct ggml_tensor * Qcur;
+        struct ggml_tensor * Kcur;
+        struct ggml_tensor * Vcur;
+        if (layer.attn_qkv) {
+            // One matmul, then three views over its output. Q sits first, then
+            // K, then V - the order fuse_layer_weights() concatenated them in.
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_off = 0;
+            const size_t k_off = (size_t) n_head    * head_dim * sizeof(float);
+            const size_t v_off = k_off + (size_t) n_kv_head * head_dim * sizeof(float);
+            const size_t row   = (size_t) head_dim * sizeof(float);
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head,    n_tokens, row, qkv->nb[1], q_off);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], k_off);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], v_off);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
         
         if (layer.attn_q_norm) {
             Qcur = ggml_rms_norm(ctx0, Qcur, eps);
@@ -2046,12 +2194,15 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
-        gate = ggml_silu(ctx0, gate);
-        
-        cur = ggml_mul(ctx0, gate, up);
+        // One GLU node, not silu + mul, and where the weights are fused, one
+        // matmul instead of two. Same arithmetic either way.
+        if (layer.ffn_gate_up) {
+            cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
         // See the prefill path: this is the graph's largest activation.
         ggml_format_name(cur, "blk.%d.ffn_swiglu", il);
         
@@ -2169,12 +2320,15 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
-        gate = ggml_silu(ctx0, gate);
-        
-        cur = ggml_mul(ctx0, gate, up);
+        // One GLU node, not silu + mul, and where the weights are fused, one
+        // matmul instead of two. Same arithmetic either way.
+        if (layer.ffn_gate_up) {
+            cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
         ggml_format_name(cur, "cp_dec.blk.%d.ffn_swiglu", il);
         
         const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
@@ -2261,13 +2415,29 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
-        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        struct ggml_tensor * Qcur;
+        struct ggml_tensor * Kcur;
+        struct ggml_tensor * Vcur;
+        if (layer.attn_qkv) {
+            // One matmul, then three views over its output. Q sits first, then
+            // K, then V - the order fuse_layer_weights() concatenated them in.
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_off = 0;
+            const size_t k_off = (size_t) n_head    * head_dim * sizeof(float);
+            const size_t v_off = k_off + (size_t) n_kv_head * head_dim * sizeof(float);
+            const size_t row   = (size_t) head_dim * sizeof(float);
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head,    n_tokens, row, qkv->nb[1], q_off);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], k_off);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], v_off);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
         
         if (layer.attn_q_norm) {
             Qcur = ggml_rms_norm(ctx0, Qcur, eps);
@@ -2323,12 +2493,15 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
-        gate = ggml_silu(ctx0, gate);
-        
-        cur = ggml_mul(ctx0, gate, up);
+        // One GLU node, not silu + mul, and where the weights are fused, one
+        // matmul instead of two. Same arithmetic either way.
+        if (layer.ffn_gate_up) {
+            cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
         ggml_format_name(cur, "cp_prefill.blk.%d.ffn_swiglu", il);
         
         const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
@@ -2417,13 +2590,29 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
-        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        struct ggml_tensor * Qcur;
+        struct ggml_tensor * Kcur;
+        struct ggml_tensor * Vcur;
+        if (layer.attn_qkv) {
+            // One matmul, then three views over its output. Q sits first, then
+            // K, then V - the order fuse_layer_weights() concatenated them in.
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_off = 0;
+            const size_t k_off = (size_t) n_head    * head_dim * sizeof(float);
+            const size_t v_off = k_off + (size_t) n_kv_head * head_dim * sizeof(float);
+            const size_t row   = (size_t) head_dim * sizeof(float);
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head,    n_tokens, row, qkv->nb[1], q_off);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], k_off);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens, row, qkv->nb[1], v_off);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
         
         if (layer.attn_q_norm) {
             Qcur = ggml_rms_norm(ctx0, Qcur, eps);
@@ -2480,12 +2669,15 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
-        gate = ggml_silu(ctx0, gate);
-        
-        cur = ggml_mul(ctx0, gate, up);
+        // One GLU node, not silu + mul, and where the weights are fused, one
+        // matmul instead of two. Same arithmetic either way.
+        if (layer.ffn_gate_up) {
+            cur = ggml_swiglu(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_up, cur));
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
         ggml_format_name(cur, "cp_step.blk.%d.ffn_swiglu", il);
         
         const bool ffn_down_rescale = needs_q8_1_activation_sum(layer.ffn_down->type);
@@ -3714,6 +3906,14 @@ bool TTSTransformer::forward_with_audio(const int32_t * tokens, int32_t n_tokens
 }
 
 void free_transformer_model(tts_transformer_model & model) {
+    if (model.fused_buffer) {
+        ggml_backend_buffer_free(model.fused_buffer);
+        model.fused_buffer = nullptr;
+    }
+    if (model.fused_ctx) {
+        ggml_free(model.fused_ctx);
+        model.fused_ctx = nullptr;
+    }
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);
         model.buffer = nullptr;

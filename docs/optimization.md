@@ -641,11 +641,66 @@ too. `QWEN3_TTS_GRAPH_REUSE=0` on the final build measures 9.80 s against
 8.49 s on ROCm, so the graph cache is still worth 13.4% of a request on its
 own.
 
+### Then: fewer, bigger kernels
+
+With the host overhead gone, `compute` is 89% of generation and it is ~2500
+dispatches a frame at roughly 4 us each. Two changes cut the count, neither
+touching the arithmetic:
+
+* **`silu` + `mul` -> one `ggml_swiglu_split`.** One node fewer per layer, and
+  a frame runs 98 layer passes. Generation 6028 -> 5915 ms (-1.9%).
+* **Q/K/V concatenated into one weight, gate and up into another.** Attention
+  becomes one matmul plus three views, the FFN one matmul plus a `ggml_swiglu`.
+  Concatenating along `ne1` is a byte concatenation - a row is a whole number
+  of quantisation blocks - so per-row arithmetic is untouched. Generation
+  5915 -> 5713 ms (-3.4%); the code predictor's own line -6.3%.
+
+**Only the code predictor is fused.** The fused weights are copies in a buffer
+of their own, because the originals cannot be freed out of a model buffer that
+holds every tensor at once. That is +53 MB for the code predictor's five
+layers, which a frame runs fifteen times - 75 of its 98 layer passes. The
+talker's 28 would cost **588 MB** of duplicated weights for the other 23
+passes, worth an estimated 1.5-2.5%. Doing it there means building the fused
+tensor at *create* time and loading Q, K and V into views of it, which is a
+real change to `create_tensors` and `load_tensor_data`; it is the right way and
+it is not done. `QWEN3_TTS_FUSE_WEIGHTS=0` switches the fusion off.
+
+### Where this landed
+
+Whole request, `scripts/bench_speed.sh`, median of 9, seed pinned, audio length
+identical throughout:
+
+| backend | before it all | graphs cached | + gathered | + fused | |
+|---|---|---|---|---|---|
+| ROCm 6800XT | 9.94 s | 8.69 s | 8.49 s | **7.47 s** | **-24.8%** |
+| CUDA 1660S | 15.55 s | 15.02 s | 14.76 s | **13.89 s** | **-10.7%** |
+| Vulkan 6800XT | generate 8445 ms | 6557 | 6028 | **5695 ms** | **-32.6%** |
+
+Byte-identical WAV at every one of these steps, on all four backends.
+
+### Two things that did not work, so nobody repeats them
+
+* **Shrinking `QWEN3_TTS_MAX_NODES` from 16384 to 2048.** The scheduler sizes
+  its hash set from that number and memsets ~330 KB on every reset, sixteen
+  times a frame - 5 MB a frame of pure memset, which looked like an easy win.
+  It is worth 0.5%, inside the noise. The scheduler's cost is the re-planning,
+  not the wipe.
+* **Uploading the code predictor's constant inputs once.** A step's position
+  and mask never change - it has a graph to itself - so priming them at build
+  time looks free. It is wrong twice over: `ggml_gallocr` only protects tensors
+  flagged OUTPUT from reuse, so an input's memory is handed to a later node in
+  the same graph and the second frame reads garbage; and it buys nothing
+  anyway. Per-step `io` is 71 us whether you upload three tensors or one,
+  because the cost is the logits *readback*, which is a device sync. Uploads
+  queue; reads wait.
+
 **What is left in the same place, measured and unfixed:** `io` in the code
-predictor, 520 ms (8.6%). Fifteen logits readbacks a frame, each a full sync.
-Sampling is host-side, so it cannot go to zero, but with the graphs now cached
-the on-device-argmax variant is a much cheaper experiment than it was when it
-was tried and scored 3%.
+predictor, 520 ms (8.6%). Fifteen logits readbacks a frame, each a full sync -
+see the note above for why the uploads around them are free and this is not.
+Sampling is host-side, so it cannot go to zero. Doing it on the device means
+`top_k` over 2048 logits (an `argsort`, which may well cost more than the sync
+it saves) and it stops being bit-identical, so it needs the ASR check, not a
+checksum.
 
 ## Remaining ideas (descending value)
 

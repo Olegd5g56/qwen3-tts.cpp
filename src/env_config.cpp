@@ -60,6 +60,10 @@ env_config read_env() {
     v = std::getenv("QWEN3_TTS_GRAPH_REUSE");
     c.graph_reuse = !(v && v[0] == '0');
 
+    // Fusing the code predictor's Q/K/V and gate/up is on unless switched off.
+    v = std::getenv("QWEN3_TTS_FUSE_WEIGHTS");
+    c.fuse_weights = !(v && v[0] == '0');
+
     // The GEMM route is the default; the variable exists to get back to
     // ggml's own kernel for comparison.
     v = std::getenv("QWEN3_TTS_CONV_T_GEMM");
