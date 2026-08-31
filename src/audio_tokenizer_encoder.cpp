@@ -241,17 +241,30 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
     struct gguf_context * gguf_ctx = loader.get_ctx();
     struct ggml_context * meta_ctx = loader.get_meta_ctx();
 
-    // Vulkan only, and deliberately so. Widening these weights changes which
-    // matmul kernel runs, and on CUDA and ROCm that moves the speaker
-    // embedding in its last bits - every cached voice would come out subtly
-    // different, for no gain on backends that never had the problem.
-    bool widen_bf16 = false;
+    // Two backends handle a bf16 second matmul operand: CUDA and ROCm. Every
+    // other one has to be given f32.
+    //
+    // The list is a whitelist rather than a blacklist because the failures do
+    // not look alike and neither is detectable in advance. ggml-vulkan asserts
+    // inside the kernel (its supports_op says yes and then aborts, #28); the
+    // CPU backend declines the op honestly, which is worse under
+    // QWEN3_TTS_FORCE_CPU=1, because then the scheduler has no second backend
+    // to hand it to and dies in ggml_backend_sched_split_graph (#31). Asking
+    // ggml_backend_supports_op would catch the CPU and miss Vulkan.
+    //
+    // Widening is exact - every bf16 value is an f32 value - but it changes
+    // which matmul kernel runs, and on CUDA and ROCm that moves the speaker
+    // embedding in its last bits. Those two stay on the narrow path so that
+    // every voice cached by a deployment keeps decoding the same.
+    bool widen_bf16 = true;
     {
         ggml_backend_t probe = init_preferred_backend("AudioTokenizerEncoder", nullptr);
         if (probe) {
             ggml_backend_dev_t probe_dev = ggml_backend_get_device(probe);
             const char * probe_name = probe_dev ? ggml_backend_dev_name(probe_dev) : "";
-            widen_bf16 = strncmp(probe_name, "Vulkan", 6) == 0;
+            widen_bf16 = strncmp(probe_name, "CUDA", 4) != 0 &&
+                         strncmp(probe_name, "ROCm", 4) != 0 &&
+                         strncmp(probe_name, "HIP",  3) != 0;
             release_preferred_backend(probe);
         }
     }

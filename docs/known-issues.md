@@ -1503,3 +1503,52 @@ one loop where host work is what dominates. The same pattern in the dead
 works on *that* Vulkan device. Backend coverage is not device coverage, and a
 `GGML_ASSERT` on a device property is exactly the kind of thing that hides
 behind one vendor's generous limit.
+
+---
+
+<a id="31"></a>
+## 31. `QWEN3_TTS_FORCE_CPU=1` could not clone a voice — #28 again, other end
+
+**Status: fixed** 2026-08-31.
+
+Found while adding a CPU row to the cross-backend sweep. Cloning on the CPU
+backend aborts in the scheduler:
+
+```
+ggml/src/ggml-backend.cpp:1283: GGML_ASSERT(*cur_backend_id != -1) failed
+  ggml_backend_sched_split_graph
+  ggml_backend_sched_alloc_graph
+  qwen3_tts::AudioTokenizerEncoder::encode
+```
+
+**Same root cause as #28.** The speaker encoder's convolutions are the only
+bf16 weights a quantised file keeps — rows of 1, 3 or 5 values, too short for
+any block type, so the quantiser leaves them at the source type.
+`ggml_conv_1d` feeds the kernel in as the *second* mul_mat operand, and the CPU
+backend accepts a second operand only when it is f32 or the vec-dot type of the
+first (`ggml-cpu.cpp`, `GGML_OP_MUL_MAT`). bf16 against f32 is neither.
+
+The two backends fail in opposite styles, which is why fixing #28 did not fix
+this:
+
+| backend | what it does with a bf16 second operand |
+|---|---|
+| ggml-vulkan | `supports_op` says yes, then the kernel asserts (#28) |
+| ggml-cpu | `supports_op` says no — honestly |
+
+Declining is the correct behaviour and normally harmless: the scheduler moves
+the node to another backend. Under `QWEN3_TTS_FORCE_CPU=1` there is no other
+backend, so pass 4 leaves the node unassigned and pass 4's closing assert
+fires. Asking `ggml_backend_supports_op` up front would have caught the CPU and
+missed Vulkan, so it is no answer either.
+
+**Fix:** the widening is now a whitelist. CUDA and ROCm keep the bf16 weights;
+everything else — Vulkan, CPU, and any backend not yet met — gets them widened
+to f32 at load. Widening is exact, since every bf16 value is an f32 value, but
+it changes which matmul kernel runs and that moves the speaker embedding in its
+last bits, so the two backends that never had the problem stay on the narrow
+path and every voice a deployment has cached keeps decoding the same.
+
+Neither this nor #28 would have surfaced without running the sweep on a
+backend nobody was using.
+
