@@ -119,6 +119,14 @@ and its KV is cached; the reference codes are behind the target text in a causal
 stack, so their KV is different every request and is rebuilt every time. See
 `optimization.md`, *Per-voice prefill reuse*.
 
+**The loop closes on the device.** The talker's next step needs this frame's
+sixteen codebook embeddings summed, plus the trailing text row. That sum used to
+be built by pulling sixteen single rows back to the host; it is now gathered
+inside the step graph itself, which takes the codes as an input
+(`build_step_graph`, `n_gather`). The code predictor reads its own codebook-0
+row the same way. Nothing about a frame's arithmetic crosses to the host except
+the logits each sampler draw needs.
+
 Generation ends on `tts_eos`, on the per-request frame budget, or on abort.
 
 ## Stage 4 — the vocoder
@@ -139,8 +147,10 @@ The chain, in graph order:
 | `dec.1..4` | snake activation, then transposed conv at **stride 8, 5, 4, 3** (same GEMM pair), each with three dilated residual blocks (dilation 1, 3, 9) | ×8 ×5 ×4 ×3 |
 | `dec.6` | final conv1d to one channel | → waveform |
 
-The 15-way sum at the top is the add chain that RADV's fusion rule mishandles
-(`ggml-notes.md`). The six transposed convolutions used to be 45–52% of decode;
+The 15-way sum at the top is the add chain that RADV's multi-add fusion
+mishandled — a mesa regression in 26.1.x, gone in 26.2.1 and never present in
+the 25.0.7 the Vulkan image ships (`known-issues.md` #8). The workaround
+variable is still set in `Dockerfile.vulkan` and is a no-op there. The six transposed convolutions used to be 45–52% of decode;
 they are now a GEMM pair instead of ggml's own op — see *Device placement*
 below.
 
@@ -161,6 +171,16 @@ same `IGPU → GPU → ACCEL → CPU` ladder as `init_preferred_backend()`. Gett
 this wrong does not fail — the log still prints the GPU's name while the whole
 graph runs on the CPU (`known-issues.md` #13).
 
+**The per-frame graphs do not go through the scheduler at all.** The talker's
+step graph and the code predictor's sixteen are built once, allocated once
+against a `ggml_gallocr_t` of their own, and run with a bare
+`ggml_backend_graph_compute`. One `ggml_backend_sched` holds one allocation, so
+cycling seventeen graphs through it re-planned every one of them, every frame.
+Everything that runs once per request still uses the scheduler and still gets
+its CPU fallback; a cached graph gives that up, so it is only taken when the
+backend supports every node in it. `QWEN3_TTS_GRAPH_REUSE=0` restores the old
+path. The invariants this imposes are in `AGENTS.md`.
+
 **Concurrent stages need their own backend instance.**
 `init_preferred_backend(..., exclusive=true)`. One instance owns one stream and
 one memory pool, and the CUDA pool asserts frees arrive in reverse order, which
@@ -171,6 +191,16 @@ are F16 and `ggml_conv_1d` keeps its im2col in F16, so CUDA/HIP pick a
 half-precision accumulator and a deep tower loses ~30 dB. Applies to the vocoder
 and the speaker encoder. Talker graphs deliberately keep F16 accumulation
 (`known-issues.md` #14).
+
+**The speaker encoder's convolution weights are widened to F32 on Vulkan.**
+They ship as bf16 — their rows are 1, 3 or 5 values long, so no block type fits
+and the quantiser leaves them at the source type — and `ggml_conv_1d` feeds the
+kernel in as the *second* `mul_mat` operand, which ggml-vulkan cannot take in
+bf16 against an f32 first operand. It asserted and took the process down for
+any voice at all. Widening is exact and is done on the way in, by the same
+loader path the vocoder uses; it is Vulkan-only because it changes which matmul
+kernel runs, and on CUDA and ROCm that would move every cached voice's
+embedding in its last bits (`known-issues.md` #28).
 
 **The six transposed convolutions do not use ggml's `conv_transpose_1d` op.**
 They are built as `mul_mat` + `col2im_1d` instead, which is the same
@@ -217,8 +247,8 @@ doubles the weight bytes and the 1.7B then does not fit in 6 GB
   instances cannot coexist and it must stay off. `QWEN3_TTS_PIPELINE=1/0`
   overrides. It was worth ~25-40% when it overlapped a GPU talker with a CPU
   vocoder, ~7% once both wanted the same GPU, and **less again now that decode
-  is 4.29 ms/frame against generation's 25** — there is not much left to hide.
-  That last share has not been re-measured.
+  is a few ms/frame against generation's 11.2 on Vulkan** — there is not much
+  left to hide. That last share has not been re-measured.
 - **Synthesis is serialized.** The server holds one `synth_mutex`; a second
   request waits rather than failing fast.
 - **Lock order is `map_mutex` before `synth_mutex`**, and `VoiceStore` locks per
@@ -250,8 +280,10 @@ stack, so their KV genuinely differs per request.
   consumers. Caught up with the core on 2026-08-27: ICL cloning through a
   prepared `Qwen3TtsVoice`, live PCM through a callback, and the same frame cap
   the other two use. `qwen3_tts_synthesize_request()` is the entry point; the
-  older per-case functions are wrappers over it. Verified byte-identical to the
-  server for the same voice, text and seed (`tests/test_c_api.c`).
+  older per-case functions are wrappers over it. `tests/test_c_api.c` checks it
+  byte for byte against the one-shot path — green on CUDA and ROCm, and
+  **failing on Vulkan**, where streamed and one-shot audio differ
+  (`known-issues.md` #29).
 
 All three go through `Qwen3TTS`, so a change to the pipeline reaches every
 front end. `install_ggml_log_bridge()` must run before the first model load or

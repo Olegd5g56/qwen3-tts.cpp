@@ -45,6 +45,18 @@ so it is a consistency fix, not a new convention), then `CONV_TRANSPOSE_1D`.
 
 ## Worth reporting upstream
 
+### `ggml_conv_1d` with a bf16 kernel aborts on Vulkan (2026-08-31)
+
+`ggml_conv_1d` puts the kernel in as `src1`, and ggml-vulkan's `mul_mat` has no
+path for a contiguous bf16 `src1` against an f32 `src0` — it asserts rather
+than falling back, so the process dies. CUDA and ROCm both handle it. bf16 conv
+weights are not exotic: any quantiser that skips a short-rowed convolution
+leaves it at the source type, and bf16 is what the current generation of
+checkpoints ships. Repro and diagnosis in `known-issues.md` #28. Either the
+dequant path should accept bf16 as `src1`, or `supports_op` should decline the
+node so the scheduler can put it on the CPU — the assert is the one outcome
+that helps nobody.
+
 ### ~~multi-add fusion is pathological on RADV / RDNA2~~ — WITHDRAWN 2026-08-27
 
 **Do not report this.** It was a mesa regression, not a ggml bug. Re-measured
@@ -101,6 +113,20 @@ followed by `ggml_mul_mat` (`ggml/src/ggml.c:4521`) — so there is no
 `GGML_OP_CONV_1D` node to look for and no backend kernel to be missing. Upstream
 has `ggml_conv_2d_direct` and `ggml_conv_3d_direct`; a `conv_1d_direct` still
 does not exist as of ggml 0.20.2. Two consequences for audio models:
+
+- **The kernel goes in as the *second* `mul_mat` operand**, which decides what
+  weight types are usable. `ggml_conv_1d` builds
+  `mul_mat(im2col_output, kernel)`, so the kernel is `src1` — the operand a
+  backend expects to be an activation. ggml-vulkan asserts on
+  `y_non_contig || !qy_needs_dequant` (`ggml-vulkan.cpp:9226`) whenever `src1`
+  is contiguous and is neither F32 nor the F16 type it picked from `src0`, so a
+  **bf16 kernel against an f32 input aborts the process**. There is no
+  `GGML_VK_DISABLE_*` that avoids it: the branch is decided by tensor types, not
+  device capability. It is easy to walk into without meaning to — a quantiser
+  that skips a short-rowed conv weight leaves it at the source type, and a bf16
+  source model then produces bf16 kernels in every quantisation of itself
+  (`known-issues.md` #28). Widening to F32 at load is the local fix; upstream
+  the honest fix is for the F16 dequant path to accept bf16 there too.
 
 - **im2col materialises very large intermediates.** For this vocoder,
   `[672, 287445]` F16 is ~386 MB per call, written and read back for nothing a
