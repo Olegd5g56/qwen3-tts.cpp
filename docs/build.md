@@ -85,10 +85,13 @@ Python implementation, which are not in the repo;
 | `transformer_test` | model + reference dump | deterministic generation |
 | `streaming_parity_test` | model | streaming decode == one-shot decode |
 | `c_api_test` | model | the C ABI: ICL, streaming, voice caching, struct-size guard |
+| `cli_test` | model | the CLI binary end to end: cloning, streaming, seeds, output formats, argument refusal |
 
-All five are green on every backend. Anything red is new.
+All six are green on every backend. Anything red is new. **ctest is the whole
+automated suite** — `scripts/run_all_tests.sh` used to be advertised here as a
+wider sweep and was deleted on 2026-08-31, having quietly skipped itself for
+months (`known-issues.md`, open rough edges).
 
-`scripts/run_all_tests.sh` **does not run** — see `known-issues.md`, open rough
-edges. It is hard-wired to a `./build/` directory and a `models/` layout the
-repo stopped using, so every section skips and the one that does not, fails.
-ctest is the whole automated suite today.
+`scripts/compare_e2e.py` still exists and is run by hand: it compares this
+implementation against the PyTorch reference and needs the `qwen_tts` Python
+environment, which is why it is not a ctest entry.

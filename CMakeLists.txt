@@ -293,6 +293,14 @@ target_link_libraries(test_icl_dump PRIVATE
 # C ABI smoke test. Built as C on purpose: the header has to compile the way an
 # FFI consumer will compile it, and linking the real .so is what proves the
 # library exports what the header promises.
+# Runs the CLI binary as a subprocess, so it links nothing of its own.
+add_executable(test_cli
+    tests/test_cli.cpp
+)
+target_link_libraries(test_cli PRIVATE
+    Threads::Threads
+)
+
 add_executable(test_c_api
     tests/test_c_api.c
 )
@@ -371,6 +379,13 @@ add_test(NAME c_api_test
     COMMAND test_c_api
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# The CLI is passed in by path: the test runs the real binary, not a copy of
+# its logic, and the working directory is the source tree so the reference clip
+# in benchmarks/voice resolves.
+add_test(NAME cli_test
+    COMMAND test_cli $<TARGET_FILE:qwen3-tts-cli>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 # The reference tests need model ggufs and binary dumps from the original
 # Python implementation, none of which are in the repo. Without them the tests
@@ -378,6 +393,6 @@ add_test(NAME c_api_test
 # still means something. Set QWEN3_TTS_TEST_MODEL / QWEN3_TTS_TEST_VOCODER to
 # local ggufs to run the ones that need only a model.
 set_tests_properties(
-    encoder_test transformer_test streaming_parity_test c_api_test
+    encoder_test transformer_test streaming_parity_test c_api_test cli_test
     PROPERTIES SKIP_RETURN_CODE 77
 )

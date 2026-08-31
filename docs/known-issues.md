@@ -985,17 +985,21 @@ unreported ggml findings.**
   ships, and our `GGML_VK_DISABLE_MULTI_ADD=1` workaround is now a measured
   no-op. Nothing to report; see #8's 2026-08-27 update.
 
-- **`scripts/run_all_tests.sh` has not run for a long time.** Checked
-  2026-08-31: **0 passed, 1 failed, 6 skipped.** Every path in it is
-  hard-wired to a `./build/` directory and to `models/qwen3-tts-0.6b-f16.gguf`,
-  neither of which the repo uses any more — models live wherever
-  `TTS_MODEL` points and build directories are per-backend. So the six
-  sections skip themselves and the seventh, the Python-vs-C++ end-to-end
-  comparison, fails on the missing binary.
+- ~~**`scripts/run_all_tests.sh` has not run for a long time.**~~ **Deleted
+  2026-08-31.** Measured before deciding: **0 passed, 1 failed, 6 skipped**.
+  Every path in it was hard-wired to a `./build/` directory and to
+  `models/qwen3-tts-0.6b-f16.gguf`, neither of which the repo uses any more.
 
-  It is not covering anything: what it can still express, ctest already runs.
-  Either point it at the current layout or delete it, but until then
-  `docs/build.md` no longer advertises it as the wider sweep.
+  Read section by section it turned out to be worth less than its 296 lines:
+  section 1 re-ran the three binaries ctest already runs, section 2 exercised an
+  F16 talker — the one type known to run away (#16) — sections 3 and 5 printed
+  file sizes, and section 6 wrapped `compare_e2e.py`, which runs on its own.
+
+  **One idea in it was real and is now a ctest entry.** Section 4's CLI
+  invocations were the only automated cover the `qwen3-tts-cli` binary had, and
+  it had been skipping itself. `tests/test_cli.cpp` runs the actual binary
+  through cloning, streaming, seed reproducibility, mp3/opus dispatch and
+  argument refusal, and skips like every other model-dependent test.
 
 ### Dismissed after checking
 

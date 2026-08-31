@@ -66,3 +66,4 @@ build-*/
 # and running it from the repo root once put a 375 KB stowaway into a commit.
 out.mp3
 *.opus
+test_output_cli/
