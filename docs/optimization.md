@@ -1,54 +1,63 @@
 # Qwen3-TTS GGML Optimization Report
 
-Performance characterization of this fork. Last updated **2026-08-26**.
+Performance characterization of this fork: what was measured, what it cost, and
+what was ruled out. Last updated **2026-08-31**.
 
-> Everything measured before **2026-08-24** described a build whose vocoder was
-> silently running on the CPU (`known-issues.md` #13). Sections are ordered so
-> current numbers come first; the August-20 sweep is kept at the end as history
-> because the relative wins it records are still real.
->
-> The newest layer is *The conv_transpose experiment* (2026-08-26), which closes
-> that target: rewritten as `mul_mat` + `col2im_1d`, vocoder decode is 2.3-4.5x
-> faster on every backend and generation is now the whole cost of a request.
+> Two dates bound how far back a number can be trusted. Anything measured
+> before **2026-08-24** described a build whose vocoder was silently running on
+> the CPU (`known-issues.md` #13). Anything before **2026-08-31** describes a
+> frame that spent about 30% of itself in host-side overhead. Both layers are
+> kept below, because the relative wins they record are still real and the
+> arguments still hold.
 
-## Current profile (where the time goes)
+**Contents.** *Where the time goes* is the current profile and *What is open*
+is the current target list; read those two if you only read two. Then, newest
+first: *Generation is dispatch-bound* (2026-08-31), *Per-voice prefill reuse*
+and *The conv_transpose experiment* (2026-08-26), *Against the reference
+PyTorch pipeline* (2026-08-24). *Tried and ruled out* is the list to check
+before proposing anything. *Tracking speed across commits* is the measurement
+protocol and *Measurement notes* the traps in it. The rest is history, kept
+because the arguments are still worth reading.
 
-`ward.txt`, 1.7B, `QWEN3_TTS_PIPELINE=0` so the stages time apart, warm process,
-fixed seed. Frame counts differ per backend because sampling does, so compare
-ms/frame, not wall time:
+## Where the time goes
 
-Decode covers the 150-frame ICL reference warm-up as well as the generated
-frames, in these numbers and in the older ones they are compared against; per
-*decoded* frame the vocoder is 10.1 ms on CUDA.
+Whole request, `scripts/bench_speed.sh`, `bench_ru.txt`, 1.7B Q8_0, median of
+nine, seed pinned. **Compare ms/frame across backends and seconds only within
+one** — sampling differs per backend, so each produces a different amount of
+audio:
 
-| stage | CUDA, 1660 SUPER | ROCm, RX 6800 XT |
+| backend | wall | ms/frame |
 |---|---|---|
-| talker forward | 10.1 ms/frame | 7.1 ms/frame |
-| code predictor | **13.2 ms/frame** | **10.9 ms/frame** |
-| generate (total) | 25.1 ms/frame | 18.9 ms/frame |
-| vocoder decode | ~~12.9 ms/frame~~ | ~~8.9 ms/frame~~ |
+| **Vulkan, RX 6800 XT** | **6.36 s** | **12.99** |
+| ROCm, RX 6800 XT | 7.39 s | 15.06 |
+| CUDA, GTX 1660 SUPER | 13.96 s | 27.59 |
 
-**The vocoder row is superseded.** `conv_transpose` moved to a GEMM +
-`col2im_1d` decomposition on 2026-08-26 and decode is now 4.29 ms/frame on
-CUDA/1660S and 1.49 on HIP/6800 XT — see *The conv_transpose experiment*. Those
-were measured on `bench_ru.txt` rather than the `ward.txt` this table uses, so
-they are not swapped into it; the generate rows are unaffected and still
-current. **Generation is now 5-7x the vocoder, not 2x.**
-| wall, pipeline off | 20 493 ms (539 fr) | 13 715 ms (494 fr) |
-| wall, pipeline on | 18 977 ms | 11 846 ms |
+Vulkan on the 6800 XT is the fastest configuration by a wide margin, and it was
+10.21 s on 2026-08-27 with the same text, model and environment.
 
-**The ordering has flipped.** The vocoder was 53.4 ms/frame and hid everything;
-it is now 12.9 and *generation is roughly twice it*. Prefill is 793 ms for the
-1.7B (210 tokens, 150 of them ICL reference frames).
+Inside generation — Vulkan, 490 frames, a build configured with
+`-DQWEN3_TTS_TIMING=ON`:
 
-The **code predictor is now the largest single line** — 13.2 ms/frame, more than
-the talker. It costs the same on the 0.6B and the 1.7B, because it is 15
-sequential 5-layer passes per frame over weights that do not change size with
-the talker. It was retired as a target in the previous revision of this file;
-that verdict was conditional on a 53 ms/frame vocoder hiding it, and that
-condition is gone.
+| stage | ms | ms/frame |
+|---|---|---|
+| talker forward | 2453 | 5.0 |
+| code predictor | 2992 | 6.1 |
+| **generate, total** | **5495** | **11.2** |
 
-### Inside the vocoder
+**Generation is the whole cost of a request**; the vocoder is 5-7x smaller than
+it since the `conv_transpose` rewrite. Within generation the code predictor is
+still the larger of the two lines, because it runs its five layers fifteen
+times a frame while the talker runs its twenty-eight once.
+
+**Nothing cheap is open.** What remains is ~2000 GPU dispatches a frame with no
+single large one — see *Generation is dispatch-bound* for how that was
+established and what it cost to learn.
+
+## The vocoder profile that motivated the rewrite
+
+Kept because the argument is what killed a whole roadmap, not because the
+numbers are current: at the time `CONV_TRANSPOSE_1D` was half of decode and
+decode was the request.
 
 Per-op, CUDA, `QWEN3_TTS_PROFILE_OPS=1`. The profiler disables fusion, but for
 this graph it costs only 3.6% (decode 2472 ms → 2561 ms), so the shares are
@@ -748,51 +757,41 @@ the 44 us it saves, and the output stops being bit-identical, so it needs the
 20-seed ASR check instead of a checksum. **Against a 5.6% ceiling that is a bad
 trade, and it is not being taken.**
 
-## Remaining ideas (descending value)
+## What is open
 
-1. **`CONV_TRANSPOSE_1D` — done.** Rewritten as `mul_mat` + `col2im_1d`; decode
-   is 2.3-4.5x faster on every backend and the vocoder is no longer a
-   meaningful share of a request. See *The conv_transpose experiment* above.
-   What is left here is an upstream report, not more local work.
-   **The vocoder is closed as a target; everything below is generation.**
-2. **The code predictor: only one lever left, and it is not a code change.**
-   At 13.2 ms/frame it is the largest single line and no longer hidden, but it
-   is ~70% weight traffic (see the ruled-out entry). Quantising it works and is
-   worth 6.6% end-to-end, rejected on audible quality. Fusing the passes bought
-   3% and broke Vulkan. Everything that targets dispatch overhead is capped at
-   the remaining ~30% of the stage. **Cutting the number of sequential passes is
-   the only large win, and that is a model-architecture question.**
+Short, and it stays short because everything on it has been priced.
 
-   The one free scrap: `code_pred.lm_head.*` ships F16 while the rest of the
-   talker is Q8_0. Near-lossless to quantise, 30 MB of file, ~2% of the stage.
-3. **Overlap pays less than it used to.** With the vocoder on the CPU the
-   pipeline overlapped two different pieces of hardware; now both stages want
-   the same GPU and it recovers only part of the decode (CUDA 20 493 → 18 977
-   ms, ROCm 13 715 → 11 846). Still worth keeping on, no longer a big lever.
-4. **Per-voice prefill reuse — done, and three times smaller than this entry
-   used to claim.** The old text said prefill was "dominated by the 150 ICL
-   reference frames — and it is recomputed on every request, though for a fixed
-   voice that prefix is byte-identical every time", and priced that at 16% of a
-   request. **The premise was wrong.** The reference frames are byte-identical
-   as *input embeddings*, but they sit at the **end** of the prompt, after the
-   line being spoken, so their KV is different for every request and can never
-   be reused. Only the head is reusable. See *Per-voice prefill reuse* below for
-   what that is worth and what shipped.
-5. **The streaming vocoder's host round-trip — mostly bounded, never timed
-   directly.** `stream_decode` pulls the conv tails and KV device→host after
-   every chunk and pushes them back before the next, a fixed cost per chunk.
-   The chunk sweep caps it indirectly: halving the number of chunks at the
-   default (100 → 200 frames, 7 round-trips → 4) changes nothing measurable,
-   so whatever the copies cost, at the operating point we ship it is under the
-   noise floor. What the sweep cannot do is separate the copies from graph
-   efficiency, and the 25-frame cliff is large enough that *something* per
-   chunk is expensive. One timing line around the copy block in
-   `audio_tokenizer_decoder.cpp` still settles it, and it is cheap.
+1. **Nothing cheap.** Generation is ~2000 dispatches a frame with no single
+   large one. The vocoder, prefill, the per-frame host overhead and the kernel
+   count are all closed — see the sections below for each.
+2. **The code predictor's `io`, ceiling 5.6%.** Fifteen logits readbacks a
+   frame at 44 us each. Every cheap route to them is closed; what is left is
+   device-side sampling, which needs an argsort over 2048 logits that can cost
+   more than it saves and gives up bit-exactness. See *The code predictor's
+   `io`* below.
+3. **The talker's Q/K/V fusion on CUDA**, if anyone finds why one 4096-row
+   matmul is slower there than three smaller ones. It is a win on Vulkan and
+   ROCm and a measured 1.6% loss on CUDA, which is why the default is decided
+   by the backend.
+4. **`code_pred.lm_head.*` ships F16** while the rest of the talker is Q8_0.
+   Near-lossless to quantise, 30 MB of file, ~2% of the stage. Never done.
+5. **The streaming vocoder's host round-trip, never timed directly.**
+   `stream_decode` pulls the conv tails and KV device-to-host after every chunk
+   and pushes them back before the next. The chunk sweep bounds it indirectly —
+   halving the number of chunks at the default changes nothing measurable — but
+   cannot separate the copies from graph efficiency. One timing line around the
+   copy block in `audio_tokenizer_decoder.cpp` settles it.
+
+**Not open, and do not re-open without new evidence:** the code predictor's 15
+sequential passes (a model-architecture property, not something this repo
+reaches), quantising it (works, 6.6% end-to-end, **rejected because Oleg could
+hear it**), the 0.6B as a speed lever (a VRAM choice), and overlap (~7% now
+that both stages want the same device — keep it on, stop calling it a lever).
 
 ## Two cards, and what that is actually good for
 
 Both stages want the same GPU now, which is why the overlap fell from 25-40% to
-~7% (idea 3). This machine has two cards, so splitting the two models across
+~7% (see *What is open*). This machine has two cards, so splitting the two models across
 them is the obvious thought. Two things to know before trying it.
 
 **CUDA and ROCm cannot be linked into one binary.** The HIP backend compiles the
@@ -816,6 +815,14 @@ same work) that is about +65% throughput — more than any single optimisation
 listed above.
 
 ## Tried and ruled out — do not redo
+
+The 2026-08-31 dead ends live with their story in *Generation is
+dispatch-bound*: shrinking `QWEN3_TTS_MAX_NODES` (0.5%, noise), priming a step
+graph's constant inputs once (incorrect **and** worthless), queueing the logits
+readback behind the graph (noise on three backends), reading fewer bytes (the
+price is the command buffer, not the payload), and writing the logits into
+pinned host memory (the backend refuses the buffer type).
+
 
 - **Fused code predictor** (one graph for all 15 codebooks, `argmax` +
   `get_rows` kept on device, zero logits readbacks). Worth only ~3% on CUDA —

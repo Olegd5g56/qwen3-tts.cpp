@@ -159,6 +159,28 @@ ggml_backend_tensor_get(out, output_data, 0, size);
 ggml_backend_sched_reset(state_.sched);
 ```
 
+**The per-frame graphs no longer follow it.** The talker's step graph and the
+code predictor's sixteen are built once, allocated once against a
+`ggml_gallocr_t` of their own and then run with a bare
+`ggml_backend_graph_compute` — no scheduler, no re-planning. One
+`ggml_backend_sched` holds one allocation, so cycling seventeen graphs through
+it re-planned every one of them, every frame; `GGML_SCHED_DEBUG_REALLOC=1`
+aborts on the first frame of the old path. `QWEN3_TTS_GRAPH_REUSE=0` restores
+it, and the pattern above is still what a once-per-request graph should use.
+
+Three things to keep true when touching those graphs:
+
+- **Anything that changes a cached graph's shape must be in its key.** The
+  talker's is the padded KV window *and* how many codebooks it gathers; the
+  code predictor's is the step index. A shape that changes without changing the
+  key gives silently wrong output.
+- **Inputs must be re-uploaded every run.** `ggml_gallocr` protects only
+  OUTPUT-flagged tensors from reuse, so an input's memory is handed to a later
+  node in the same graph. Priming a "constant" input once reads garbage on the
+  second frame.
+- **Recreating a KV cache invalidates the graphs that view it.** `init_kv_cache`
+  and `init_code_pred_kv_cache` release theirs; a new cache must do the same.
+
 Important: `ggml_mul_mat` consumes F16/quantized weights directly — do NOT insert a `ggml_cast` to F32 in front of it. An old `ffn_down` cast workaround forced a full dequant of the largest FFN matrix on every step and cost ~6x in generation time (removed in d544a6f).
 
 Not to be confused with it: `ffn_down` **does** carry a deliberate
@@ -301,25 +323,34 @@ bash scripts/run_all_tests.sh           # Full suite
 
 ## Performance Profile
 
-Measured 2026-08-24 on CUDA (GTX 1660 SUPER, Q8_0 1.7B, `ward.txt`), stages
-timed apart with `QWEN3_TTS_PIPELINE=0`:
+Whole request, `scripts/bench_speed.sh`, `bench_ru.txt`, 1.7B Q8_0, median of
+nine, seed pinned, 2026-08-31. Compare ms/frame across backends, seconds only
+within one:
 
-| stage | ms/frame |
-|---|---|
-| talker | 10.1 |
-| code predictor | 13.2 |
-| generate total | 25.1 |
-| ~~vocoder decode~~ | ~~12.9~~ → **4.29** (2026-08-26) |
+| backend | wall | ms/frame |
+|---|---|---|
+| **Vulkan, RX 6800 XT** | **6.36 s** | **12.99** |
+| ROCm, RX 6800 XT | 7.39 s | 15.06 |
+| CUDA, GTX 1660 SUPER | 13.96 s | 27.59 |
 
-RTF 0.44 (2.3x realtime) end to end with the pipeline on; 0.30 on ROCm/6800 XT.
-Both predate the vocoder change below.
+Inside generation, Vulkan, 490 frames: talker forward 5.0 ms/frame, code
+predictor 6.1, total 11.2.
 
-- **Generation is now 5-7x the vocoder**, and the code predictor is the largest
-  single line. It costs the same on the 0.6B and the 1.7B — 15 sequential
-  5-layer passes over weights that do not scale with the talker — and it is
-  ~70% weight-read bandwidth, not arithmetic. Quantising it works and was
-  rejected on audible quality. **Every remaining speed question is a generation
-  question.**
+- **Generation is the whole cost of a request** — the vocoder is 5-7x smaller
+  since the `conv_transpose` rewrite. Within it the code predictor is the
+  larger line, because it runs five layers fifteen times a frame where the
+  talker runs twenty-eight once. It costs the same on the 0.6B and the 1.7B.
+- **It is dispatch- and sync-bound, not bandwidth-bound.** The earlier claim
+  that the code predictor was "~70% weight-read bandwidth" is **retracted**:
+  three concurrent synths each slow by only 1.48x while throughput rises to
+  2.0x, and the 6800 XT beats the 1660 SUPER by 1.56x while holding 3.5x its
+  bandwidth. Roughly 2000 GPU dispatches a frame, none of them large.
+  Consequence for anyone optimising here: **a win is usually a driver-overhead
+  win, so it is large on Vulkan, small on CUDA and zero on CPU — A/B it on
+  every backend before calling it a win.**
+- **Quantising the code predictor** works and is worth 6.6% end-to-end. It was
+  rejected because it coarsens fine acoustic detail audibly; that verdict
+  stands.
 - **The vocoder's transposed convolutions do not use `ggml_conv_transpose_1d`.**
   They are `mul_mat` + `col2im_1d`, with the weights repacked at load from
   `[K, OC, IC]` to `[IC, K*OC]` — 2.3-4.5x faster than the op on every backend
