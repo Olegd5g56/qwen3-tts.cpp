@@ -660,7 +660,9 @@ The Vulkan rows above are CLI generation times rather than bench rows: the
 Vulkan server could not load a voice at all while known-issues #28 was open.
 With that fixed, the first whole-request Vulkan row since 2026-08-27 reads
 **6.36 s** against that day's 10.21 s on the same text, model and environment -
-**12.99 ms/frame, the fastest of the three** (ROCm 15.06, CUDA 27.59).
+**12.99 ms/frame, the fastest of the three measured then** (ROCm 15.06, CUDA
+27.59). The sweep later that day widened to six configurations and confirmed
+the ranking; those are the numbers in *Where the time goes*.
 
 Correctness bar used, reuse it: **byte-identical WAV** with the switch on and
 off, on Vulkan, ROCm, CUDA and CPU, plus `ctest` (streaming parity green) and
@@ -843,7 +845,7 @@ Short, and it stays short because everything on it has been priced.
 **Not open, and do not re-open without new evidence:** the code predictor's 15
 sequential passes (a model-architecture property, not something this repo
 reaches), quantising it (works, 6.6% end-to-end, **rejected because Oleg could
-hear it**), the 0.6B as a speed lever (a VRAM choice), and overlap (~7% now
+hear it**), the 0.6B as a speed lever (**measured 2026-08-31: 19-26% on a GPU** — both variants have 28 layers, so it is a VRAM choice, see *The 0.6B is 2.8x smaller and 20-26% faster*), and overlap (~7% now
 that both stages want the same device — keep it on, stop calling it a lever).
 
 ## Two cards, and what that is actually good for

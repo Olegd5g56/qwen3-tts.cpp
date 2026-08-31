@@ -37,7 +37,9 @@ root cause still there) / **wontfix**.
 | [26](#26) | `q2_k` runs away on any paragraph — no end-of-speech, hits the frame budget | open 2026-08-27 |
 | [27](#27) | The server rounded every request up to a multiple of 200 ms | fixed 2026-08-27 |
 | [28](#28) | The Vulkan server aborts warming any voice — `ggml-vulkan` assert in the speaker encoder | fixed 2026-08-31 |
-| [29](#29) | On Vulkan, streamed audio differs from one-shot — `test_c_api` fails where ROCm and CUDA pass | open 2026-08-31 |
+| [29](#29) | Streamed audio differed from one-shot — the test was wrong, not the code | fixed 2026-08-31 |
+| [30](#30) | Vulkan on NVIDIA died on the first frame — an index view four bytes in | fixed 2026-08-31 |
+| [31](#31) | `QWEN3_TTS_FORCE_CPU=1` could not clone a voice — #28 again, other end | fixed 2026-08-31 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---

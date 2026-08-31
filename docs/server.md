@@ -236,3 +236,10 @@ None of these affect a normal run. Several cost a lot of speed.
 `libqwen3tts.so` exposes the same engine over a C ABI for FFI consumers —
 `src/qwen3tts_c_api.h` is the reference, and `tests/test_c_api.c` is a worked
 example: prepare a voice, synthesize, stream, cache the voice's parts.
+
+Two things the header spells out and a caller has to honour. Fill every struct
+with `qwen3_tts_default_params()` / `qwen3_tts_default_request()` first — they
+stamp `struct_size`, and a call refuses a struct whose size it does not know
+rather than misreading it. And `qwen3_tts_get_error()` belongs to the call that
+just returned: every call that can fail clears it first, so an empty string
+after a call means success.

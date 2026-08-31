@@ -127,6 +127,13 @@ inside the step graph itself, which takes the codes as an input
 row the same way. Nothing about a frame's arithmetic crosses to the host except
 the logits each sampler draw needs.
 
+The sixteen indices travel as one tensor and the graph reads each back as a
+one-element view. Those views are spaced by the backend buffer type's alignment
+(`code_index_stride()`), not packed four bytes apart — ggml-vulkan requires
+every operand of a `GET_ROWS` to start on `minStorageBufferOffsetAlignment`,
+which is 4 on RADV and 16 on NVIDIA, so packed indices worked on one Vulkan
+device and aborted on the other (`known-issues.md` #30).
+
 Generation ends on `tts_eos`, on the per-request frame budget, or on abort.
 
 ## Stage 4 — the vocoder

@@ -43,8 +43,10 @@ That is the whole happy path. Everything below is the variations.
 
 ### Build for your card
 
-Swap the one flag. Prefer the vendor backend (CUDA/ROCm/Metal) over Vulkan on
-the same card — it is faster and it can overlap the vocoder with generation.
+Swap the one flag. On NVIDIA prefer CUDA — it is faster than Vulkan on the same
+card and it overlaps the vocoder with generation. **On an AMD RDNA2 card try
+both**: Vulkan measured 13% faster than ROCm on an RX 6800 XT, because ROCm's
+overlap no longer hides much. See [docs/optimization.md](docs/optimization.md).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release                  # CPU

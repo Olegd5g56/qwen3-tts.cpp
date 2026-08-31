@@ -57,6 +57,7 @@ qwen3-tts.cpp/
     test_streaming_parity.cpp   # Streaming-vs-oneshot decoder parity
     test_icl_dump.cpp           # ICL diagnostic dump
     test_c_api.c                # C ABI smoke test — written in C on purpose
+    test_cli.cpp                # runs the qwen3-tts-cli BINARY end to end
   scripts/                      # Python utilities (HF↔GGUF conversion, refs)
                                 # + bench_speed.sh: the speed protocol
   benchmarks/                   # speed.tsv: committed speed history, one row
@@ -335,12 +336,23 @@ within one:
 
 | backend | wall | ms/frame |
 |---|---|---|
-| **Vulkan, RX 6800 XT** | **6.36 s** | **12.99** |
-| ROCm, RX 6800 XT | 7.39 s | 15.06 |
-| CUDA, GTX 1660 SUPER | 13.96 s | 27.59 |
+| **Vulkan, RX 6800 XT** | **6.38 s** | **13.03** |
+| ROCm, RX 6800 XT | 7.35 s | 14.98 |
+| CUDA, GTX 1660 SUPER | 13.91 s | 27.49 |
+| Vulkan, GTX 1660 SUPER | 16.16 s | 30.61 |
+| CPU, Ryzen 7 5700X, 4 / 8 threads | 64.56 / 62.63 s | 133.17 / 123.56 |
 
 Inside generation, Vulkan, 490 frames: talker forward 5.0 ms/frame, code
 predictor 6.1, total 11.2.
+
+- **Which backend to prefer is a property of the card, not the backend.** Vulkan
+  beats ROCm by 13% on the 6800 XT; CUDA beats Vulkan by 10% on the 1660 SUPER.
+  Never write "Vulkan is faster" without naming the card.
+- **The 0.6B is only 19-26% faster than the 1.7B on a GPU** despite 2.8x fewer
+  parameters, because both have **28 layers** and the 0.6B only halves the
+  hidden size: the dispatch count per frame is identical and only each matmul
+  shrinks. The CPU, which actually pays for the FLOPs, collects 1.70x on
+  generation against the GPU's 1.28x. Reach for the 0.6B for VRAM, not latency.
 
 - **Generation is the whole cost of a request** — the vocoder is 5-7x smaller
   since the `conv_transpose` rewrite. Within it the code predictor is the
