@@ -576,6 +576,16 @@ private:
     bool                          graph_reuse_ = false;
     std::vector<uint8_t> *        active_meta_ = nullptr;  // set only while filling a cache
 
+    // The frame's 16 codebook indices are one input tensor, read back out as
+    // sixteen one-element views. A view has to start on the backend buffer's
+    // alignment, so the slots are spaced by this many int32s rather than
+    // packed. See code_index_stride().
+    int32_t                       code_index_stride_ = 0;
+    std::vector<int32_t>          code_index_scratch_;
+
+    // int32 slots between consecutive codebook indices in "inp_codes".
+    int32_t code_index_stride();
+
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;
 #endif

@@ -2050,6 +2050,25 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
+// Sixteen codebook indices go to the device as one tensor, and the graph reads
+// each of them back as a one-element view. ggml-vulkan requires every operand
+// of a GET_ROWS to sit on minStorageBufferOffsetAlignment and asserts if one
+// does not, so packing the indices four bytes apart only works where that
+// alignment IS four. It is on RADV; it is 16 on NVIDIA, which is how this shipped
+// broken on one Vulkan device and fine on another (docs/known-issues.md #30).
+// Space the slots by the backend's own alignment instead and every view lands
+// on it by construction, on every backend.
+int32_t TTSTransformer::code_index_stride() {
+    if (code_index_stride_ > 0) return code_index_stride_;
+    size_t align = sizeof(int32_t);
+    if (state_.backend) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(state_.backend);
+        if (buft) align = std::max(align, ggml_backend_buft_get_alignment(buft));
+    }
+    code_index_stride_ = (int32_t) ((align + sizeof(int32_t) - 1) / sizeof(int32_t));
+    return code_index_stride_;
+}
+
 struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_gather) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
@@ -2078,7 +2097,7 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
     struct ggml_tensor * inp_codes     = nullptr;
     struct ggml_tensor * inp_trailing  = nullptr;
     if (n_gather > 0) {
-        inp_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_gather);
+        inp_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_gather * code_index_stride());
         ggml_set_name(inp_codes, "inp_codes");
         ggml_set_input(inp_codes);
 
@@ -2105,10 +2124,11 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t n_
         // Codebook 0 comes from the talker's own table, 1..15 from the code
         // predictor's. Summed left to right and then the trailing row, which
         // is the order the host loop used, so the arithmetic is unchanged.
+        const size_t idx_step = (size_t) code_index_stride() * ggml_element_size(inp_codes);
         struct ggml_tensor * idx0 = ggml_view_1d(ctx0, inp_codes, 1, 0);
         cur = ggml_get_rows(ctx0, model_.codec_embd, idx0);
         for (int cb = 1; cb < n_gather; ++cb) {
-            struct ggml_tensor * idx = ggml_view_1d(ctx0, inp_codes, 1, cb * ggml_element_size(inp_codes));
+            struct ggml_tensor * idx = ggml_view_1d(ctx0, inp_codes, 1, cb * idx_step);
             cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, model_.code_pred_embd[cb - 1], idx));
         }
         cur = ggml_add(ctx0, cur, inp_trailing);
@@ -2277,7 +2297,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     
     struct ggml_tensor * inp_prev_codes = nullptr;
     if (n_prev_codes > 0) {
-        inp_prev_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_prev_codes);
+        inp_prev_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32,
+                                            (int64_t) n_prev_codes * code_index_stride());
         ggml_set_name(inp_prev_codes, "inp_prev_codes");
         ggml_set_input(inp_prev_codes);
     }
@@ -2285,8 +2306,10 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     struct ggml_tensor * cur = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
     
     if (n_prev_codes > 0 && inp_prev_codes) {
+        // Same alignment rule as build_step_graph() - see code_index_stride().
+        const size_t idx_step = (size_t) code_index_stride() * sizeof(int32_t);
         for (int cb = 0; cb < n_prev_codes && cb < n_codebooks - 1; ++cb) {
-            struct ggml_tensor * code_idx = ggml_view_1d(ctx0, inp_prev_codes, 1, cb * sizeof(int32_t));
+            struct ggml_tensor * code_idx = ggml_view_1d(ctx0, inp_prev_codes, 1, cb * idx_step);
             struct ggml_tensor * code_embd = ggml_get_rows(ctx0, model_.code_pred_embd[cb], code_idx);
             cur = ggml_add(ctx0, cur, code_embd);
         }
@@ -2968,7 +2991,20 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #endif
     if (n_gather > 0) {
         struct ggml_tensor * inp_codes = ggml_graph_get_tensor(gf, "inp_codes");
-        ggml_backend_tensor_set(inp_codes, codes, 0, n_gather * sizeof(int32_t));
+        const int32_t stride = code_index_stride();
+        if (stride == 1) {
+            ggml_backend_tensor_set(inp_codes, codes, 0, n_gather * sizeof(int32_t));
+        } else {
+            // Scatter into the padded layout and upload once. Sixteen small
+            // uploads would be correct too and cost sixteen times the host
+            // work, in the one loop where host work is what dominates.
+            code_index_scratch_.assign((size_t) n_gather * stride, 0);
+            for (int32_t cb = 0; cb < n_gather; ++cb) {
+                code_index_scratch_[(size_t) cb * stride] = codes[cb];
+            }
+            ggml_backend_tensor_set(inp_codes, code_index_scratch_.data(), 0,
+                                    code_index_scratch_.size() * sizeof(int32_t));
+        }
 
         struct ggml_tensor * inp_trailing = ggml_graph_get_tensor(gf, "inp_trailing");
         ggml_backend_tensor_set(inp_trailing, trailing, 0,
@@ -3096,7 +3132,13 @@ bool TTSTransformer::predict_codes(const float * hidden, const int32_t * prev_co
     if (n_prev > 0) {
         struct ggml_tensor * inp_prev = ggml_graph_get_tensor(gf, "inp_prev_codes");
         if (inp_prev) {
-            ggml_backend_tensor_set(inp_prev, prev_codes, 0, n_prev * sizeof(int32_t));
+            const int32_t stride = code_index_stride();
+            code_index_scratch_.assign((size_t) n_prev * stride, 0);
+            for (int cb = 0; cb < n_prev; ++cb) {
+                code_index_scratch_[(size_t) cb * stride] = prev_codes[cb];
+            }
+            ggml_backend_tensor_set(inp_prev, code_index_scratch_.data(), 0,
+                                    code_index_scratch_.size() * sizeof(int32_t));
         }
     }
     

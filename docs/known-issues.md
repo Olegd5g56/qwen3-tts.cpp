@@ -1453,3 +1453,53 @@ to three orders below anything a real streaming-state bug would produce, since
 a dropped conv tail or a botched overlap corrupts samples at signal level. The
 `stream_decode` header comment no longer promises bit-identical PCM.
 
+---
+
+<a id="30"></a>
+## 30. Vulkan on NVIDIA died on the first frame — an index view four bytes in
+
+**Status: fixed** 2026-08-31, found and closed within the hour.
+
+Found while benchmarking every backend, which is the only reason it was found
+at all: a Vulkan build on the 6800 XT is fine, and the same binary on the
+GTX 1660 SUPER aborts after prefill, on the first generated frame.
+
+```
+ggml/src/ggml-vulkan/ggml-vulkan.cpp:11861:
+GGML_ASSERT(dst->op != GGML_OP_GET_ROWS ||
+            (a_offset == 0 && b_offset == 0 && d_offset == 0)) failed
+```
+
+**Ours, and new that day.** The on-device frame gather added in `b1694aa`
+sends the frame's sixteen codebook indices to the device as one `I32` tensor
+and reads each one back as a one-element `ggml_view_1d` at `cb * 4` bytes.
+ggml-vulkan requires every operand of a `GET_ROWS` to start on
+`minStorageBufferOffsetAlignment` and asserts rather than handling a
+misaligned one.
+
+That alignment is a device property, and the two cards in this machine
+disagree:
+
+| device | minStorageBufferOffsetAlignment |
+|---|---|
+| AMD RX 6800 XT (RADV) | **4** |
+| NVIDIA GTX 1660 SUPER | 16 |
+| llvmpipe | 16 |
+
+Four-byte spacing is aligned when the requirement is 4 and misaligned for
+three views out of four when it is 16. So the bug was invisible on the card it
+was written on and fatal on every other Vulkan device — NVIDIA, llvmpipe, and
+by the look of that table most non-RADV drivers.
+
+**Fix:** space the index slots by the backend buffer type's own alignment
+(`ggml_backend_buft_get_alignment`) instead of by `sizeof(int32_t)`, so every
+view lands on it by construction, on every backend. The frame still ships in
+one upload — the codes are scattered into the padded layout host-side first,
+because sixteen small uploads would put sixteen times the host work into the
+one loop where host work is what dominates. The same pattern in the dead
+`build_code_pred_graph` path was fixed alongside it.
+
+**The lesson, which is the expensive half:** "it works on Vulkan" means it
+works on *that* Vulkan device. Backend coverage is not device coverage, and a
+`GGML_ASSERT` on a device property is exactly the kind of thing that hides
+behind one vendor's generous limit.
