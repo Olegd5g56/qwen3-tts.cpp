@@ -28,12 +28,32 @@ audio:
 
 | backend | wall | ms/frame |
 |---|---|---|
-| **Vulkan, RX 6800 XT** | **6.36 s** | **12.99** |
-| ROCm, RX 6800 XT | 7.39 s | 15.06 |
-| CUDA, GTX 1660 SUPER | 13.96 s | 27.59 |
+| **Vulkan, RX 6800 XT** | **6.38 s** | **13.03** |
+| ROCm, RX 6800 XT | 7.35 s | 14.98 |
+| CUDA, GTX 1660 SUPER | 13.91 s | 27.49 |
+| Vulkan, GTX 1660 SUPER | 16.16 s | 30.61 |
+| CPU, Ryzen 7 5700X, 4 threads | 64.56 s | 133.17 |
+| CPU, Ryzen 7 5700X, 8 threads | 62.63 s | 123.56 |
 
 Vulkan on the 6800 XT is the fastest configuration by a wide margin, and it was
 10.21 s on 2026-08-27 with the same text, model and environment.
+
+**Which backend to prefer is a property of the card, not of the backend.** On
+the 6800 XT Vulkan beats ROCm by 13%; on the 1660 SUPER, CUDA beats Vulkan by
+10%. Nothing here says "Vulkan is fast" — it says RADV is good at this workload
+and NVIDIA's own runtime is better on NVIDIA.
+
+**The CPU is 9.5x off the fastest GPU and barely responds to more threads.**
+Doubling the threads bought 7%: the per-frame graphs are small and latency-bound
+rather than throughput-bound, which is the same thing the GPU numbers say. Note
+the two CPU rows produced *different amounts of audio* (40.40 s against 42.24 s)
+— the thread count changes the order the reductions accumulate in, which changes
+the logits and with them the sampling. That is why only the ms/frame column
+compares them.
+
+Both non-GPU-vendor configurations above were benchmarked for the first time on
+2026-08-31, and both crashed on the first attempt — see `known-issues.md` #30
+and #31. A backend is not a device.
 
 Inside generation — Vulkan, 490 frames, a build configured with
 `-DQWEN3_TTS_TIMING=ON`:
