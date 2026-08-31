@@ -88,5 +88,7 @@ Python implementation, which are not in the repo;
 
 All five are green on every backend. Anything red is new.
 
-`scripts/run_all_tests.sh` runs the wider sweep, including the things ctest
-cannot express.
+`scripts/run_all_tests.sh` **does not run** — see `known-issues.md`, open rough
+edges. It is hard-wired to a `./build/` directory and a `models/` layout the
+repo stopped using, so every section skips and the one that does not, fails.
+ctest is the whole automated suite today.

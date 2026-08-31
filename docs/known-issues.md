@@ -985,6 +985,18 @@ unreported ggml findings.**
   ships, and our `GGML_VK_DISABLE_MULTI_ADD=1` workaround is now a measured
   no-op. Nothing to report; see #8's 2026-08-27 update.
 
+- **`scripts/run_all_tests.sh` has not run for a long time.** Checked
+  2026-08-31: **0 passed, 1 failed, 6 skipped.** Every path in it is
+  hard-wired to a `./build/` directory and to `models/qwen3-tts-0.6b-f16.gguf`,
+  neither of which the repo uses any more — models live wherever
+  `TTS_MODEL` points and build directories are per-backend. So the six
+  sections skip themselves and the seventh, the Python-vs-C++ end-to-end
+  comparison, fails on the missing binary.
+
+  It is not covering anything: what it can still express, ctest already runs.
+  Either point it at the current layout or delete it, but until then
+  `docs/build.md` no longer advertises it as the wider sweep.
+
 ### Dismissed after checking
 
 - **"Repetition penalty diverges from HuggingFace — it should use a sliding
