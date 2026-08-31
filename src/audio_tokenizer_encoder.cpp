@@ -240,6 +240,21 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
     
     struct gguf_context * gguf_ctx = loader.get_ctx();
     struct ggml_context * meta_ctx = loader.get_meta_ctx();
+
+    // Vulkan only, and deliberately so. Widening these weights changes which
+    // matmul kernel runs, and on CUDA and ROCm that moves the speaker
+    // embedding in its last bits - every cached voice would come out subtly
+    // different, for no gain on backends that never had the problem.
+    bool widen_bf16 = false;
+    {
+        ggml_backend_t probe = init_preferred_backend("AudioTokenizerEncoder", nullptr);
+        if (probe) {
+            ggml_backend_dev_t probe_dev = ggml_backend_get_device(probe);
+            const char * probe_name = probe_dev ? ggml_backend_dev_name(probe_dev) : "";
+            widen_bf16 = strncmp(probe_name, "Vulkan", 6) == 0;
+            release_preferred_backend(probe);
+        }
+    }
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
@@ -252,7 +267,19 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
             continue;
         }
         
-        struct ggml_tensor * tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        // The speaker encoder's convolutions are the only bf16 weights a
+        // quantised file keeps: their rows are 1, 3 or 5 values long, so no
+        // block type fits and the quantiser leaves them at the source type -
+        // which is bf16 for every file built from the bf16 release.
+        // ggml_conv_1d feeds the kernel in as the *second* mul_mat operand,
+        // and ggml-vulkan asserts on a bf16 second operand against an f32
+        // first one, taking the whole process down (known-issues.md #28).
+        // Widening to F32 on the way in is exact and the loader already knows
+        // how - the vocoder widens its conv_transpose weights the same way.
+        struct ggml_tensor * tensor =
+            (widen_bf16 && meta_tensor->type == GGML_TYPE_BF16)
+                ? ggml_new_tensor(model_.ctx, GGML_TYPE_F32, ggml_n_dims(meta_tensor), meta_tensor->ne)
+                : ggml_dup_tensor(model_.ctx, meta_tensor);
         ggml_set_name(tensor, name);
         
         model_.tensors[name] = tensor;

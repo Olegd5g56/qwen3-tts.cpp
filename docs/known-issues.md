@@ -36,7 +36,8 @@ root cause still there) / **wontfix**.
 | [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
 | [26](#26) | `q2_k` runs away on any paragraph — no end-of-speech, hits the frame budget | open 2026-08-27 |
 | [27](#27) | The server rounded every request up to a multiple of 200 ms | fixed 2026-08-27 |
-| [28](#28) | The Vulkan server aborts warming any voice — `ggml-vulkan` assert in the speaker encoder | open 2026-08-31 |
+| [28](#28) | The Vulkan server aborts warming any voice — `ggml-vulkan` assert in the speaker encoder | fixed 2026-08-31 |
+| [29](#29) | On Vulkan, streamed audio differs from one-shot — `test_c_api` fails where ROCm and CUDA pass | open 2026-08-31 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1353,12 +1354,71 @@ and CUDA. Both reproduce on a clean `68c32b1` with nothing in the working
 tree, so it is not the graph cache that found it — the cache work is only what
 tripped over it, when `scripts/bench_speed.sh` could not raise a Vulkan server.
 
-**Not yet bisected.** The last Vulkan rows in `benchmarks/speed.tsv` are from
-2026-08-27 at commit `20594ee`, and they were written by this same script with
-this same voice, so something between `20594ee` and `68c32b1` did it — fifteen
-commits, none of which touches the encoder on its face. The vendored ggml has
-not moved (`f0aeec2`, v0.20.2-1).
+**Status: fixed** 2026-08-31, later the same day.
 
-**Consequences while it is open:** the deployed stack runs CUDA and is not
-affected, ROCm and CPU are not affected, and no Vulkan row can be added to the
-speed history.
+**It was never a code change, and never the driver.** A bisect over the fifteen
+commits since the last good Vulkan bench pointed at `915ecdf`, which touches
+only `benchmarks/`, `docs/` and `scripts/` — no C++ at all. That result is
+void: it means the "good" end was already bad, and testing `20594ee` directly
+confirmed it. None of the `GGML_VK_DISABLE_*` switches change anything either,
+so it is not a device capability the driver flipped.
+
+The offending op, printed from a temporary probe at the assert:
+
+```
+src0 = (im2col output)          f32
+src1 = spk_enc.conv0.weight     bf16
+```
+
+`ggml_conv_1d` feeds the kernel in as the **second** `mul_mat` operand, and
+ggml-vulkan cannot take a bf16 second operand against an f32 first one:
+`f16_type` is F16 because src0 is not bf16, src1 is neither F32 nor F16, so
+`qy_needs_dequant` is true with a contiguous y — exactly the case the assert
+says is not implemented.
+
+**Why the weight is bf16.** The speaker encoder's 70 convolutions have rows 1,
+3 or 5 values long, so no block type fits and `quantize.cpp` skips them — and a
+skipped tensor keeps its **source** type. Every model file in `MODELS/TTS` was
+rebuilt on 2026-08-27 *from the bf16 release*, so those 70 weights went from
+f16 to bf16 in every file, Q8_0 and Q4_K included. The Vulkan bench rows at
+11:01 and 11:05 that looked like proof of a working build were run **before**
+that rebuild, which happened around 12:47. Nothing in the repository changed;
+the inputs did.
+
+**The fix** widens those weights to F32 as they are read — exact, since bf16 is
+a subset of f32, and the shared loader already does this for the vocoder's
+`conv_transpose` weights. It is applied **only on Vulkan**: widening changes
+which matmul kernel runs, and on CUDA and ROCm that moves the speaker embedding
+in its last bits, which would make every cached voice come out subtly different
+for no gain. Verified: ROCm and CUDA cloned output byte-identical before and
+after; Vulkan goes from abort to audio that whisper transcribes back to the
+input text word for word, at -23.9 dB mean against ROCm's -22.7.
+
+With the server able to hold a voice again, the first Vulkan speed row since
+2026-08-27: **6.36 s** where that day's row read 10.21 s, on the same text,
+model and environment.
+
+---
+
+<a id="29"></a>
+## 29. On Vulkan, streamed audio differs from one-shot
+
+**Status: open** 2026-08-31.
+
+Found the moment #28 stopped aborting: `test_c_api` gets past loading, the
+voice and ICL synthesis, and then fails its last check —
+
+```
+FAIL: streaming audio differs from non-streaming
+```
+
+The text printed after it, about `struct_size` being 32, is a **stale
+last_error** from the deliberate rejection earlier in the same test, not the
+cause. That is worth fixing on its own: the C ABI does not clear the last error
+on a successful call, so any later failure reports the previous complaint.
+
+The same test passes on ROCm and on CUDA, and `test_streaming_parity` is green
+everywhere, so this is Vulkan-specific and narrower than the parity test
+covers. Not yet diagnosed. Parity has failed twice before for two different
+numerical reasons — see `optimization.md` and the decoder notes — so start by
+comparing one-shot against CPU rather than assuming the streaming path.

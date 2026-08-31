@@ -589,8 +589,11 @@ ggml-cuda already captures CUDA graphs, so there was little to win there; the
 Vulkan path pays for every submission and wins four times as much. **The CPU
 gains nothing, which is the control** - it was never waiting on a driver.
 
-The Vulkan row is a CLI generation time, not a bench row, because the Vulkan
-server cannot currently load a voice at all (known-issues.md #28).
+The Vulkan rows above are CLI generation times rather than bench rows: the
+Vulkan server could not load a voice at all while known-issues #28 was open.
+With that fixed, the first whole-request Vulkan row since 2026-08-27 reads
+**6.36 s** against that day's 10.21 s on the same text, model and environment -
+**12.99 ms/frame, the fastest of the three** (ROCm 15.06, CUDA 27.59).
 
 Correctness bar used, reuse it: **byte-identical WAV** with the switch on and
 off, on Vulkan, ROCm, CUDA and CPU, plus `ctest` (streaming parity green) and
