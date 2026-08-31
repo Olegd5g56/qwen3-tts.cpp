@@ -114,7 +114,10 @@ void qwen3_tts_destroy(Qwen3Tts * tts);
 /* Free generated audio */
 void qwen3_tts_free_audio(Qwen3TtsAudio * audio);
 
-/* Get last error message (or empty string) */
+/* Why the last call failed, or an empty string.
+ *
+ * Every call that can fail clears this first, so the message always belongs to
+ * the most recent one: an empty string after a call means it succeeded. */
 const char * qwen3_tts_get_error(const Qwen3Tts * tts);
 
 /* ---- voices ------------------------------------------------------------ */

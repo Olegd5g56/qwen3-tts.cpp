@@ -970,7 +970,8 @@ unreported ggml findings.**
   deliberately unused.
 
   Verified against the server: same voice, same text, same seed, byte-identical
-  audio — and streaming matches one-shot byte for byte. `tests/test_c_api.c`,
+  audio — and streaming matches one-shot to within vocoder noise (#29).
+  `tests/test_c_api.c`,
   wired into ctest, skips without models like the other model-dependent tests.
 - **Two ggml findings are sitting unreported.** #17 (OOM segfault) is a
   one-line fix with a verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops
@@ -1401,24 +1402,52 @@ model and environment.
 ---
 
 <a id="29"></a>
-## 29. On Vulkan, streamed audio differs from one-shot
+## 29. Streamed audio differed from one-shot — the test was wrong, not the code
 
-**Status: open** 2026-08-31.
+**Status: closed** 2026-08-31, same day. Nothing in the decoder changed.
 
-Found the moment #28 stopped aborting: `test_c_api` gets past loading, the
-voice and ICL synthesis, and then fails its last check —
+Found the moment #28 stopped aborting: `test_c_api` got past loading, the voice
+and ICL synthesis, and then failed its last check —
 
 ```
 FAIL: streaming audio differs from non-streaming
 ```
 
-The text printed after it, about `struct_size` being 32, is a **stale
-last_error** from the deliberate rejection earlier in the same test, not the
-cause. That is worth fixing on its own: the C ABI does not clear the last error
-on a successful call, so any later failure reports the previous complaint.
+The text printed after it, about `struct_size` being 32, was a **stale
+last_error** from the deliberate rejection earlier in the same test. That was a
+real bug of its own and is fixed: every C entry point that can fail now clears
+the message first, so an empty string after a call means it succeeded and a
+non-empty one always belongs to the call that just returned.
 
-The same test passes on ROCm and on CUDA, and `test_streaming_parity` is green
-everywhere, so this is Vulkan-specific and narrower than the parity test
-covers. Not yet diagnosed. Parity has failed twice before for two different
-numerical reasons — see `optimization.md` and the decoder notes — so start by
-comparing one-shot against CPU rather than assuming the streaming path.
+### What the difference actually was
+
+Same length, same code stream, and a difference spread evenly over 99% of the
+samples — not the localised click a mis-stitched chunk boundary makes:
+
+| compared | max abs | rel. RMS |
+|---|---|---|
+| Vulkan one-shot vs Vulkan streamed | 7.5e-4 | 6.2e-4 |
+| **CPU** one-shot vs **CPU** streamed | 5.2e-4 | 4.8e-4 |
+| Vulkan one-shot vs CPU one-shot | 6.2e-4 | 6.1e-4 |
+
+Peak of the waveform is 0.41, so all of it is ~0.2% of peak, about −63 dB.
+
+The CPU row is the one that settles it. **The chunk size changes the vocoder's
+output everywhere, the CPU included** — the conv tower's arithmetic is not
+chunk-invariant, and re-chunking perturbs the result by exactly as much as
+swapping the backend does. The one-shot path decodes in 100-frame chunks
+(`sequential_decode_batch_frames()`); the streaming request asked for 16.
+
+Proof: set `QWEN3_TTS_DECODE_BATCH=16` so both paths chunk the same way, and
+the two are byte-identical on Vulkan again.
+
+So `test_c_api` was asserting something the arithmetic never promised. CUDA and
+ROCm passed it by luck — their kernels happen to give the same answer at both
+shapes; Vulkan's pick a different one, which is allowed.
+
+**Fixed by fixing the claim.** The test now requires the streamed waveform to
+be within 1% of peak of the one-shot one — 5x the noise measured above, and two
+to three orders below anything a real streaming-state bug would produce, since
+a dropped conv tail or a botched overlap corrupts samples at signal level. The
+`stream_decode` header comment no longer promises bit-identical PCM.
+

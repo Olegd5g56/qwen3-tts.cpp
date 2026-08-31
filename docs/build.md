@@ -86,9 +86,7 @@ Python implementation, which are not in the repo;
 | `streaming_parity_test` | model | streaming decode == one-shot decode |
 | `c_api_test` | model | the C ABI: ICL, streaming, voice caching, struct-size guard |
 
-`c_api_test` **fails on a Vulkan build** and passes on CUDA and ROCm: streamed
-and one-shot audio differ there (`known-issues.md` #29). It is the one known
-red test; anything else red is new.
+All five are green on every backend. Anything red is new.
 
 `scripts/run_all_tests.sh` runs the wider sweep, including the things ctest
 cannot express.

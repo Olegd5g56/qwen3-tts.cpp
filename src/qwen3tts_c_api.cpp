@@ -49,6 +49,14 @@ struct Qwen3TtsVoice {
     std::string          ref_text;
 };
 
+// Every entry point that can report a failure starts by forgetting the last
+// one. Without this a call that fails for its own reason prints whatever the
+// previous failing call complained about, which sent one debugging session
+// after the wrong bug entirely (docs/known-issues.md #29).
+static void begin_call(Qwen3Tts * tts) {
+    if (tts) tts->last_error.clear();
+}
+
 // A struct whose struct_size we do not recognise was compiled against a
 // different version of this header. Reading it would mean reading fields that
 // may not be there, so every entry point refuses instead. NULL params are
@@ -223,6 +231,7 @@ const char * qwen3_tts_get_error(const Qwen3Tts * tts) {
 
 Qwen3TtsVoice * qwen3_tts_voice_from_file(Qwen3Tts * tts, const char * audio_path,
                                           const char * ref_text) {
+    begin_call(tts);
     if (!tts || !audio_path) return nullptr;
     AUTORELEASE_BEGIN
     Qwen3TtsVoice * voice = nullptr;
@@ -247,6 +256,7 @@ Qwen3TtsVoice * qwen3_tts_voice_from_file(Qwen3Tts * tts, const char * audio_pat
 Qwen3TtsVoice * qwen3_tts_voice_from_samples(Qwen3Tts * tts, const float * samples,
                                              int32_t n_samples, int32_t sample_rate,
                                              const char * ref_text) {
+    begin_call(tts);
     if (!tts || !samples || n_samples <= 0) return nullptr;
     AUTORELEASE_BEGIN
     Qwen3TtsVoice * voice = nullptr;
@@ -312,6 +322,7 @@ void qwen3_tts_voice_free(Qwen3TtsVoice * voice) {
 Qwen3TtsAudio * qwen3_tts_synthesize_request(Qwen3Tts * tts,
                                              const Qwen3TtsRequest * request,
                                              const Qwen3TtsParams * params) {
+    begin_call(tts);
     if (!tts) return nullptr;
     if (!request_ok(tts, request) || !params_ok(tts, params)) return nullptr;
     if (!request->text) {
@@ -383,6 +394,7 @@ Qwen3TtsAudio * qwen3_tts_synthesize_with_voice_file(
         Qwen3Tts * tts, const char * text,
         const char * reference_audio_path,
         const Qwen3TtsParams * params) {
+    begin_call(tts);
     if (!tts || !text || !reference_audio_path) return nullptr;
     if (!params_ok(tts, params)) return nullptr;
     AUTORELEASE_BEGIN
@@ -400,6 +412,7 @@ Qwen3TtsAudio * qwen3_tts_synthesize_with_voice_samples(
         Qwen3Tts * tts, const char * text,
         const float * ref_samples, int32_t n_ref_samples,
         const Qwen3TtsParams * params) {
+    begin_call(tts);
     if (!tts || !text || !ref_samples || n_ref_samples <= 0) return nullptr;
     if (!params_ok(tts, params)) return nullptr;
     AUTORELEASE_BEGIN
@@ -416,6 +429,7 @@ Qwen3TtsAudio * qwen3_tts_synthesize_with_voice_samples(
 int32_t qwen3_tts_extract_embedding_file(
         Qwen3Tts * tts, const char * reference_audio_path,
         float * embedding_out, int32_t max_size) {
+    begin_call(tts);
     if (!tts || !reference_audio_path || !embedding_out || max_size <= 0) return -1;
 
     AUTORELEASE_BEGIN

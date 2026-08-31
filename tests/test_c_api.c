@@ -5,8 +5,9 @@
  *
  * What it checks:
  *   - a params struct from a different header version is refused, not misread
+ *   - a call that succeeds clears the previous call's error message
  *   - a voice prepared from a clip + transcript carries ICL reference frames
- *   - streaming and non-streaming produce the SAME audio, byte for byte
+ *   - streaming and non-streaming produce the same audio, to vocoder noise
  *   - a voice cached as parts and rebuilt produces the same audio again
  *   - reference codes without their transcript are refused
  *
@@ -94,6 +95,7 @@ int main(void) {
     Qwen3TtsParams stale = params;
     stale.struct_size = 32;
     if (qwen3_tts_synthesize(tts, text, &stale)) return fail("stale struct_size accepted", tts);
+    if (!qwen3_tts_get_error(tts)[0]) return fail("refusal left no error message", tts);
     printf("ok   stale struct_size refused\n");
 
     /* ICL voice: clip + matching transcript. */
@@ -113,7 +115,14 @@ int main(void) {
     req.voice = voice;
     Qwen3TtsAudio * plain = qwen3_tts_synthesize_request(tts, &req, &params);
     if (!plain) return fail("ICL synthesis", tts);
-    printf("ok   ICL synthesis: %d samples\n", plain->n_samples);
+    /* The rejection above left a message behind. A call that succeeds must
+     * clear it, or the next real failure reports the wrong complaint - which
+     * is exactly how docs/known-issues.md #29 was first misread. */
+    if (qwen3_tts_get_error(tts)[0]) {
+        printf("     stale error: %s\n", qwen3_tts_get_error(tts));
+        return fail("a successful call left the previous error in place", tts);
+    }
+    printf("ok   ICL synthesis: %d samples, error cleared\n", plain->n_samples);
 
     /* Streaming must be the same audio, not merely similar. */
     Qwen3TtsRequest sreq = req;
@@ -123,12 +132,41 @@ int main(void) {
     if (!streamed) return fail("streaming synthesis", tts);
     if (n_chunks < 2) return fail("streaming produced fewer than two batches", tts);
     if (n_streamed != streamed->n_samples) return fail("streamed sample count != returned", tts);
-    if (streamed->n_samples != plain->n_samples ||
-        memcmp(streamed->samples, plain->samples,
-               (size_t) plain->n_samples * sizeof(float)) != 0) {
-        return fail("streaming audio differs from non-streaming", tts);
+    if (streamed->n_samples != plain->n_samples) {
+        return fail("streamed length differs from one-shot", tts);
     }
-    printf("ok   streaming: %d batches, byte-identical to one-shot\n", n_chunks);
+    /* Not byte-for-byte: the two runs chunk the vocoder differently (100
+     * frames for the one-shot path, stream_batch_size here), and the conv
+     * tower's arithmetic is not chunk-invariant. That difference measures
+     * ~0.2% of peak on every backend, CPU included - the same size as the
+     * difference between two backends decoding identical codes. Feed both
+     * paths the same chunk size (QWEN3_TTS_DECODE_BATCH=16) and they are
+     * byte-identical again; see docs/known-issues.md #29.
+     *
+     * A real streaming-state bug - a dropped conv tail, a mis-stitched
+     * overlap - lands two to three orders above this, so the bar below still
+     * catches one. */
+    {
+        double sum2d = 0.0, sum2a = 0.0, peak = 0.0, maxd = 0.0;
+        int32_t i;
+        for (i = 0; i < plain->n_samples; i++) {
+            double a = plain->samples[i];
+            double d = a - (double) streamed->samples[i];
+            if (d < 0) d = -d;
+            if (d > maxd) maxd = d;
+            if (a < 0) a = -a;
+            if (a > peak) peak = a;
+            sum2a += (double) plain->samples[i] * plain->samples[i];
+            sum2d += d * d;
+        }
+        if (peak <= 0.0 || sum2a <= 0.0) return fail("one-shot audio is silent", tts);
+        if (maxd > 0.01 * peak) {
+            printf("     max |diff| = %.3e, peak = %.3e\n", maxd, peak);
+            return fail("streaming audio differs from non-streaming", tts);
+        }
+        printf("ok   streaming: %d batches, within %.2f%% of peak of one-shot\n",
+               n_chunks, 100.0 * maxd / peak);
+    }
 
     /* Cache the voice as parts and rebuild it — what a service does. */
     float   * emb   = (float *)   malloc((size_t) n_emb   * sizeof(float));

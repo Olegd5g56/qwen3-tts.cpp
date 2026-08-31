@@ -209,8 +209,10 @@ public:
     // Stateful streaming decode. Appends PCM for the given chunk of codes
     // to `samples`, carrying KV-cache and causal-conv tail state across
     // calls. Call stream_reset() between independent utterances.
-    // On the first call (n_past == 0) with the same codes this produces
-    // bit-identical PCM to decode(); subsequent chunks continue the stream.
+    // Chunk size changes the result slightly: the conv tower's arithmetic is
+    // not chunk-invariant, so decoding the same codes in 16-frame chunks and
+    // in 100-frame chunks differs by ~0.2% of peak - on the CPU as much as on
+    // a GPU. Same chunk size, same bytes. (docs/known-issues.md #29)
     bool stream_decode(const int32_t * codes, int32_t n_frames,
                        std::vector<float> & samples);
 
