@@ -65,6 +65,11 @@ TTSTransformer::~TTSTransformer() {
 }
 
 void TTSTransformer::unload_model() {
+    // Before the backend goes: the cached graphs hold buffers on it.
+    release_cached_graphs();
+    code_pred_step_graphs_.clear();
+    graph_reuse_ = false;
+
     free_tts_kv_cache(state_.cache);
     free_tts_kv_cache(state_.code_pred_cache);
     free_transformer_model(model_);
@@ -193,6 +198,16 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     op_profiler_attach(state_.sched, "generate");
 
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
+
+    // The per-op profiler and the numeric probe both hook the scheduler's eval
+    // callback, and a cached graph never reaches the scheduler. Diagnostics
+    // win: they are why anyone turns them on.
+    const auto & cfg_env = qwen3_tts::env();
+    graph_reuse_ = cfg_env.graph_reuse && !cfg_env.profile_ops && !cfg_env.probe_num;
+    // A second load into the same object must not inherit graphs built against
+    // the first model's tensors.
+    release_cached_graphs();
+    code_pred_step_graphs_.assign(16, tts_cached_graph{});
 
     if (!try_init_coreml_code_predictor(model_path)) {
         return false;
@@ -829,9 +844,108 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
     return true;
 }
 
+struct ggml_cgraph * TTSTransformer::new_graph(struct ggml_context ** ctx0_out) {
+    // While a cache is being filled the graph goes into that cache's own
+    // buffer and has to survive the next build; otherwise it goes into the
+    // shared scratch, which the next build overwrites.
+    std::vector<uint8_t> & meta = active_meta_ ? *active_meta_ : state_.compute_meta;
+    const int cap = active_meta_ ? QWEN3_TTS_STEP_MAX_NODES : QWEN3_TTS_MAX_NODES;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    *ctx0_out = ctx0;
+    return ggml_new_graph_custom(ctx0, cap, false);
+}
+
+void TTSTransformer::release_cached_graph(tts_cached_graph & cg) {
+    if (cg.galloc) {
+        ggml_gallocr_free(cg.galloc);
+        cg.galloc = nullptr;
+    }
+    cg.gf  = nullptr;
+    cg.key = -1;
+    cg.meta.clear();
+    cg.meta.shrink_to_fit();
+}
+
+void TTSTransformer::release_cached_graphs() {
+    release_cached_graph(talker_graph_);
+    release_cached_graph(code_pred_prefill_graph_);
+    for (auto & cg : code_pred_step_graphs_) {
+        release_cached_graph(cg);
+    }
+}
+
+struct ggml_cgraph * TTSTransformer::cached_graph(tts_cached_graph & cg, int32_t key,
+                                                  const std::function<struct ggml_cgraph *()> & build) {
+    if (!graph_reuse_ || !state_.backend) {
+        return nullptr;
+    }
+    if (cg.gf && cg.key == key) {
+        return cg.gf;
+    }
+
+    // Build once into the shared scratch to learn how big it is and whether
+    // the backend can run every node of it - the scheduler's whole job is the
+    // fallback for a node it cannot, and bypassing the scheduler gives that
+    // up. Both answers are properties of the model, so a refusal is permanent.
+    struct ggml_cgraph * probe = build();
+    if (!probe) {
+        return nullptr;
+    }
+    const int n_nodes = ggml_graph_n_nodes(probe);
+    if (n_nodes > QWEN3_TTS_STEP_MAX_NODES) {
+        log_debug("graph reuse off: %d nodes exceeds the %d-node cap",
+                  n_nodes, QWEN3_TTS_STEP_MAX_NODES);
+        graph_reuse_ = false;
+        return nullptr;
+    }
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(probe, i);
+        if (!ggml_backend_supports_op(state_.backend, node)) {
+            log_debug("graph reuse off: %s does not support %s",
+                      ggml_backend_name(state_.backend), ggml_op_name(node->op));
+            graph_reuse_ = false;
+            return nullptr;
+        }
+    }
+
+    release_cached_graph(cg);
+    cg.meta.resize(ggml_tensor_overhead() * QWEN3_TTS_STEP_MAX_NODES +
+                   ggml_graph_overhead_custom(QWEN3_TTS_STEP_MAX_NODES, false));
+
+    active_meta_ = &cg.meta;
+    cg.gf = build();
+    active_meta_ = nullptr;
+
+    if (cg.gf) {
+        cg.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_.backend));
+    }
+    // Allocated once, here. Nothing after this point moves a tensor, so every
+    // later frame is a bare graph_compute - no splitting, no re-planning.
+    if (!cg.galloc || !ggml_gallocr_alloc_graph(cg.galloc, cg.gf)) {
+        log_debug("graph reuse off: could not allocate a %d-node graph", n_nodes);
+        release_cached_graph(cg);
+        graph_reuse_ = false;
+        return nullptr;
+    }
+
+    cg.key = key;
+    return cg.gf;
+}
+
 bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
     const auto & cfg = model_.config;
-    
+
+    // The step graph views these tensors. New ones mean the cached graph
+    // points at freed memory.
+    release_cached_graph(talker_graph_);
+
     free_tts_kv_cache(state_.cache);
     
     state_.cache.n_ctx = n_ctx;
@@ -892,6 +1006,13 @@ void TTSTransformer::clear_kv_cache() {
 }
 
 bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
+    // Same reason as init_kv_cache: the cached code predictor graphs view the
+    // cache tensors that are about to be replaced.
+    release_cached_graph(code_pred_prefill_graph_);
+    for (auto & cg : code_pred_step_graphs_) {
+        release_cached_graph(cg);
+    }
+
     const auto & cfg = model_.config;
     
     free_tts_kv_cache(state_.code_pred_cache);
@@ -981,14 +1102,8 @@ bool TTSTransformer::lookup_embedding_rows(struct ggml_tensor * embedding, const
         return true;
     }
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     struct ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_tokens, input_name);
@@ -1099,14 +1214,8 @@ bool TTSTransformer::project_text_tokens(const int32_t * text_tokens, int32_t n_
         return true;
     }
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     struct ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_tokens, "inp_text_tokens");
@@ -1662,14 +1771,8 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     // the cache is zeroed but still costs a full KQ product if left in view.
     const int n_kv = std::min<int>(state_.cache.n_ctx, n_past + n_tokens);
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-    
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     struct ggml_tensor * inp_prefill_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, n_tokens);
     ggml_set_name(inp_prefill_embd, "inp_prefill_embd");
@@ -1818,14 +1921,8 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
     // changes) while still throwing away the huge unused tail of the cache.
     const int n_kv = std::min<int>(state_.cache.n_ctx, GGML_PAD(n_past + 1, QWEN3_TTS_KV_STEP));
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-    
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     struct ggml_tensor * inp_step_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
     ggml_set_name(inp_step_embd, "inp_step_embd");
@@ -1970,14 +2067,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     const int n_layer = cfg.code_pred_layers;
     const int n_codebooks = cfg.n_codebooks;
     
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-    
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
     
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_hidden, "inp_hidden");
@@ -2094,14 +2185,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 2;
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     // Input: past_hidden from talker [hidden_size]
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
@@ -2251,14 +2336,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 1;
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    struct ggml_context * ctx0 = nullptr;
+    struct ggml_cgraph * gf = new_graph(&ctx0);
 
     // inp_hidden is [hidden_size] (talker's dimension), used only for generation_step == 0
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
@@ -2594,7 +2673,16 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    struct ggml_cgraph * gf = build_step_graph(n_past);
+    // The graph's only shape is its KV window, which the builder pads, so one
+    // build serves QWEN3_TTS_KV_STEP consecutive frames.
+    const int32_t kv_key = std::min<int>(state_.cache.n_ctx,
+                                         GGML_PAD(n_past + 1, QWEN3_TTS_KV_STEP));
+    struct ggml_cgraph * gf = cached_graph(talker_graph_, kv_key,
+                                           [&] { return build_step_graph(n_past); });
+    const bool cached = gf != nullptr;
+    if (!cached) {
+        gf = build_step_graph(n_past);
+    }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2603,7 +2691,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+    if (!cached && !ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
@@ -2643,9 +2731,12 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+    const enum ggml_status step_status =
+        cached ? ggml_backend_graph_compute(state_.backend, gf)
+               : ggml_backend_sched_graph_compute(state_.sched, gf);
+    if (step_status != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
-        ggml_backend_sched_reset(state_.sched);
+        if (!cached) ggml_backend_sched_reset(state_.sched);
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -2670,7 +2761,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     if (!logits) {
         error_msg_ = "Failed to find logits tensor";
-        ggml_backend_sched_reset(state_.sched);
+        if (!cached) ggml_backend_sched_reset(state_.sched);
         return false;
     }
     
@@ -2679,7 +2770,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     
     state_.cache.n_used = n_past + 1;
     
-    ggml_backend_sched_reset(state_.sched);
+    if (!cached) ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2988,7 +3079,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_prefill_graph();
+        struct ggml_cgraph * gf = cached_graph(code_pred_prefill_graph_, 0,
+                                              [&] { return build_code_pred_prefill_graph(); });
+        const bool cached = gf != nullptr;
+        if (!cached) {
+            gf = build_code_pred_prefill_graph();
+        }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2997,7 +3093,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+        if (!cached && !ggml_backend_sched_alloc_graph(state_.sched, gf)) {
             error_msg_ = "Failed to allocate code predictor prefill graph";
             return false;
         }
@@ -3033,9 +3129,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+        const enum ggml_status pf_status =
+            cached ? ggml_backend_graph_compute(state_.backend, gf)
+                   : ggml_backend_sched_graph_compute(state_.sched, gf);
+        if (pf_status != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor prefill graph";
-            ggml_backend_sched_reset(state_.sched);
+            if (!cached) ggml_backend_sched_reset(state_.sched);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -3046,7 +3145,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
         if (!logits) {
             error_msg_ = "Failed to find logits tensor in prefill";
-            ggml_backend_sched_reset(state_.sched);
+            if (!cached) ggml_backend_sched_reset(state_.sched);
             return false;
         }
 
@@ -3065,7 +3164,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         output[0] = sample_token(logits_data.data(), cfg.code_pred_vocab_size,
                                  temperature, top_k, code_probs);
         
-        ggml_backend_sched_reset(state_.sched);
+        if (!cached) ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3083,7 +3182,14 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_step_graph(n_past, step);
+        // One cached graph per codebook: the step index picks the embedding
+        // and head tensors, and nothing else about the shape ever moves.
+        struct ggml_cgraph * gf = cached_graph(code_pred_step_graphs_[step], step,
+                                               [&] { return build_code_pred_step_graph(n_past, step); });
+        const bool cached = gf != nullptr;
+        if (!cached) {
+            gf = build_code_pred_step_graph(n_past, step);
+        }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3092,7 +3198,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+        if (!cached && !ggml_backend_sched_alloc_graph(state_.sched, gf)) {
             error_msg_ = "Failed to allocate code predictor step graph";
             return false;
         }
@@ -3135,9 +3241,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+        const enum ggml_status cp_status =
+            cached ? ggml_backend_graph_compute(state_.backend, gf)
+                   : ggml_backend_sched_graph_compute(state_.sched, gf);
+        if (cp_status != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor step graph";
-            ggml_backend_sched_reset(state_.sched);
+            if (!cached) ggml_backend_sched_reset(state_.sched);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -3168,7 +3277,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         output[step] = sample_token(logits_data.data(), cfg.code_pred_vocab_size,
                                     temperature, top_k, code_probs);
         
-        ggml_backend_sched_reset(state_.sched);
+        if (!cached) ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

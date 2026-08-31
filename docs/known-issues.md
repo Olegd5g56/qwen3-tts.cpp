@@ -36,6 +36,7 @@ root cause still there) / **wontfix**.
 | [25](#25) | `Dockerfile.vulkan` does not build — ggml now needs SPIRV-Headers | fixed 2026-08-27 |
 | [26](#26) | `q2_k` runs away on any paragraph — no end-of-speech, hits the frame budget | open 2026-08-27 |
 | [27](#27) | The server rounded every request up to a multiple of 200 ms | fixed 2026-08-27 |
+| [28](#28) | The Vulkan server aborts warming any voice — `ggml-vulkan` assert in the speaker encoder | open 2026-08-31 |
 | [—](#rough-edges) | Open rough edges (sampler duplication, env sprawl, no 429, C ABI lag, …) | open |
 
 ---
@@ -1320,3 +1321,44 @@ quantisation** and reads in 0.2 s steps; the first two without it carry the
 note "watcher join no longer waits out its 200ms sleep tick". Full write-up in
 `optimization.md`,
 "The server added 200 ms to every request".
+
+---
+
+<a id="28"></a>
+## 28. The Vulkan server aborts warming any voice
+
+**Status: open** 2026-08-31.
+
+A Vulkan build cannot load a voice at all. The library warm-up calls the
+speaker encoder, and ggml's Vulkan `mul_mat` asserts:
+
+```
+ggml/src/ggml-vulkan/ggml-vulkan.cpp:9221:
+GGML_ASSERT(y_non_contig || !qy_needs_dequant) failed
+```
+
+The stack is `qwen3_tts_voice_from_file` → `extract_speaker_embedding` →
+`AudioTokenizerEncoder::encode` → `ggml_backend_sched_graph_compute`. It takes
+the whole server down, not just that voice.
+
+Repro, on the 6800 XT:
+
+```
+mkdir -p /tmp/v/bench && cp benchmarks/voice/sample.{mp3,txt} /tmp/v/bench/
+GGML_VK_VISIBLE_DEVICES=0 TTS_VOICES_DIR=/tmp/v ./build-vk-native/qwen3-tts-server
+```
+
+`ctest -R c_api_test` fails the same way on a Vulkan build, and passes on ROCm
+and CUDA. Both reproduce on a clean `68c32b1` with nothing in the working
+tree, so it is not the graph cache that found it — the cache work is only what
+tripped over it, when `scripts/bench_speed.sh` could not raise a Vulkan server.
+
+**Not yet bisected.** The last Vulkan rows in `benchmarks/speed.tsv` are from
+2026-08-27 at commit `20594ee`, and they were written by this same script with
+this same voice, so something between `20594ee` and `68c32b1` did it — fifteen
+commits, none of which touches the encoder on its face. The vendored ggml has
+not moved (`f0aeec2`, v0.20.2-1).
+
+**Consequences while it is open:** the deployed stack runs CUDA and is not
+affected, ROCm and CPU are not affected, and no Vulkan row can be added to the
+speed history.

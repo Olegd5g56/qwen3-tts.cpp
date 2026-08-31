@@ -202,6 +202,7 @@ on first use, so setting one after start has no effect.
 |---|---|---|
 | `QWEN3_TTS_PIPELINE` | auto | Overlap the vocoder with generation. Auto-on for CUDA/ROCm/Metal, off for Vulkan. `1`/`0` forces it. |
 | `QWEN3_TTS_DECODE_BATCH` | 16 overlapped / 100 sequential | Frames per vocoder batch; overrides both paths. `8` saves ~120 MB VRAM and costs ~7%. Above ~100 frames larger batches buy nothing. |
+| `QWEN3_TTS_GRAPH_REUSE` | on | Keep each per-frame graph built and allocated instead of rebuilding it every frame. Worth 12.6% of a whole request on ROCm, 3.4% on CUDA, 22% of generation on Vulkan; bit-identical output. `0` puts every frame back through the scheduler. Off automatically under `QWEN3_TTS_PROFILE_OPS` or `QWEN3_TTS_PROBE_NUM`, which hook the scheduler a cached graph never reaches. |
 | `QWEN3_TTS_FRAME_BUDGET` | on | The runaway guard that caps generated frames from the input length. `0` disables it. |
 | `QWEN3_TTS_LOW_MEM` | off | Never keep the talker and the vocoder resident at once. Much lower peak VRAM, one model load per request, no overlap on the one-shot path. |
 | `QWEN3_TTS_FORCE_CPU` | off | `1` — and only `1` — keeps everything on the CPU. |

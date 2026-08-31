@@ -55,6 +55,14 @@ struct tts_timing {
 
 #define QWEN3_TTS_MAX_NODES 16384
 
+// Capacity of a *cached* step graph. The scratch buffer above is shared and
+// sized once for the largest graph there is; a cached graph keeps a buffer of
+// its own for the whole request, so seventeen of them at the shared size would
+// be a hundred megabytes of host memory for nothing. The largest graph that
+// gets cached is the talker's step (1235 nodes on the 1.7B); anything above
+// this cap simply falls back to the scheduler.
+#define QWEN3_TTS_STEP_MAX_NODES 2048
+
 // KV window granularity: per-step attention views are padded up to a multiple
 // of this, so the step graph keeps one shape across many consecutive steps
 // instead of growing by one row every frame.
@@ -213,6 +221,23 @@ struct tts_transformer_state {
     tts_kv_cache code_pred_cache; // Code predictor KV cache (5 layers)
 
     int32_t n_threads = 0;        // 0 = leave ggml default, otherwise applied to CPU backend(s)
+};
+
+// A graph whose shape does not change from frame to frame, kept built and kept
+// allocated for as long as that shape holds.
+//
+// This exists because ggml_backend_sched holds exactly one allocation. A frame
+// pushes seventeen different graphs through it - the talker's step and the
+// code predictor's sixteen - so every one of them finds the allocation planned
+// for a different graph and re-plans it from scratch. Running with
+// GGML_SCHED_DEBUG_REALLOC=1 aborts on the first frame. Giving each graph its
+// own allocator and running it straight on the backend takes that work out of
+// the per-frame path entirely; nothing about the arithmetic changes.
+struct tts_cached_graph {
+    std::vector<uint8_t> meta;             // the graph's own metadata buffer
+    struct ggml_cgraph * gf     = nullptr; // lives inside meta
+    ggml_gallocr_t       galloc = nullptr;
+    int32_t              key    = -1;      // shape this was built for; -1 = empty
 };
 
 // TTS Transformer class
@@ -480,6 +505,18 @@ private:
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
     struct ggml_cgraph * build_code_pred_prefill_graph();
 
+    // Starts a graph in whichever scratch buffer is active - the shared one,
+    // or a cache's own while that cache is being filled.
+    struct ggml_cgraph * new_graph(struct ggml_context ** ctx0_out);
+
+    // The cached graph for `key`, built on first use and rebuilt when the key
+    // changes. nullptr means "not cacheable" - the caller falls back to the
+    // scheduler, which is also what happens when reuse is switched off.
+    struct ggml_cgraph * cached_graph(tts_cached_graph & cg, int32_t key,
+                                      const std::function<struct ggml_cgraph *()> & build);
+    static void release_cached_graph(tts_cached_graph & cg);
+    void release_cached_graphs();
+
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -512,6 +549,16 @@ private:
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
     bool skip_ggml_code_pred_layers_ = false;
+
+    // Kept step graphs. talker_graph_ is keyed by the padded KV window, so it
+    // is rebuilt once every QWEN3_TTS_KV_STEP frames; the code predictor's are
+    // keyed by nothing at all - their KV window is a fixed 16 - and are built
+    // once per model load.
+    tts_cached_graph              talker_graph_;
+    tts_cached_graph              code_pred_prefill_graph_;
+    std::vector<tts_cached_graph> code_pred_step_graphs_;
+    bool                          graph_reuse_ = false;
+    std::vector<uint8_t> *        active_meta_ = nullptr;  // set only while filling a cache
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;

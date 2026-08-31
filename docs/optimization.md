@@ -536,6 +536,83 @@ Everything below is byte-exact comparison of the returned WAV, fixed seed:
   every voice switch evicts.
 * The non-ICL path (no reference at all) does not use either cache.
 
+## Generation is dispatch-bound, and the graph was rebuilt every frame (2026-08-31)
+
+**The old reading of the code predictor - "~70% weight-read bandwidth" - does
+not survive a measurement on this machine.** Two of them, in fact:
+
+* **Three synths at once on the 6800 XT** each slowed by 1.48x while total
+  throughput rose to 2.0x. A single request therefore leaves the card idle
+  about half the time. A bandwidth-bound workload cannot do that.
+* **The 6800 XT beats the 1660 SUPER by 1.56x** on the whole request while
+  holding 3.5x its memory bandwidth. Two very different cards landing that
+  close is the signature of a cost that is neither of them - the host.
+
+Where the host time went, measured with `-DQWEN3_TTS_TIMING=ON`, 490 frames,
+`bench_ru.txt`, 1.7B Q8_0, Vulkan on the 6800 XT:
+
+| | before | after |
+|---|---|---|
+| talker forward | 3135 ms (build 37, **alloc 240**, compute 2802) | 2686 ms (build 4, **alloc 0**, compute 2629) |
+| code predictor | 4888 ms (build 112, **alloc 577**, compute 3391, io 557) | 3513 ms (build 6, **alloc 0**, compute 2744, io 523) |
+| embed lookups | 369 ms | 361 ms |
+| **generate** | **8441 ms (17.2 ms/frame)** | **6608 ms (13.5 ms/frame)** |
+
+A frame pushes **seventeen different graphs** through one
+`ggml_backend_sched`: the talker's step, and the code predictor's prefill plus
+fifteen steps. The scheduler holds exactly one allocation, so every graph finds
+the plan made for a different graph and re-plans itself from scratch -
+`ggml_backend_sched_split_graph` plus a full `ggml_gallocr_reserve_n`, sixteen
+times a frame. Running with `GGML_SCHED_DEBUG_REALLOC=1` aborts on the first
+frame; that flag exists upstream to catch exactly this.
+
+**The fix is a cache, not a rewrite.** Every one of those graphs has a fixed
+shape: the code predictor's KV window is a fixed 16 rows, and the talker's is
+padded to `QWEN3_TTS_KV_STEP` by the builder, which already had a comment
+saying so. So each gets built once into a buffer of its own, allocated once
+with a `ggml_gallocr_t` of its own, and thereafter run with a bare
+`ggml_backend_graph_compute` - no scheduler, no splitting, no re-planning.
+`QWEN3_TTS_GRAPH_REUSE=0` restores the old path.
+
+Measured, whole request, `scripts/bench_speed.sh`, median of 9, seed pinned,
+audio length identical on both sides of every pair:
+
+| backend | before | after | |
+|---|---|---|---|
+| ROCm 6800XT | 9.94 s | **8.69 s** | **-12.6%** |
+| CUDA 1660S | 15.55 s | **15.02 s** | **-3.4%** |
+| Vulkan 6800XT | generate 8441 ms | **6608 ms** | **-21.7%** |
+| CPU | 1427 ms | 1412 ms | noise |
+
+The spread across backends is the point. NVIDIA's dispatch is cheap and
+ggml-cuda already captures CUDA graphs, so there was little to win there; the
+Vulkan path pays for every submission and wins four times as much. **The CPU
+gains nothing, which is the control** - it was never waiting on a driver.
+
+The Vulkan row is a CLI generation time, not a bench row, because the Vulkan
+server cannot currently load a voice at all (known-issues.md #28).
+
+Correctness bar used, reuse it: **byte-identical WAV** with the switch on and
+off, on Vulkan, ROCm, CUDA and CPU, plus `ctest` (streaming parity green) and
+ten server requests per configuration through `bench_speed.sh`. Peak VRAM moved
+by 1 MB, which is the desktop.
+
+**What is left in the same place, unfixed and measured:**
+
+* **16 embedding rows fetched one at a time, per frame - 369 ms (4.4%).** The
+  next step's input is the sum of 16 codebook embeddings, and `generate()`
+  builds it with 16 separate device-to-host `ggml_backend_tensor_get` calls and
+  a host-side add. This is the same pattern the prefix cache fixed for the
+  reference block; nobody fixed it for the frames being generated. One
+  `ggml_get_rows` + sum inside the step graph removes 16 round trips a frame.
+* **`clear_code_pred_kv_cache()` - 10 device memsets a frame**, part of the
+  243 ms `init` line. Every slot the mask lets the model read is written before
+  it is read, so the clear looks redundant.
+* **`io` in the code predictor - 523 ms (7.9%).** Fifteen logits readbacks a
+  frame, each a full sync. Sampling is host-side, so this cannot go to zero,
+  but with the graphs now cached the on-device-argmax variant is a much
+  cheaper experiment than it was when it was tried and scored 3%.
+
 ## Remaining ideas (descending value)
 
 1. **`CONV_TRANSPOSE_1D` — done.** Rewritten as `mul_mat` + `col2im_1d`; decode
