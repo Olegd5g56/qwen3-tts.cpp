@@ -694,13 +694,38 @@ Byte-identical WAV at every one of these steps, on all four backends.
   because the cost is the logits *readback*, which is a device sync. Uploads
   queue; reads wait.
 
-**What is left in the same place, measured and unfixed:** `io` in the code
-predictor, 520 ms (8.6%). Fifteen logits readbacks a frame, each a full sync -
-see the note above for why the uploads around them are free and this is not.
-Sampling is host-side, so it cannot go to zero. Doing it on the device means
-`top_k` over 2048 logits (an `argsort`, which may well cost more than the sync
-it saves) and it stops being bit-identical, so it needs the ASR check, not a
-checksum.
+### The code predictor's `io`: priced at 5.6%, and every cheap route to it is closed
+
+The one thing left in this area is the fifteen logits readbacks a frame. It is
+now priced rather than guessed. Adding a **second, redundant** read per step -
+output unchanged, so the comparison is exact - costs **+305 ms**, i.e. **44 us
+per read**, and it lands in the total: generate 5738 -> 6046 ms. So removing
+all fifteen would be worth about **5.6%** of a request, and no more.
+
+Three ways to get it were tried or checked. All are closed:
+
+* **Queue the read behind the graph instead of after it.**
+  `ggml_backend_graph_compute_async` + `ggml_backend_tensor_get_async` +
+  one `ggml_backend_synchronize` should turn two trips to the driver into one.
+  Measured on three backends: Vulkan 5713 -> 5705 ms, ROCm 7893 -> 7870, CUDA
+  12752 -> 12729. All noise. The read costs its 44 us whether it rides with the
+  graph or follows it, so the cost is the read itself, not the extra submit.
+  Reverted - it also moves the wait out of the `compute` timer into `io`,
+  which makes the profile harder to read for nothing.
+* **Read fewer bytes.** 256 bytes costs the same 44 us as 8 KB. On a discrete
+  GPU `ggml_vk_buffer_read` builds a command buffer, submits it, waits on a
+  fence and cleans up; the payload is not what is being paid for.
+* **Have the graph write the logits straight into pinned host memory**, so the
+  read is a `memcpy` after a synchronize that has already happened.
+  `ggml_backend_vk_device_supports_buft` returns false for anything but the
+  backend's own device buffer type, so a node cannot target a host buffer.
+  The same shape of check applies on the other backends.
+
+What is left is to stop reading at all - sample on the device. That means
+`top_k` over 2048 logits, which is an `argsort` that can easily cost more than
+the 44 us it saves, and the output stops being bit-identical, so it needs the
+20-seed ASR check instead of a checksum. **Against a 5.6% ceiling that is a bad
+trade, and it is not being taken.**
 
 ## Remaining ideas (descending value)
 
