@@ -973,11 +973,12 @@ unreported ggml findings.**
   audio — and streaming matches one-shot to within vocoder noise (#29).
   `tests/test_c_api.c`,
   wired into ctest, skips without models like the other model-dependent tests.
-- **Two ggml findings are sitting unreported.** #17 (OOM segfault) is a
-  one-line fix with a verified repro; and `CONV_TRANSPOSE_1D` — ggml's own ops
+- **Three ggml findings are sitting unreported.** #17 (OOM segfault) is a
+  one-line fix with a verified repro; `CONV_TRANSPOSE_1D` — ggml's own ops
   compose into something 6x faster than its dedicated CUDA kernel — is measured
-  on four backends. Both go to `ggml-org/llama.cpp` rather than to the ggml
-  mirror, and the order to send them in is in `ggml-notes.md`.
+  on four backends; and a bf16 conv kernel aborts ggml-vulkan's `mul_mat`
+  instead of falling back (#28). All three go to `ggml-org/llama.cpp` rather
+  than to the ggml mirror, and the order to send them in is in `ggml-notes.md`.
 
   **#8 (RADV multi-add) is no longer one of them.** It was a mesa regression,
   not a ggml bug: gone in mesa 26.2.1, never present in the 25.0.7 the container
@@ -1329,7 +1330,8 @@ note "watcher join no longer waits out its 200ms sleep tick". Full write-up in
 <a id="28"></a>
 ## 28. The Vulkan server aborts warming any voice
 
-**Status: open** 2026-08-31.
+**Status: fixed** 2026-08-31, the same day it was found. What follows is in the
+order it happened — the symptom first, the diagnosis below it.
 
 A Vulkan build cannot load a voice at all. The library warm-up calls the
 speaker encoder, and ggml's Vulkan `mul_mat` asserts:
